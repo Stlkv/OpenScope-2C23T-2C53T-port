@@ -27,6 +27,9 @@ enum {
     SETTINGS_SIGGEN_DEFAULT_AMP_TENTHS = 33,
     SETTINGS_SIGGEN_DEFAULT_FREQ_HZ = 1000,
     SETTINGS_SIGGEN_MAX_FREQ_HZ = 2000000,
+    SETTINGS_SIGGEN_SWEEP_MODE_COUNT = 3, // 0 = OFF, 1 = LINEAR, 2 = LOG
+    SETTINGS_SIGGEN_FM_MODE_COUNT = 2, // 0 = OFF, 1 = ON
+    SETTINGS_SIGGEN_FM_SOURCE_COUNT = 3, // 0 = SINE, 1 = TRIANGLE, 2 = SQUARE
 };
 
 typedef struct {
@@ -71,6 +74,13 @@ typedef struct {
     uint8_t scope_fft_window;    // 0 = HANN, 1 = HAMMING, 2 = BLACKMAN, 3 = RECTANGLE
     uint8_t scope_fft_display;   // 0 = NORMAL, 1 = AVERAGE, 2 = MAX HOLD
     uint8_t scope_hide_traces;   // 0=NONE, 1=CH1, 2=CH2, 3=ALL
+    uint8_t siggen_sweep_mode;
+    uint32_t siggen_sweep_ms;    // Range: 100ms to 10000ms (10 seconds)
+    uint32_t siggen_sweep_start_hz;
+    uint32_t siggen_sweep_stop_hz;
+    uint8_t siggen_fm_mode;
+    uint8_t siggen_fm_source;
+    uint32_t siggen_fm_freq_hz;  // Range: 1Hz to 9999Hz (the HW limit)
 
 } settings_state_t;
 

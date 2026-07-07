@@ -235,6 +235,19 @@ static uint8_t gen_deferred_apply;
 static uint16_t gen_deferred_apply_ms;
 static uint8_t gen_output_applied;
 static uint8_t gen_running;
+static uint8_t gen_sweep_menu_active = 0;
+static uint8_t gen_sweep_row_selected = 0; // 0 to 4
+static uint8_t gen_sweep_digit_index = 0; // 0 to 3 (which of the 4 digits is active)
+static uint8_t gen_sweep_edit_active = 0; // 1 if we clicked into a digit editor field 
+static uint8_t gen_sweep_mode = 0;
+static uint32_t siggen_sweep_start_hz = 0;
+static uint32_t siggen_sweep_stop_hz = 4999;
+static uint16_t gen_sweep_ms = 1000;
+static uint8_t gen_fm_mode = 0;
+static uint8_t gen_fm_source = 0;
+static uint16_t gen_fm_freq_hz = 1000;
+static uint32_t gen_sweep_elapsed_ms = 0;
+static uint32_t gen_fm_elapsed_ms = 0;
 static uint8_t scope_samples[SCOPE_SAMPLE_BYTES] __attribute__((aligned(4)));
 static uint8_t scope_capture_samples[SCOPE_SAMPLE_BYTES] __attribute__((aligned(4)));
 static uint8_t scope_frame_valid;
@@ -347,6 +360,13 @@ static void ui_settings_copy(settings_state_t *dst, const settings_state_t *src)
     dst->siggen_freq_unit = src->siggen_freq_unit;
     dst->siggen_running = src->siggen_running;
     dst->siggen_freq_hz = src->siggen_freq_hz;
+    dst->siggen_sweep_mode = src->siggen_sweep_mode;
+    dst->siggen_sweep_ms = src->siggen_sweep_ms;
+    dst->siggen_sweep_start_hz = src->siggen_sweep_start_hz;
+    dst->siggen_sweep_stop_hz = src->siggen_sweep_stop_hz;
+    dst->siggen_fm_mode = src->siggen_fm_mode;
+    dst->siggen_fm_source = src->siggen_fm_source;
+    dst->siggen_fm_freq_hz = src->siggen_fm_freq_hz;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         dst->scope_ch_enabled[ch] = src->scope_ch_enabled[ch];
         dst->scope_probe_x10[ch] = src->scope_probe_x10[ch];
@@ -610,6 +630,7 @@ static const int8_t scope_sine_lut[64] = {
 static void dmm_pause_for_menu_overlay(void);
 static void dmm_apply_selected_mode(void);
 static void gen_prepare_state(void);
+static uint32_t gen_get_current_sweep_freq(void);
 static void gen_apply(void);
 static void gen_normalize_param(void);
 static void draw_gen_param_row(uint16_t x, uint16_t y);
@@ -923,16 +944,51 @@ static void draw_battery(uint16_t x, uint16_t y, uint16_t bg) {
     }
 }
 
-static void draw_siggen_status(uint16_t x, uint16_t y, uint16_t bg) {
-    uint8_t active = (uint8_t)(gen_running || gen_output_applied);
+static void draw_header_icon(uint16_t x, uint16_t y, const char *text, uint16_t color, uint16_t bg) {
+    lcd_frame(x, y, 26, 10, color);
+    lcd_text((uint16_t)(x + 4u), (uint16_t)(y + 1u), text, color, bg, 1);
+}
 
-    lcd_rect(x, y, 26, 10, bg);
-    if (!active) {
-        return;
+static void draw_all_active_status_icons(uint16_t start_x, uint16_t y, uint16_t bg) {
+    uint16_t current_x = start_x;
+
+    uint8_t gen_active = (uint8_t)(gen_running || gen_output_applied);
+    if (gen_active) {
+        draw_header_icon(current_x, y, "GEN", C_GEN, bg);
+        current_x -= 30u;
+        
+        if (gen_running && gen_sweep_mode != 0) {
+            draw_header_icon(current_x, y, "SWP", C_GEN, bg);
+            current_x -= 30u;
+        }
+
+        if (gen_running && gen_fm_mode != 0) {
+            draw_header_icon(current_x, y, "FM ", C_GEN, bg);
+            current_x -= 30u;
+        }
     }
 
-    lcd_frame(x, y, 26, 10, C_GEN);
-    lcd_text((uint16_t)(x + 4u), (uint16_t)(y + 1u), "GEN", C_GEN, bg, 1);
+    if (scope_math_mode) {
+        draw_header_icon(current_x, y, "MAT", C_GEN, bg); 
+        current_x -= 30u;
+    }
+
+    if (scope_fft_src == 1u || scope_fft_src == 2u) {
+        draw_header_icon(current_x, y, "FFT", C_GEN, bg);
+        current_x -= 30u;
+    } else if (scope_fft_src == 3u) {
+        draw_header_icon(current_x, y, "X-Y", C_GEN, bg);
+        current_x -= 30u;
+    }
+
+    if (current_x >= 134u) {
+        uint16_t clear_width = (uint16_t)(current_x - 134u + 26u);
+        // battery text territory
+        if (134u + clear_width > 250u) {
+            clear_width = 250u - 134u;
+        }
+        lcd_rect(134, y, clear_width, 10, bg);
+    }
 }
 
 static void draw_battery_status_header(void) {
@@ -942,7 +998,9 @@ static void draw_battery_status_header(void) {
     format_percent(pct);
     format_battery_voltage(volts);
 
-    draw_siggen_status(224, 7, C_TOP);
+    // dynamic renderer starting at the safe rightmost coordinate (224)
+    draw_all_active_status_icons(224, 7, C_TOP);
+    
     lcd_rect(252, 4, 33, 21, C_TOP);
     lcd_text(254, 5, pct, battery_alert_color(C_TEXT), C_TOP, 1);
     lcd_text(254, 16, volts, battery_alert_color(C_MUTED), C_TOP, 1);
@@ -953,7 +1011,9 @@ static void draw_battery_status_overlay(uint16_t bg) {
     char pct[5];
 
     format_percent(pct);
-    draw_siggen_status(224, 7, bg);
+
+    draw_all_active_status_icons(224, 7, bg);
+    
     lcd_rect(252, 5, 68, 15, bg);
     lcd_text(254, 9, pct, battery_alert_color(C_TEXT), bg, 1);
     draw_battery(280, 7, bg);
@@ -5721,6 +5781,168 @@ static void draw_generator(void) {
     draw_gen_output_panel(GEN_OUTPUT_X, 101, GEN_OUTPUT_W, 76, C_PANEL);
 }
 
+static void ui_draw_gen_sweep_menu(void) {
+    if (!gen_sweep_menu_active) {
+        return;
+    }
+
+    const char *gen_sweep_mode_names[] = { "OFF", "LINEAR", "LOG" };
+    const char *gen_fm_mode_names[]    = { "OFF", "ON" };
+    const char *gen_fm_wave_names[]    = { "SINE", "TRIANGLE", "SQUARE" };
+
+    uint16_t box_x = 50;
+    uint16_t box_y = 40;
+    uint16_t box_w = 220;
+    uint16_t box_h = 160;
+
+
+    lcd_rect(box_x, box_y, box_w, box_h, RGB565(30, 30, 45)); 
+    lcd_frame(box_x, box_y, box_w, box_h, RGB565(255, 165, 0)); 
+
+    lcd_text(box_x + 10, box_y + 8, "SWEEP AND MODULATION", RGB565(255, 255, 255), RGB565(30, 30, 45), 1);
+    lcd_rect(box_x + 10, box_y + 20, box_w - 20, 1, RGB565(100, 100, 100)); 
+
+    uint16_t color_fg, color_bg;
+    uint16_t row_y;
+
+    row_y = box_y + 26;
+    color_bg = (gen_sweep_row_selected == 0) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
+    color_fg = RGB565(255, 255, 255);
+    lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
+    lcd_text(box_x + 12, row_y + 3, "SWEEP MODE:", color_fg, color_bg, 1);
+    lcd_text(box_x + 110, row_y + 3, gen_sweep_mode_names[gen_sweep_mode], color_fg, color_bg, 1);
+
+    row_y = box_y + 44;
+    color_bg = (gen_sweep_row_selected == 1) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
+    color_fg = (gen_sweep_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
+    lcd_text(box_x + 12, row_y + 3, "SWEEP TIME:", color_fg, color_bg, 1);
+    
+    char sweep_digits[5];
+    sweep_digits[0] = (char)('0' + ((gen_sweep_ms / 1000) % 10));
+    sweep_digits[1] = (char)('0' + ((gen_sweep_ms / 100) % 10));
+    sweep_digits[2] = (char)('0' + ((gen_sweep_ms / 10) % 10));
+    sweep_digits[3] = (char)('0' + (gen_sweep_ms % 10));
+    sweep_digits[4] = '\0';
+    
+    if (gen_sweep_edit_active && gen_sweep_row_selected == 1) {
+        for (uint8_t d = 0; d < 4u; ++d) {
+            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+            char d_str[2] = { sweep_digits[d], '\0' };
+            if (d == gen_sweep_digit_index) {
+                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+            } else {
+                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+            }
+        }
+    } else {
+        lcd_text(box_x + 110, row_y + 3, sweep_digits, color_fg, color_bg, 1);
+    }
+    lcd_text(box_x + 110 + (4 * 6) + 2, row_y + 3, "ms", color_fg, color_bg, 1);
+
+    row_y = box_y + 62;
+    color_bg = (gen_sweep_row_selected == 2) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
+    color_fg = (gen_sweep_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
+    lcd_text(box_x + 12, row_y + 3, "START FREQ:", color_fg, color_bg, 1);
+    
+    char start_digits[5];
+    start_digits[0] = (char)('0' + ((siggen_sweep_start_hz / 1000) % 10));
+    start_digits[1] = (char)('0' + ((siggen_sweep_start_hz / 100) % 10));
+    start_digits[2] = (char)('0' + ((siggen_sweep_start_hz / 10) % 10));
+    start_digits[3] = (char)('0' + (siggen_sweep_start_hz % 10));
+    start_digits[4] = '\0';
+    
+    if (gen_sweep_edit_active && gen_sweep_row_selected == 2) {
+        for (uint8_t d = 0; d < 4u; ++d) {
+            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+            char d_str[2] = { start_digits[d], '\0' };
+            if (d == gen_sweep_digit_index) {
+                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+            } else {
+                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+            }
+        }
+    } else {
+        lcd_text(box_x + 110, row_y + 3, start_digits, color_fg, color_bg, 1);
+    }
+    lcd_text(box_x + 110 + (4 * 6) + 2, row_y + 3, "Hz", color_fg, color_bg, 1);
+
+    row_y = box_y + 80;
+    color_bg = (gen_sweep_row_selected == 3) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
+    color_fg = (gen_sweep_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
+    lcd_text(box_x + 12, row_y + 3, "STOP FREQ:", color_fg, color_bg, 1);
+    
+    char stop_digits[5];
+    stop_digits[0] = (char)('0' + ((siggen_sweep_stop_hz / 1000) % 10));
+    stop_digits[1] = (char)('0' + ((siggen_sweep_stop_hz / 100) % 10));
+    stop_digits[2] = (char)('0' + ((siggen_sweep_stop_hz / 10) % 10));
+    stop_digits[3] = (char)('0' + (siggen_sweep_stop_hz % 10));
+    stop_digits[4] = '\0';
+    
+    if (gen_sweep_edit_active && gen_sweep_row_selected == 3) {
+        for (uint8_t d = 0; d < 4u; ++d) {
+            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+            char d_str[2] = { stop_digits[d], '\0' };
+            if (d == gen_sweep_digit_index) {
+                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+            } else {
+                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+            }
+        }
+    } else {
+        lcd_text(box_x + 110, row_y + 3, stop_digits, color_fg, color_bg, 1);
+    }
+    lcd_text(box_x + 110 + (4 * 6) + 2, row_y + 3, "Hz", color_fg, color_bg, 1);
+
+    row_y = box_y + 98;
+    color_bg = (gen_sweep_row_selected == 4) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
+    color_fg = RGB565(255, 255, 255);
+    lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
+    lcd_text(box_x + 12, row_y + 3, "FM MODE:", color_fg, color_bg, 1);
+    lcd_text(box_x + 110, row_y + 3, gen_fm_mode_names[gen_fm_mode], color_fg, color_bg, 1);
+
+    row_y = box_y + 116;
+    color_bg = (gen_sweep_row_selected == 5) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
+    color_fg = (gen_fm_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
+    lcd_text(box_x + 12, row_y + 3, "FM WAVE:", color_fg, color_bg, 1);
+    lcd_text(box_x + 110, row_y + 3, gen_fm_wave_names[gen_fm_source], color_fg, color_bg, 1);
+
+    row_y = box_y + 134;
+    color_bg = (gen_sweep_row_selected == 6) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
+    color_fg = (gen_fm_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
+    lcd_text(box_x + 12, row_y + 3, "FM FREQ:", color_fg, color_bg, 1);
+    
+    char freq_digits[5];
+    freq_digits[0] = (char)('0' + ((gen_fm_freq_hz / 1000) % 10));
+    freq_digits[1] = (char)('0' + ((gen_fm_freq_hz / 100) % 10));
+    freq_digits[2] = (char)('0' + ((gen_fm_freq_hz / 10) % 10));
+    freq_digits[3] = (char)('0' + (gen_fm_freq_hz % 10));
+    freq_digits[4] = '\0';
+    
+    if (gen_sweep_edit_active && gen_sweep_row_selected == 6) {
+        for (uint8_t d = 0; d < 4u; ++d) {
+            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+            char d_str[2] = { freq_digits[d], '\0' };
+            if (d == gen_sweep_digit_index) {
+                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+            } else {
+                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+            }
+        }
+    } else {
+        lcd_text(box_x + 110, row_y + 3, freq_digits, color_fg, color_bg, 1);
+    }
+    lcd_text(box_x + 110 + (4 * 6) + 2, row_y + 3, "Hz", color_fg, color_bg, 1);
+}
+
 static void draw_generator_immersive(void) {
     lcd_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, C_BG);
     draw_micro_status(6, 6, C_BG);
@@ -5729,6 +5951,7 @@ static void draw_generator_immersive(void) {
     draw_gen_wave_preview(14, 68, 220, 123, C_BG);
     draw_gen_output_panel(GEN_OUTPUT_X, 68, GEN_OUTPUT_W, 123, C_BG);
     draw_gen_param_row(GEN_PARAM_ROW_X, (uint16_t)(Y_SOFT + 4u));
+    ui_draw_gen_sweep_menu();
 }
 
 static uint16_t menu_item_color(uint8_t index) {
@@ -6609,6 +6832,98 @@ static void gen_prepare_state(void) {
     }
 }
 
+static uint32_t gen_get_current_sweep_freq(void) {
+
+    if (gen_sweep_mode != 0 && gen_sweep_ms != 0) {
+        uint32_t start = siggen_sweep_start_hz;
+        uint32_t stop = siggen_sweep_stop_hz;
+        uint32_t duration = gen_sweep_ms;
+
+        if (gen_sweep_elapsed_ms >= duration) {
+            return stop; 
+        }
+
+        // lin
+        if (gen_sweep_mode == 1) { 
+            if (stop >= start) {
+                uint32_t delta = stop - start;
+                return start + ((delta * gen_sweep_elapsed_ms) / duration);
+            } else {
+                uint32_t delta = start - stop;
+                return start - ((delta * gen_sweep_elapsed_ms) / duration);
+            }
+        }
+        
+        // log
+        else if (gen_sweep_mode == 2) {
+            if (start == 0) start = 1;
+            if (stop == 0)  stop = 1;
+
+            uint32_t progress = (gen_sweep_elapsed_ms * 1024) / duration;
+            uint32_t target;
+
+            if (stop >= start) {
+                uint32_t ratio = (stop << 10) / start;
+                uint32_t factor = 1024 + (((ratio - 1024) * progress) >> 10);
+                target = (start * factor) >> 10;
+                
+                if (target < start) target = start;
+                if (target > stop)  target = stop;
+            } else {
+                uint32_t ratio = (start << 10) / stop;
+                uint32_t factor = 1024 + (((ratio - 1024) * progress) >> 10);
+                target = (start << 10) / factor; 
+
+                if (target > start) target = start;
+                if (target < stop)  target = stop;
+            }
+            return target;
+        }
+    }
+
+    if (gen_fm_mode != 0 && gen_fm_freq_hz != 0) {
+        uint32_t carrier = ui.gen_freq_hz;
+        
+        // maximum deviation to 25% of carrier up to a hard 1000Hz limit
+        uint32_t deviation = carrier >> 2; 
+        if (deviation > 1000u) deviation = 1000u;
+        if (deviation == 0)    deviation = 1u;
+
+        // modulating wave period: T_ms = 1000 / gen_fm_freq_hz
+        uint32_t period_ms = 1000u / gen_fm_freq_hz;
+        if (period_ms == 0) period_ms = 1u;
+
+        uint32_t cycle_pos = (gen_fm_elapsed_ms * 1024u) / period_ms;
+        cycle_pos %= 1024u;
+
+        int32_t offset = 0;
+
+        if (gen_fm_source == 0) { // SINE LFO Shape (Piecewise Binary Approximation)
+            if (cycle_pos < 256u)       offset = (int32_t)cycle_pos;
+            else if (cycle_pos < 768u)  offset = 512 - (int32_t)cycle_pos;
+            else                        offset = (int32_t)cycle_pos - 1024;
+            offset = (offset * (int32_t)deviation) >> 8;
+        }
+        else if (gen_fm_source == 1) { // TRIANGLE LFO Shape
+            if (cycle_pos < 512u) offset = (int32_t)cycle_pos - 256;
+            else                  offset = 768 - (int32_t)cycle_pos;
+            offset = (offset * (int32_t)deviation) >> 8;
+        }
+        else if (gen_fm_source == 2) { // SQUARE LFO Shape
+            if (cycle_pos < 512u) offset = (int32_t)deviation;
+            else                  offset = -(int32_t)deviation;
+        }
+
+        int32_t final_freq = (int32_t)carrier + offset;
+        
+        if (final_freq < 1)    return 1u;
+        if (final_freq > 4999) return 4999u;
+        return (uint32_t)final_freq;
+    }
+
+    return ui.gen_freq_hz;
+}
+
 static void gen_apply(void) {
     gen_prepare_state();
     if (!gen_running && !gen_output_applied) {
@@ -6616,9 +6931,12 @@ static void gen_apply(void) {
         gen_deferred_apply_ms = 0;
         return;
     }
+    uint32_t target_freq = (gen_running && (gen_sweep_mode != 0 || gen_fm_mode != 0)) ? 
+                           gen_get_current_sweep_freq() : ui.gen_freq_hz;
     siggen_configure(gen_running,
                      ui.gen_wave,
-                     ui.gen_freq_hz,
+                    //  ui.gen_freq_hz,
+                    target_freq,
                      ui.gen_duty_percent,
                      ui.gen_amp_tenths_v);
     gen_output_applied = gen_running ? 1u : 0u;
@@ -8180,12 +8498,168 @@ static void ui_handle_menu_keys(uint32_t events) {
     }
 }
 
+static uint8_t ui_handle_keys_gen_sweep_menu(uint32_t events) {
+    if (!gen_sweep_menu_active) {
+        return 0;
+    }
+
+    if (events & KEY_SAVE_LONG) {
+        capture_screenshot_now();
+        return 1; 
+    }
+
+    if (events & KEY_OK) {
+        if ((gen_sweep_row_selected == 1 || gen_sweep_row_selected == 2 || gen_sweep_row_selected == 3) && gen_sweep_mode == 0) {
+            return 1;
+        }
+        if ((gen_sweep_row_selected == 5 || gen_sweep_row_selected == 6) && gen_fm_mode == 0) {
+            return 1;
+        }
+
+        if (gen_sweep_row_selected == 1 || gen_sweep_row_selected == 2 || 
+            gen_sweep_row_selected == 3 || gen_sweep_row_selected == 6) {
+            gen_sweep_edit_active = !gen_sweep_edit_active;
+            gen_sweep_digit_index = 0;
+        } else {
+            gen_sweep_edit_active = 0;
+        }
+
+        ui_render_local_change();
+        return 1;
+    }
+
+    if (gen_sweep_edit_active) {
+        if (((gen_sweep_row_selected == 1 || gen_sweep_row_selected == 2 || gen_sweep_row_selected == 3) && gen_sweep_mode == 0) ||
+            (gen_sweep_row_selected == 6 && gen_fm_mode == 0)) {
+            gen_sweep_edit_active = 0;
+            ui_render_local_change();
+            return 1;
+        }
+
+        uint32_t current_val;
+        if (gen_sweep_row_selected == 1) {
+            current_val = gen_sweep_ms;
+        } else if (gen_sweep_row_selected == 2) {
+            current_val = siggen_sweep_start_hz;
+        } else if (gen_sweep_row_selected == 3) {
+            current_val = siggen_sweep_stop_hz;
+        } else {
+            current_val = gen_fm_freq_hz; // Row 6
+        }
+        
+        uint32_t thousands = (current_val / 1000) % 10;
+        uint32_t hundreds = (current_val / 100) % 10;
+        uint32_t tens = (current_val / 10) % 10;
+        uint32_t ones = current_val % 10;
+
+        if (events & KEY_LEFT) {
+            if (gen_sweep_digit_index > 0) {
+                gen_sweep_digit_index--;
+            } else {
+                gen_sweep_digit_index = 3;
+            }
+        } 
+        else if (events & KEY_RIGHT) {
+            if (gen_sweep_digit_index < 3) {
+                gen_sweep_digit_index++;
+            } else {
+                gen_sweep_digit_index = 0;
+            }
+        } 
+        else if (events & (KEY_UP | KEY_DOWN)) {
+            int8_t delta = (events & KEY_DOWN) ? 1 : -1;
+            
+            if (gen_sweep_digit_index == 0) thousands = (thousands + delta + 10) % 10;
+            else if (gen_sweep_digit_index == 1) hundreds = (hundreds + delta + 10) % 10;
+            else if (gen_sweep_digit_index == 2) tens = (tens + delta + 10) % 10;
+            else if (gen_sweep_digit_index == 3) ones = (ones + delta + 10) % 10;
+
+            uint32_t new_val = (thousands * 1000) + (hundreds * 100) + (tens * 10) + ones;
+
+            // Enforce constraints (Time: 100-9999 ms, Frequencies: 1-4999 Hz)
+            if (gen_sweep_row_selected == 1) {
+                if (new_val < 100) new_val = 100;
+                if (new_val > 9999) new_val = 9999;
+                gen_sweep_ms = (uint16_t)new_val;
+            } 
+            else if (gen_sweep_row_selected == 2) {
+                if (new_val < 1) new_val = 1;
+                if (new_val > 4999) new_val = 4999;
+                siggen_sweep_start_hz = new_val;
+            } 
+            else if (gen_sweep_row_selected == 3) {
+                if (new_val < 1) new_val = 1;
+                if (new_val > 4999) new_val = 4999;
+                siggen_sweep_stop_hz = new_val;
+            } 
+            else if (gen_sweep_row_selected == 6) {
+                if (new_val < 1) new_val = 1;
+                if (new_val > 4999) new_val = 4999;
+                gen_fm_freq_hz = (uint16_t)new_val;
+            }
+        }
+        ui_render_local_change();
+        return 1;
+    }
+
+    if (events & KEY_DOWN) {
+        if (gen_sweep_row_selected > 0) {
+            gen_sweep_row_selected--;
+        } else {
+            gen_sweep_row_selected = 6;
+        }
+        ui_render_local_change();
+        return 1;
+    } 
+    else if (events & KEY_UP) {
+        if (gen_sweep_row_selected < 6) {
+            gen_sweep_row_selected++;
+        } else {
+            gen_sweep_row_selected = 0;
+        }
+        ui_render_local_change();
+        return 1;
+    } 
+    else if (events & (KEY_LEFT | KEY_RIGHT)) {
+        int8_t step = (events & KEY_RIGHT) ? 1 : -1;
+        
+        switch (gen_sweep_row_selected) {
+            case 0:
+                gen_sweep_mode = (uint8_t)((gen_sweep_mode + step + 3) % 3);
+                break;
+            case 4:
+                gen_fm_mode = (uint8_t)((gen_fm_mode + step + 2) % 2);
+                break;
+            case 5:
+                gen_fm_source = (uint8_t)((gen_fm_source + step + 3) % 3);
+                break;
+        }
+        ui_render_local_change();
+        return 1;
+    }
+
+    if (events & KEY_MENU) {
+        gen_sweep_menu_active = 0;
+        gen_sweep_edit_active = 0;
+        ui_render(); 
+        return 1;
+    }
+
+    return 1;
+}
+
 void ui_handle_keys(uint32_t events) {
     ui.idle_ms = 0;
     ui.sleep_ms = 0;
     ui.sleep_due = 0;
 
     if (events == 0) return;
+
+    if (gen_sweep_menu_active) {
+        if (ui_handle_keys_gen_sweep_menu(events)) {
+            return;
+        }
+    }
 
     if (ui_math_menu_visible && (ui.mode != UI_MODE_SCOPE || ui.overlay != UI_OVERLAY_NONE)) {
         ui_math_menu_visible = 0;
@@ -8212,6 +8686,22 @@ void ui_handle_keys(uint32_t events) {
         }
         ui_render_local_change();
         return; 
+    }
+
+    if (gen_sweep_menu_active && (ui.mode != UI_MODE_GEN || ui.overlay != UI_OVERLAY_NONE)) {
+        gen_sweep_menu_active = 0;
+        gen_sweep_edit_active = 0;
+        gen_sweep_row_selected = 0;
+    }
+
+    if ((events & KEY_CH1_LONG) && ui.mode == UI_MODE_GEN && !gen_sweep_menu_active) {
+        gen_sweep_menu_active = 1;
+        gen_sweep_row_selected = 0;
+        gen_sweep_edit_active = 0;
+        gen_sweep_digit_index = 0;
+
+        ui_render_local_change();
+        return;
     }
 
     if (ui_math_menu_visible && ui.mode == UI_MODE_SCOPE && ui.overlay == UI_OVERLAY_NONE) {
@@ -8747,6 +9237,32 @@ void ui_tick(uint32_t elapsed_ms) {
         } else {
             gen_deferred_apply_ms = (uint16_t)(gen_deferred_apply_ms - elapsed_ms);
         }
+    }
+
+    if (gen_running && (gen_sweep_mode != 0 || gen_fm_mode != 0)) {
+
+        if (gen_sweep_mode != 0) {
+            gen_sweep_elapsed_ms += elapsed_ms;
+            if (gen_sweep_elapsed_ms >= gen_sweep_ms) {
+                gen_sweep_elapsed_ms = 0; 
+            }
+        } else {
+            gen_sweep_elapsed_ms = 0;
+        }
+
+        if (gen_fm_mode != 0) {
+            gen_fm_elapsed_ms += elapsed_ms;
+            if (gen_fm_elapsed_ms > 10000) {
+                gen_fm_elapsed_ms %= 10000;
+            }
+        } else {
+            gen_fm_elapsed_ms = 0;
+        }
+        
+        gen_apply();
+    } else {
+        gen_sweep_elapsed_ms = 0;
+        gen_fm_elapsed_ms = 0;
     }
 
     if (ui.overlay != UI_OVERLAY_NONE) {
