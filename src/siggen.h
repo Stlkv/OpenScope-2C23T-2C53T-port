@@ -18,9 +18,12 @@ enum {
     SIGGEN_WAVE_LORENTZ,
     SIGGEN_WAVE_TRIANGLE,
     SIGGEN_WAVE_NOISE,
+    SIGGEN_WAVE_ARBITRARY,
     SIGGEN_WAVE_COUNT,
 };
 
 void siggen_configure(uint8_t enabled, uint8_t wave, uint32_t freq_hz, uint8_t duty_percent, uint8_t amplitude_tenths_v);
+void siggen_set_arb_waveform(const uint8_t *samples, uint16_t count);
+const uint8_t *siggen_get_arb_waveform(uint16_t *count);
 void siggen_shutdown(void);
 uint8_t siggen_ready(void);

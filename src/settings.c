@@ -25,6 +25,19 @@ enum {
     SETTINGS_STATE_SCOPE_POS = 0xD1u,
     SETTINGS_STATE_MATH_MENU = 0xD2u,
     SETTINGS_STATE_SIGGEN_SWEEP_FM = 0xD3u,
+    SETTINGS_STATE_BODE_START_LO = 0xD4u,
+    SETTINGS_STATE_BODE_START_HI = 0xD5u,
+    SETTINGS_STATE_BODE_STOP_LO = 0xD6u,
+    SETTINGS_STATE_BODE_STOP_HI = 0xD7u,
+    SETTINGS_STATE_BODE_CFG = 0xD8u,
+    SETTINGS_STATE_SIGGEN_SWEEP_MS_LO = 0xD9u,
+    SETTINGS_STATE_SIGGEN_SWEEP_MS_HI = 0xDAu,
+    SETTINGS_STATE_SIGGEN_FM_FREQ_LO = 0xDBu,
+    SETTINGS_STATE_SIGGEN_FM_FREQ_HI = 0xDCu,
+    SETTINGS_STATE_SIGGEN_SWEEP_START_LO = 0xDDu,
+    SETTINGS_STATE_SIGGEN_SWEEP_START_HI = 0xDEu,
+    SETTINGS_STATE_SIGGEN_SWEEP_STOP_LO = 0xDFu,
+    SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI = 0xE0u,
     SETTINGS_SCOPE_BIAS_DEFAULT = 1861u,
     SETTINGS_SCOPE_BIAS_RATE_DEFAULT = 505u,
     SETTINGS_SCOPE_CAL_WORDS = SETTINGS_SCOPE_CHANNEL_COUNT * SETTINGS_SCOPE_RANGE_COUNT * 2,
@@ -98,6 +111,9 @@ static void settings_defaults(settings_state_t *settings) {
     settings->siggen_fm_mode = 0;
     settings->siggen_fm_source = 0;
     settings->siggen_fm_freq_hz = 100;
+    settings->bode_start_hz = 100u;
+    settings->bode_stop_hz = 100000u;
+    settings->bode_steps = 40u;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         settings->scope_ch_enabled[ch] = 1;
         settings->scope_probe_x10[ch] = 0;
@@ -150,6 +166,9 @@ static void settings_copy(settings_state_t *dst, const settings_state_t *src) {
     dst->siggen_fm_mode    = src->siggen_fm_mode;
     dst->siggen_fm_source  = src->siggen_fm_source;
     dst->siggen_fm_freq_hz = src->siggen_fm_freq_hz;
+    dst->bode_start_hz = src->bode_start_hz;
+    dst->bode_stop_hz = src->bode_stop_hz;
+    dst->bode_steps = src->bode_steps;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         dst->scope_ch_enabled[ch] = src->scope_ch_enabled[ch];
         dst->scope_probe_x10[ch] = src->scope_probe_x10[ch];
@@ -197,7 +216,17 @@ static uint8_t settings_equal(const settings_state_t *a, const settings_state_t 
         a->siggen_amp_tenths_v != b->siggen_amp_tenths_v ||
         a->siggen_freq_unit != b->siggen_freq_unit ||
         a->siggen_running != b->siggen_running ||
-        a->siggen_freq_hz != b->siggen_freq_hz) {
+        a->siggen_freq_hz != b->siggen_freq_hz ||
+        a->siggen_sweep_mode != b->siggen_sweep_mode ||
+        a->siggen_sweep_ms != b->siggen_sweep_ms ||
+        a->siggen_sweep_start_hz != b->siggen_sweep_start_hz ||
+        a->siggen_sweep_stop_hz != b->siggen_sweep_stop_hz ||
+        a->siggen_fm_mode != b->siggen_fm_mode ||
+        a->siggen_fm_source != b->siggen_fm_source ||
+        a->siggen_fm_freq_hz != b->siggen_fm_freq_hz ||
+        a->bode_start_hz != b->bode_start_hz ||
+        a->bode_stop_hz != b->bode_stop_hz ||
+        a->bode_steps != b->bode_steps) {
         return 0;
     }
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
@@ -278,7 +307,7 @@ static void settings_clamp(settings_state_t *settings) {
     if (settings->scope_math_op >= 3u) {
         settings->scope_math_op = 0u;   // Default to CH1 + CH2
     }
-    if (settings->scope_fft_src >= 4u) {
+    if (settings->scope_fft_src >= 5u) {
         settings->scope_fft_src = 0u;
     }
     if (settings->scope_math_selected >= 6u) {
@@ -317,16 +346,31 @@ static void settings_clamp(settings_state_t *settings) {
     if (settings->siggen_sweep_ms > 9999) settings->siggen_sweep_ms = 9999;
     
     if (settings->siggen_sweep_start_hz < 1) settings->siggen_sweep_start_hz = 1;
-    if (settings->siggen_sweep_start_hz > 4999) settings->siggen_sweep_start_hz = 4999;
+    if (settings->siggen_sweep_start_hz > SETTINGS_SIGGEN_MAX_FREQ_HZ) settings->siggen_sweep_start_hz = SETTINGS_SIGGEN_MAX_FREQ_HZ;
 
     if (settings->siggen_sweep_stop_hz < 1) settings->siggen_sweep_stop_hz = 1;
-    if (settings->siggen_sweep_stop_hz > 4999) settings->siggen_sweep_stop_hz = 4999;
+    if (settings->siggen_sweep_stop_hz > SETTINGS_SIGGEN_MAX_FREQ_HZ) settings->siggen_sweep_stop_hz = SETTINGS_SIGGEN_MAX_FREQ_HZ;
     
     if (settings->siggen_fm_mode >= 2) settings->siggen_fm_mode = 0;
     if (settings->siggen_fm_source >= 3) settings->siggen_fm_source = 0;
     
     if (settings->siggen_fm_freq_hz < 1) settings->siggen_fm_freq_hz = 1;
-    if (settings->siggen_fm_freq_hz > 9999) settings->siggen_fm_freq_hz = 9999;
+    if (settings->siggen_fm_freq_hz > SETTINGS_SIGGEN_MAX_FREQ_HZ) settings->siggen_fm_freq_hz = SETTINGS_SIGGEN_MAX_FREQ_HZ;
+    if (settings->bode_start_hz < 10u) {
+        settings->bode_start_hz = 10u;
+    } else if (settings->bode_start_hz > SETTINGS_SIGGEN_MAX_FREQ_HZ) {
+        settings->bode_start_hz = SETTINGS_SIGGEN_MAX_FREQ_HZ;
+    }
+    if (settings->bode_stop_hz < 100u) {
+        settings->bode_stop_hz = 100u;
+    } else if (settings->bode_stop_hz > SETTINGS_SIGGEN_MAX_FREQ_HZ) {
+        settings->bode_stop_hz = SETTINGS_SIGGEN_MAX_FREQ_HZ;
+    }
+    if (settings->bode_steps < 10u) {
+        settings->bode_steps = 10u;
+    } else if (settings->bode_steps > 80u) {
+        settings->bode_steps = 80u;
+    }
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         settings->scope_ch_enabled[ch] = settings->scope_ch_enabled[ch] ? 1u : 0u;
         settings->scope_probe_x10[ch] = settings->scope_probe_x10[ch] ? 1u : 0u;
@@ -521,18 +565,42 @@ static uint8_t settings_state_record_valid(uint32_t record, settings_state_t *se
     } else if (type == SETTINGS_STATE_MATH_MENU) {
         settings->scope_math_mode     = (uint8_t)(payload & 0x01u);
         settings->scope_math_op       = (uint8_t)((payload >> 1) & 0x03u);
-        settings->scope_fft_src       = (uint8_t)((payload >> 3) & 0x03u);
-        settings->scope_math_selected = (uint8_t)((payload >> 5) & 0x07u);
-        settings->scope_fft_window    = (uint8_t)((payload >> 8) & 0x03u);
-        settings->scope_fft_display   = (uint8_t)((payload >> 10) & 0x03u);
-        settings->scope_hide_traces   = (uint8_t)((payload >> 12) & 0x03u);
+        settings->scope_fft_src       = (uint8_t)((payload >> 3) & 0x07u);
+        settings->scope_math_selected = (uint8_t)((payload >> 6) & 0x07u);
+        settings->scope_fft_window    = (uint8_t)((payload >> 9) & 0x03u);
+        settings->scope_fft_display   = (uint8_t)((payload >> 11) & 0x03u);
+        settings->scope_hide_traces   = (uint8_t)((payload >> 13) & 0x03u);
+    } else if (type == SETTINGS_STATE_BODE_START_LO) {
+        settings->bode_start_hz = (settings->bode_start_hz & 0xFFFF0000u) | payload;
+    } else if (type == SETTINGS_STATE_BODE_START_HI) {
+        settings->bode_start_hz = (settings->bode_start_hz & 0x0000FFFFu) | ((uint32_t)payload << 16);
+    } else if (type == SETTINGS_STATE_BODE_STOP_LO) {
+        settings->bode_stop_hz = (settings->bode_stop_hz & 0xFFFF0000u) | payload;
+    } else if (type == SETTINGS_STATE_BODE_STOP_HI) {
+        settings->bode_stop_hz = (settings->bode_stop_hz & 0x0000FFFFu) | ((uint32_t)payload << 16);
+    } else if (type == SETTINGS_STATE_BODE_CFG) {
+        settings->bode_steps = (uint8_t)(payload & 0xFFu);
     } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_FM) {
         settings->siggen_sweep_mode = (uint8_t)(payload & 3u);
         settings->siggen_fm_mode    = (uint8_t)((payload >> 2) & 1u);
         settings->siggen_fm_source  = (uint8_t)((payload >> 3) & 3u);
-        settings->siggen_sweep_ms   = (uint32_t)((payload >> 5) & 0x3FFFu); // 14 bits
-        settings->siggen_fm_freq_hz = (uint32_t)((payload >> 19) & 0x3FFFu); // 14 bits
         return 1;
+    } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_MS_LO) {
+        settings->siggen_sweep_ms = (settings->siggen_sweep_ms & 0xFFFF0000u) | payload;
+    } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_MS_HI) {
+        settings->siggen_sweep_ms = (settings->siggen_sweep_ms & 0x0000FFFFu) | ((uint32_t)payload << 16);
+    } else if (type == SETTINGS_STATE_SIGGEN_FM_FREQ_LO) {
+        settings->siggen_fm_freq_hz = (settings->siggen_fm_freq_hz & 0xFFFF0000u) | payload;
+    } else if (type == SETTINGS_STATE_SIGGEN_FM_FREQ_HI) {
+        settings->siggen_fm_freq_hz = (settings->siggen_fm_freq_hz & 0x0000FFFFu) | ((uint32_t)payload << 16);
+    } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_START_LO) {
+        settings->siggen_sweep_start_hz = (settings->siggen_sweep_start_hz & 0xFFFF0000u) | payload;
+    } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_START_HI) {
+        settings->siggen_sweep_start_hz = (settings->siggen_sweep_start_hz & 0x0000FFFFu) | ((uint32_t)payload << 16);
+    } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_STOP_LO) {
+        settings->siggen_sweep_stop_hz = (settings->siggen_sweep_stop_hz & 0xFFFF0000u) | payload;
+    } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI) {
+        settings->siggen_sweep_stop_hz = (settings->siggen_sweep_stop_hz & 0x0000FFFFu) | ((uint32_t)payload << 16);
     } else {
         return 0;
     }
@@ -601,20 +669,62 @@ static void settings_write_state_records(uint32_t *addr, const settings_state_t 
 
     payload = (uint16_t)((settings->scope_math_mode & 0x01u) |
                          ((settings->scope_math_op & 0x03u) << 1) |
-                         ((settings->scope_fft_src & 0x03u) << 3) |
-                         ((settings->scope_math_selected & 0x07u) << 5) |
-                         ((settings->scope_fft_window & 0x03u) << 8) |
-                         ((settings->scope_fft_display & 0x03u) << 10) |
-                         ((settings->scope_hide_traces & 0x03u) << 12));
+                         ((settings->scope_fft_src & 0x07u) << 3) |
+                         ((settings->scope_math_selected & 0x07u) << 6) |
+                         ((settings->scope_fft_window & 0x03u) << 9) |
+                         ((settings->scope_fft_display & 0x03u) << 11) |
+                         ((settings->scope_hide_traces & 0x03u) << 13));
     flash_program_word(*addr, settings_state_record(SETTINGS_STATE_MATH_MENU, payload));
     *addr += 4u;
 
-    payload = ((uint32_t)settings->siggen_sweep_mode) |
-                               ((uint32_t)settings->siggen_fm_mode << 2) |
-                               ((uint32_t)settings->siggen_fm_source << 3) |
-                               ((uint32_t)(settings->siggen_sweep_ms & 0x3FFFu) << 5) |
-                               ((uint32_t)(settings->siggen_fm_freq_hz & 0x3FFFu) << 19);
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_BODE_START_LO,
+                                                    (uint16_t)settings->bode_start_hz));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_BODE_START_HI,
+                                                    (uint16_t)(settings->bode_start_hz >> 16)));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_BODE_STOP_LO,
+                                                    (uint16_t)settings->bode_stop_hz));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_BODE_STOP_HI,
+                                                    (uint16_t)(settings->bode_stop_hz >> 16)));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_BODE_CFG,
+                                                    (uint16_t)settings->bode_steps));
+    *addr += 4u;
+
+    payload = (uint16_t)((settings->siggen_sweep_mode & 3u) |
+                         ((settings->siggen_fm_mode & 1u) << 2) |
+                         ((settings->siggen_fm_source & 3u) << 3));
     flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_FM, payload));
+    *addr += 4u;
+
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_MS_LO,
+                                                    (uint16_t)settings->siggen_sweep_ms));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_MS_HI,
+                                                    (uint16_t)(settings->siggen_sweep_ms >> 16)));
+    *addr += 4u;
+
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_FM_FREQ_LO,
+                                                    (uint16_t)settings->siggen_fm_freq_hz));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_FM_FREQ_HI,
+                                                    (uint16_t)(settings->siggen_fm_freq_hz >> 16)));
+    *addr += 4u;
+
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_START_LO,
+                                                    (uint16_t)settings->siggen_sweep_start_hz));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_START_HI,
+                                                    (uint16_t)(settings->siggen_sweep_start_hz >> 16)));
+    *addr += 4u;
+
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_STOP_LO,
+                                                    (uint16_t)settings->siggen_sweep_stop_hz));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI,
+                                                    (uint16_t)(settings->siggen_sweep_stop_hz >> 16)));
     *addr += 4u;
 }
 

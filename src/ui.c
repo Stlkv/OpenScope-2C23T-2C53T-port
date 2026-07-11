@@ -11,6 +11,7 @@
 #include "scope.h"
 #include "usb_msc.h"
 #include "fft.h"
+#include "arb_csv.h"
 
 #include <stdint.h>
 
@@ -85,6 +86,38 @@ typedef enum {
     UI_OVERLAY_MODE_MENU,
     UI_OVERLAY_SETTINGS,
 } ui_overlay_t;
+
+typedef enum {
+    MENU_ITEM_PLOT = 0,
+    MENU_ITEM_FFT_WINDOW,
+    MENU_ITEM_FFT_DISPLAY,
+    MENU_ITEM_MATH_MODE,
+    MENU_ITEM_MATH_OP,
+    MENU_ITEM_HIDE_TRACES,
+
+    MENU_ITEM_BODE_START,
+    MENU_ITEM_BODE_STOP,
+    MENU_ITEM_BODE_STEPS,
+    MENU_ITEM_BODE_SWEEP
+} math_menu_item_t;
+
+static const uint8_t math_menu_order[] = {
+    MENU_ITEM_PLOT,
+    MENU_ITEM_FFT_WINDOW,
+    MENU_ITEM_FFT_DISPLAY,
+    MENU_ITEM_MATH_MODE,
+    MENU_ITEM_MATH_OP,
+    MENU_ITEM_HIDE_TRACES
+};
+
+static const uint8_t bode_menu_order[] = {
+    MENU_ITEM_PLOT,
+    MENU_ITEM_BODE_START,
+    MENU_ITEM_BODE_STOP,
+    MENU_ITEM_BODE_STEPS,
+    MENU_ITEM_BODE_SWEEP
+};
+
 
 typedef struct {
     ui_mode_t mode;
@@ -237,17 +270,24 @@ static uint8_t gen_output_applied;
 static uint8_t gen_running;
 static uint8_t gen_sweep_menu_active = 0;
 static uint8_t gen_sweep_row_selected = 0; // 0 to 4
-static uint8_t gen_sweep_digit_index = 0; // 0 to 3 (which of the 4 digits is active)
-static uint8_t gen_sweep_edit_active = 0; // 1 if we clicked into a digit editor field 
+static uint8_t ui_edit_digit_index = 0; // 0 to 3 (which of the 4 digits is active)
+static uint8_t ui_edit_digit_active = 0; // 1 if we clicked into a digit editor field 
 static uint8_t gen_sweep_mode = 0;
 static uint32_t siggen_sweep_start_hz = 0;
-static uint32_t siggen_sweep_stop_hz = 4999;
+static uint32_t siggen_sweep_stop_hz = 9999;
 static uint16_t gen_sweep_ms = 1000;
 static uint8_t gen_fm_mode = 0;
 static uint8_t gen_fm_source = 0;
-static uint16_t gen_fm_freq_hz = 1000;
+static uint32_t gen_fm_freq_hz = 1000;
 static uint32_t gen_sweep_elapsed_ms = 0;
+static uint8_t sweep_start_unit = 0;
+static uint8_t sweep_stop_unit = 0;
+static uint8_t fm_freq_unit = 0;
 static uint32_t gen_fm_elapsed_ms = 0;
+static uint8_t arb_file_index;
+static uint8_t arb_loaded;
+static uint16_t arb_sample_count;
+static uint8_t arb_samples[2048];
 static uint8_t scope_samples[SCOPE_SAMPLE_BYTES] __attribute__((aligned(4)));
 static uint8_t scope_capture_samples[SCOPE_SAMPLE_BYTES] __attribute__((aligned(4)));
 static uint8_t scope_frame_valid;
@@ -308,7 +348,7 @@ static uint8_t ui_math_menu_visible = 0; // 0 = Hidden, 1 = Displayed on Screen
 static uint8_t scope_math_selected = 0; // 0=MODE, 1=MATH OP, 2=FFT DISPLAY/XY, 3=WINDOW, 4=CLEAR HISTORY, 5=HIDE TRACES
 static uint8_t scope_math_mode = 0; // 0 = OFF, 1 = ON
 static uint8_t scope_math_op = 0; // 0 = A+B, 1 = A-B, 2 = B-A
-static uint8_t scope_fft_src = 0; // 0 = OFF, 1 = CH1, 2 = CH2, 3 = XY MODE
+static uint8_t scope_fft_src = 0; // 0 = OFF, 1 = CH1, 2 = CH2, 3 = XY MODE, 4 = BODE
 static uint8_t scope_fft_window = 0;  // 0 = HANN, 1 = HAMMING, 2 = BLACKMAN, 3 = RECTANGLE
 static uint8_t scope_fft_display = 0; // 0 = NORMAL, 1 = AVERAGING, 2 = MAX HOLD
 // Static array to preserve history across frames for display processing
@@ -316,6 +356,24 @@ static float fft_history[FFT_SIZE / 2] = {0.0f};
 static float fft_input_buffer[FFT_SIZE];
 static float fft_output_buffer[FFT_SIZE / 2];
 static uint8_t scope_hide_traces = 0; // 0=NONE, 1=CH1, 2=CH2, 3=ALL
+static uint32_t bode_start_hz = 100u;
+static uint32_t bode_stop_hz = 100000u;
+static uint8_t bode_steps = 40u;
+static uint8_t bode_start_unit = 0;
+static uint8_t bode_stop_unit = 0;
+static uint8_t bode_current_step = 0;
+static uint8_t bode_is_sweeping = 0;
+static uint8_t bode_cursor_sub = 0;  // 0=F (freq), 1=DB, 2=DEG
+static float bode_gain_db[120];
+static float bode_phase_deg[120];
+static uint8_t bode_dwell_frames = 0;
+static uint32_t bode_step_freq_hz = 0;
+static uint8_t bode_siggen_active = 0;
+static uint8_t scope_fft_src_menu_saved = 0;
+static uint8_t bode_hide_traces_saved = 0;
+enum {
+    BODE_DWELL_FRAMES = 4u,
+};
 static int32_t dmm_rel_ref_milli;
 static char dmm_hold_value[10];
 static char dmm_hold_unit[6];
@@ -367,6 +425,9 @@ static void ui_settings_copy(settings_state_t *dst, const settings_state_t *src)
     dst->siggen_fm_mode = src->siggen_fm_mode;
     dst->siggen_fm_source = src->siggen_fm_source;
     dst->siggen_fm_freq_hz = src->siggen_fm_freq_hz;
+    dst->bode_start_hz = src->bode_start_hz;
+    dst->bode_stop_hz = src->bode_stop_hz;
+    dst->bode_steps = src->bode_steps;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         dst->scope_ch_enabled[ch] = src->scope_ch_enabled[ch];
         dst->scope_probe_x10[ch] = src->scope_probe_x10[ch];
@@ -418,6 +479,7 @@ enum {
     SCOPE_CURSOR_OFF,
     SCOPE_CURSOR_TIME,
     SCOPE_CURSOR_LEVEL,
+    SCOPE_CURSOR_BODE,
     SCOPE_CURSOR_COUNT,
 };
 
@@ -553,8 +615,8 @@ enum {
 };
 static const char *const scope_display_labels[] = {"Y-T", "ROLL", "X-Y"};
 static const char *const scope_display_short[] = {"YT", "ROLL", "XY"};
-static const char *const scope_cursor_labels[] = {"CUR OFF", "T CUR", "Y CUR"};
-static const char *const scope_cursor_short[] = {"OFF", "T", "Y"};
+static const char *const scope_cursor_labels[] = {"CUR OFF", "T CUR", "Y CUR", "B CUR"};
+static const char *const scope_cursor_short[] = {"OFF", "T", "Y", "B"};
 static const char *const scope_trigger_short[] = {"AUTO", "NORM", "SNGL"};
 static const char *const scope_measure_labels[] = {"VPP", "VMAX", "VMIN", "VAVG", "VRMS", "FREQ"};
 static const char *const scope_param_labels[] = {
@@ -582,12 +644,12 @@ static const uint8_t scope_trigger_param_order[] = {
 static const char *const gen_wave_labels[] = {
     "SINE", "RECT", "SAW", "HALF", "FULL",
     "P STEP", "R STEP", "EXP UP", "EXP DN", "DC",
-    "MULTI AUD", "SINK PLS", "LORENTZ", "TRIANGLE", "NOISE",
+    "MULTI AUD", "SINK PLS", "LORENTZ", "TRIANGLE", "NOISE", "ARBITRARY",
 };
 static const char *const gen_wave_short_labels[] = {
     "SINE", "RECT", "SAW", "HALF", "FULL",
     "PSTEP", "RSTEP", "EXP+", "EXP-", "DC",
-    "MULTI", "SINK", "LOR", "TRI", "NOISE",
+    "MULTI", "SINK", "LOR", "TRI", "NOISE", "ARBT",
 };
 static const uint8_t gen_wave_order[] = {
     SIGGEN_WAVE_SINE,
@@ -597,6 +659,7 @@ static const uint8_t gen_wave_order[] = {
     SIGGEN_WAVE_HALF,
     SIGGEN_WAVE_NOISE,
     SIGGEN_WAVE_DC,
+    SIGGEN_WAVE_ARBITRARY,
     SIGGEN_WAVE_SAW,
     SIGGEN_WAVE_POS_STEP,
     SIGGEN_WAVE_REV_STEP,
@@ -649,6 +712,7 @@ static void scope_format_delta_time(char out[14]);
 static void scope_format_delta_level(char out[14]);
 static void scope_format_frequency_reading(char out[12], uint32_t hz);
 static void scope_text_copy(char *dst, const char *src, uint8_t max_len);
+static uint8_t scope_text_len(const char *text);
 static void ui_text_append(char *dst, const char *src, uint8_t max_len);
 static void scope_step_measure_param(int8_t dir);
 static void scope_toggle_measure_for_channel(uint8_t idx);
@@ -668,6 +732,19 @@ static void ui_apply_saved_runtime_settings(void);
 static uint8_t scope_any_menu_open(void);
 static uint8_t scope_softkey_menu_open(void);
 static void scope_clear_menus(void);
+static void scope_trace_invalidate(void);
+static void scope_apply_settings_keep_frame(uint8_t keep_frame);
+static void ui_render_scope_frame(void);
+static uint32_t bode_step_freq_for(uint8_t step, uint8_t total_steps);
+static uint8_t bode_auto_timebase(uint32_t freq_hz);
+static void bode_begin_sweep(void);
+static void bode_shutdown(void);
+static void bode_apply_step_freq(void);
+static uint8_t bode_measure_step(uint8_t step);
+static void bode_sweep_service(void);
+static void bode_extract_channel(uint8_t target_ch, float *dst);
+static void scope_fft_src_apply_from(uint8_t old_src, uint8_t new_src);
+static void ui_draw_bode(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t gh);
 
 static uint16_t mode_accent(void) {
     if (ui.mode == UI_MODE_SCOPE) {
@@ -763,6 +840,17 @@ static uint32_t gen_freq_unit_multiplier(uint8_t unit) {
         return 1000u;
     }
     return 1u;
+}
+
+static uint32_t freq_clamp_display(uint32_t hz, uint8_t unit) {
+    uint32_t mult = gen_freq_unit_multiplier(unit);
+    if (!mult) return 1u;
+    uint32_t value = hz / mult;
+    uint32_t max_val = GEN_MAX_FREQ_HZ / mult;
+    if (max_val > 9999u) max_val = 9999u;
+    if (value < 1u) return 1u;
+    if (value > max_val) return max_val;
+    return value;
 }
 
 static uint16_t gen_freq_unit_max_value(uint8_t unit) {
@@ -978,6 +1066,9 @@ static void draw_all_active_status_icons(uint16_t start_x, uint16_t y, uint16_t 
         current_x -= 30u;
     } else if (scope_fft_src == 3u) {
         draw_header_icon(current_x, y, "X-Y", C_GEN, bg);
+        current_x -= 30u;
+    } else if (scope_fft_src == 4u) {
+        draw_header_icon(current_x, y, "BOD", C_GEN, bg);
         current_x -= 30u;
     }
 
@@ -1432,11 +1523,31 @@ static const char *scope_display_label(void) {
 }
 
 static const char *scope_cursor_label(void) {
-    return scope_cursor_labels[scope_safe_cursor()];
+    uint8_t mode = scope_safe_cursor();
+
+    if (scope_fft_src == 4u && mode == SCOPE_CURSOR_BODE) {
+        if (bode_cursor_sub == 0u) return "F CUR";
+        if (bode_cursor_sub == 1u) return "DB CUR";
+        return "PH CUR";
+    }
+    if ((scope_fft_src == 1u || scope_fft_src == 2u) && mode == SCOPE_CURSOR_TIME) {
+        return "F CUR";
+    }
+    return scope_cursor_labels[mode];
 }
 
 static const char *scope_cursor_chip_label(void) {
-    return scope_cursor_short[scope_safe_cursor()];
+    uint8_t mode = scope_safe_cursor();
+
+    if (scope_fft_src == 4u && mode == SCOPE_CURSOR_BODE) {
+        if (bode_cursor_sub == 1u) return "DB";
+        if (bode_cursor_sub == 2u) return "DEG";
+        return "F";
+    }
+    if ((scope_fft_src == 1u || scope_fft_src == 2u) && mode == SCOPE_CURSOR_TIME) {
+        return "F";
+    }
+    return scope_cursor_short[mode];
 }
 
 static const char *scope_timebase_label(void) {
@@ -1574,6 +1685,26 @@ static const char *scope_trigger_edge_label(void) {
     return ui.scope_trigger_edge ? "FALL" : "RISE";
 }
 
+static void math_menu_step_selected(int8_t dir) {
+    uint8_t rows;
+    
+    if (scope_fft_src == 4u) {
+        rows = sizeof(bode_menu_order) / sizeof(bode_menu_order[0]);
+    } else {
+        rows = sizeof(math_menu_order) / sizeof(math_menu_order[0]);
+    }
+
+    if (dir > 0) {
+        scope_math_selected = (scope_math_selected + 1) % rows;
+    } else {
+        if (scope_math_selected == 0) {
+            scope_math_selected = rows - 1;
+        } else {
+            scope_math_selected--;
+        }
+    }
+}
+
 static void ui_draw_math_menu(void) {
     if (!ui_math_menu_visible) {
         return;
@@ -1581,70 +1712,194 @@ static void ui_draw_math_menu(void) {
 
     const char *math_status_text[] = { "OFF", "ON" };
     const char *math_op_text[]     = { "CH1 + CH2", "CH1 - CH2", "CH2 - CH1" };
-    const char *fft_status_text[] = { "OFF", "CH1 ENABLED", "CH2 ENABLED", "XY MODE" };
-    
+    const char *fft_status_text[]  = { "OFF", "FFT CH1", "FFT CH2", "XY MODE", "BODE PLOT" };
     const char *fft_window_text[]  = { "HANN", "HAMMING", "BLACKMAN", "RECTANGLE" };
     const char *fft_display_text[] = { "NORMAL", "AVERAGING", "MAX HOLD" };
-
     const char *hide_traces_text[] = { "NONE", "CH1", "CH2", "ALL" };
+
+    const uint8_t *menu;
+    uint8_t rows;
 
     uint16_t box_x = 50;
     uint16_t box_y = 60;
     uint16_t box_w = 220;
-    uint16_t box_h = 144;
+    uint16_t row_y;
+    uint16_t color_bg;
+    uint16_t color_fg;
 
-    // window background and border
-    lcd_rect(box_x, box_y, box_w, box_h, RGB565(30, 30, 45)); 
-    lcd_frame(box_x, box_y, box_w, box_h, RGB565(255, 165, 0)); 
+    if (scope_fft_src == 4u) {
+        menu = bode_menu_order;
+        rows = sizeof(bode_menu_order) / sizeof(bode_menu_order[0]);
+    } else {
+        menu = math_menu_order;
+        rows = sizeof(math_menu_order) / sizeof(math_menu_order[0]);
+    }
 
-    // Header Title Text
-    lcd_text(box_x + 10, box_y + 8, "ANALYTICAL / MATH MENU", RGB565(255, 255, 255), RGB565(30, 30, 45), 1);
-    lcd_rect(box_x + 10, box_y + 20, box_w - 20, 1, RGB565(100, 100, 100)); 
+    uint16_t box_h = (uint16_t)(36u + rows * 18u);
 
-    uint16_t color_fg, color_bg;
+    // Draw menu background and frame
+    lcd_rect(box_x, box_y, box_w, box_h, RGB565(30, 30, 45));
+    lcd_frame(box_x, box_y, box_w, box_h, RGB565(255, 165, 0));
 
-    // Math Enable
-    color_bg = (scope_math_selected == 0) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = RGB565(255, 255, 255);
-    lcd_rect(box_x + 8, box_y + 26, box_w - 16, 14, color_bg);
-    lcd_text(box_x + 12, box_y + 29, "MATH MODE:", color_fg, color_bg, 1);
-    lcd_text(box_x + 110, box_y + 29, math_status_text[scope_math_mode], color_fg, color_bg, 1);
+    lcd_text(box_x + 10, box_y + 8, "MATH / BODE MENU", RGB565(255, 255, 255), RGB565(30, 30, 45), 1);
+    lcd_rect(box_x + 10, box_y + 20, box_w - 20, 1, RGB565(100, 100, 100));
 
-    // Math Equation Operator
-    color_bg = (scope_math_selected == 1) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = (scope_math_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); // Dim line if Math is OFF
-    lcd_rect(box_x + 8, box_y + 44, box_w - 16, 14, color_bg);
-    lcd_text(box_x + 12, box_y + 47, "MATH OP:", color_fg, color_bg, 1);
-    lcd_text(box_x + 110, box_y + 47, math_op_text[scope_math_op], color_fg, color_bg, 1);
+    row_y = box_y + 26;
 
-    // FFT Target Channel Source
-    color_bg = (scope_math_selected == 2) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = RGB565(255, 255, 255);
-    lcd_rect(box_x + 8, box_y + 62, box_w - 16, 14, color_bg);
-    lcd_text(box_x + 12, box_y + 65, "FFT MODE:", color_fg, color_bg, 1);
-    lcd_text(box_x + 110, box_y + 65, fft_status_text[scope_fft_src], color_fg, color_bg, 1);
+    for (uint8_t row = 0; row < rows; row++) {
+        uint8_t item = menu[row];
 
-    // FFT window func
-    color_bg = (scope_math_selected == 3) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    // Dim if FFT is OFF (0) OR set to XY MODE (3)
-    color_fg = (scope_fft_src == 1 || scope_fft_src == 2) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
-    lcd_rect(box_x + 8, box_y + 80, box_w - 16, 14, color_bg);
-    lcd_text(box_x + 12, box_y + 83, "FFT WINDOW:", color_fg, color_bg, 1);
-    lcd_text(box_x + 110, box_y + 83, fft_window_text[scope_fft_window], color_fg, color_bg, 1);
+        color_bg = (scope_math_selected == row) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
+        color_fg = RGB565(255, 255, 255);
 
-    // FFT display mode
-    color_bg = (scope_math_selected == 4) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    // Dim if FFT is OFF (0) OR set to XY MODE (3)
-    color_fg = (scope_fft_src == 1 || scope_fft_src == 2) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
-    lcd_rect(box_x + 8, box_y + 98, box_w - 16, 14, color_bg);
-    lcd_text(box_x + 12, box_y + 101, "FFT DISPLAY:", color_fg, color_bg, 1);
-    lcd_text(box_x + 110, box_y + 101, fft_display_text[scope_fft_display], color_fg, color_bg, 1);
+        lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
 
-    color_bg = (scope_math_selected == 5) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = RGB565(255, 255, 255);
-    lcd_rect(box_x + 8, box_y + 116, box_w - 16, 14, color_bg);
-    lcd_text(box_x + 12, box_y + 119, "HIDE TRACES:", color_fg, color_bg, 1);
-    lcd_text(box_x + 110, box_y + 119, hide_traces_text[scope_hide_traces], color_fg, color_bg, 1);
+        switch (item) {
+            case MENU_ITEM_PLOT:
+                lcd_text(box_x + 12, row_y + 3, "PLOT MODE:", color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, fft_status_text[scope_fft_src], color_fg, color_bg, 1);
+                break;
+
+            case MENU_ITEM_FFT_WINDOW:
+                if (scope_fft_src != 1 && scope_fft_src != 2) color_fg = RGB565(120, 120, 120);
+                lcd_text(box_x + 12, row_y + 3, "FFT WINDOW:", color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, fft_window_text[scope_fft_window], color_fg, color_bg, 1);
+                break;
+
+            case MENU_ITEM_FFT_DISPLAY:
+                if (scope_fft_src != 1 && scope_fft_src != 2) color_fg = RGB565(120, 120, 120);
+                lcd_text(box_x + 12, row_y + 3, "FFT DISPLAY:", color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, fft_display_text[scope_fft_display], color_fg, color_bg, 1);
+                break;
+
+            case MENU_ITEM_MATH_MODE:
+                lcd_text(box_x + 12, row_y + 3, "MATH MODE:", color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, math_status_text[scope_math_mode], color_fg, color_bg, 1);
+                break;
+
+            case MENU_ITEM_MATH_OP:
+                if (!scope_math_mode) color_fg = RGB565(120, 120, 120);
+                lcd_text(box_x + 12, row_y + 3, "MATH OP:", color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, math_op_text[scope_math_op], color_fg, color_bg, 1);
+                break;
+
+            case MENU_ITEM_HIDE_TRACES:
+                lcd_text(box_x + 12, row_y + 3, "HIDE TRACES:", color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, hide_traces_text[scope_hide_traces], color_fg, color_bg, 1);
+                break;
+
+            case MENU_ITEM_BODE_START:
+                lcd_text(box_x + 12, row_y + 3, "START FREQ:", color_fg, color_bg, 1);
+                {
+                    uint16_t bstart_display = (uint16_t)freq_clamp_display(bode_start_hz, bode_start_unit);
+                    char start_digits[5];
+                    start_digits[0] = (char)('0' + ((bstart_display / 1000u) % 10u));
+                    start_digits[1] = (char)('0' + ((bstart_display / 100u) % 10u));
+                    start_digits[2] = (char)('0' + ((bstart_display / 10u) % 10u));
+                    start_digits[3] = (char)('0' + (bstart_display % 10u));
+                    start_digits[4] = '\0';
+
+                    uint8_t bstart_edit = (uint8_t)(ui_edit_digit_active && scope_math_selected == row);
+                    if (bstart_edit) {
+                        for (uint8_t d = 0; d < 4u; ++d) {
+                            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+                            char d_str[2] = { start_digits[d], '\0' };
+                            if (d == ui_edit_digit_index) {
+                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                            } else {
+                                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+                            }
+                        }
+                    } else {
+                        lcd_text(box_x + 110, row_y + 3, start_digits, color_fg, color_bg, 1);
+                    }
+                    {
+                        uint16_t ux = (uint16_t)(box_x + 110 + (4 * 6) + 2);
+                        uint8_t uselected = (uint8_t)(bstart_edit && ui_edit_digit_index == 4u);
+                        static const char * const bsun[] = {"Hz", "kHz", "MHz"};
+                        uint8_t bsun_idx = bode_start_unit < 3u ? bode_start_unit : 0;
+                        lcd_text(ux, row_y + 3, bsun[bsun_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+                        if (uselected) {
+                            lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(bsun_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
+                        }
+                    }
+                }
+                break;
+
+            case MENU_ITEM_BODE_STOP:
+                lcd_text(box_x + 12, row_y + 3, "STOP FREQ:", color_fg, color_bg, 1);
+                {
+                    uint16_t bstop_display = (uint16_t)freq_clamp_display(bode_stop_hz, bode_stop_unit);
+                    char stop_digits[5];
+                    stop_digits[0] = (char)('0' + ((bstop_display / 1000u) % 10u));
+                    stop_digits[1] = (char)('0' + ((bstop_display / 100u) % 10u));
+                    stop_digits[2] = (char)('0' + ((bstop_display / 10u) % 10u));
+                    stop_digits[3] = (char)('0' + (bstop_display % 10u));
+                    stop_digits[4] = '\0';
+
+                    uint8_t bstop_edit = (uint8_t)(ui_edit_digit_active && scope_math_selected == row);
+                    if (bstop_edit) {
+                        for (uint8_t d = 0; d < 4u; ++d) {
+                            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+                            char d_str[2] = { stop_digits[d], '\0' };
+                            if (d == ui_edit_digit_index) {
+                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                            } else {
+                                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+                            }
+                        }
+                    } else {
+                        lcd_text(box_x + 110, row_y + 3, stop_digits, color_fg, color_bg, 1);
+                    }
+                    {
+                        uint16_t ux = (uint16_t)(box_x + 110 + (4 * 6) + 2);
+                        uint8_t uselected = (uint8_t)(bstop_edit && ui_edit_digit_index == 4u);
+                        static const char * const bsun[] = {"Hz", "kHz", "MHz"};
+                        uint8_t bsun_idx = bode_stop_unit < 3u ? bode_stop_unit : 0;
+                        lcd_text(ux, row_y + 3, bsun[bsun_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+                        if (uselected) {
+                            lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(bsun_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
+                        }
+                    }
+                }
+                break;
+
+            case MENU_ITEM_BODE_STEPS:
+                lcd_text(box_x + 12, row_y + 3, "STEPS:", color_fg, color_bg, 1);
+                {
+                    char steps_digits[5];
+                    steps_digits[0] = (char)('0' + ((bode_steps / 1000) % 10));
+                    steps_digits[1] = (char)('0' + ((bode_steps / 100) % 10));
+                    steps_digits[2] = (char)('0' + ((bode_steps / 10) % 10));
+                    steps_digits[3] = (char)('0' + (bode_steps % 10));
+                    steps_digits[4] = '\0';
+
+                    if (ui_edit_digit_active && scope_math_selected == row) {
+                        for (uint8_t d = 0; d < 4u; ++d) {
+                            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+                            char d_str[2] = { steps_digits[d], '\0' };
+                            if (d == ui_edit_digit_index) {
+                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                            } else {
+                                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+                            }
+                        }
+                    } else {
+                        lcd_text(box_x + 110, row_y + 3, steps_digits, color_fg, color_bg, 1);
+                    }
+                }
+                break;
+
+            case MENU_ITEM_BODE_SWEEP:
+                lcd_text(box_x + 12, row_y + 3, "SWEEP:", color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, bode_is_sweeping ? "RUNNING" : "RE-SWEEP", color_fg, color_bg, 1);
+                break;
+        }
+        row_y += 18u;
+    }
 }
 
 
@@ -1759,7 +2014,8 @@ static void ui_draw_fft_spectrum(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t
     lcd_text(gx, (uint16_t)(y_axis_top + 4u), "0.0HZ", RGB565(180, 180, 180), text_bg, 1);
 
     scope_format_frequency_reading(freq_label, (uint32_t)(f_max_hz + 0.5f));
-    lcd_text(gx + gw > 72u ? (uint16_t)(gx + gw - 72u) : gx,
+    uint16_t fw = lcd_text_width(freq_label, 1);
+    lcd_text(gx + gw > fw ? (uint16_t)(gx + gw - fw) : gx,
              (uint16_t)(y_axis_top + 4u),
              freq_label,
              RGB565(180, 180, 180),
@@ -1790,6 +2046,433 @@ static void ui_draw_fft_spectrum(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t
              RGB565(255, 255, 0),
              text_bg,
              1);
+}
+
+static float bode_ln(float x) {
+    int8_t exp = 0;
+
+    if (x <= 0.0f) {
+        return -10.0f;
+    }
+    while (x >= 2.0f) {
+        x *= 0.5f;
+        ++exp;
+    }
+    while (x < 1.0f) {
+        x *= 2.0f;
+        --exp;
+    }
+    {
+        float t = x - 1.0f;
+        float t2 = t * t;
+        float ln = t - t2 * 0.5f + t2 * t * 0.3333333f;
+        return ln + (float)exp * 0.69314718f;
+    }
+}
+
+static float bode_gain_db_from_ratio(float mag_out, float mag_in) {
+    if (mag_in <= 0.0f || mag_out <= 0.0f) {
+        return -120.0f;
+    }
+    return 8.6858896f * bode_ln(mag_out / mag_in);
+}
+
+static float bode_wrap_deg(float deg) {
+    while (deg > 180.0f) {
+        deg -= 360.0f;
+    }
+    while (deg < -180.0f) {
+        deg += 360.0f;
+    }
+    return deg;
+}
+
+static uint32_t bode_step_freq_for(uint8_t step, uint8_t total_steps) {
+    uint32_t start = bode_start_hz;
+    uint32_t stop = bode_stop_hz;
+    uint32_t progress;
+    uint32_t target;
+
+    if (total_steps <= 1u) {
+        return start ? start : 1u;
+    }
+    if (start == 0u) {
+        start = 1u;
+    }
+    if (stop == 0u) {
+        stop = 1u;
+    }
+    if (step >= total_steps) {
+        step = (uint8_t)(total_steps - 1u);
+    }
+
+    progress = ((uint32_t)step * 1024u) / (uint32_t)(total_steps - 1u);
+    if (stop >= start) {
+        uint32_t ratio = (stop << 10) / start;
+        uint32_t factor = 1024u + (((ratio - 1024u) * progress) >> 10);
+        target = (start * factor) >> 10;
+        if (target < start) {
+            target = start;
+        }
+        if (target > stop) {
+            target = stop;
+        }
+        return target;
+    }
+
+    {
+        uint32_t ratio = (start << 10) / stop;
+        uint32_t factor = 1024u + (((ratio - 1024u) * progress) >> 10);
+        target = (start << 10) / factor;
+        if (target > start) {
+            target = start;
+        }
+        if (target < stop) {
+            target = stop;
+        }
+        return target;
+    }
+}
+
+static uint8_t bode_auto_timebase(uint32_t freq_hz) {
+    uint32_t min_screen_ns;
+
+    if (freq_hz < 1u) {
+        freq_hz = 1u;
+    }
+    min_screen_ns = 3000000000u / freq_hz;
+    for (uint8_t i = 0; i < SCOPE_TIMEBASE_COUNT; ++i) {
+        uint32_t screen_ns = scope_timebase_unit_ns[i] * SCOPE_X_DIVS * 10u;
+        if (screen_ns >= min_screen_ns) {
+            return i;
+        }
+    }
+    return (uint8_t)(SCOPE_TIMEBASE_COUNT - 1u);
+}
+
+static void bode_shutdown(void) {
+    if (bode_siggen_active) {
+        siggen_shutdown();
+        bode_siggen_active = 0;
+    }
+    bode_is_sweeping = 0;
+    scope_hide_traces = bode_hide_traces_saved;
+}
+
+static void bode_apply_step_freq(void) {
+    uint32_t freq = bode_step_freq_for(bode_current_step, bode_steps);
+
+    bode_step_freq_hz = freq;
+    bode_dwell_frames = 0;
+    ui.scope_timebase = bode_auto_timebase(freq);
+    ui.scope_trigger_mode = SCOPE_TRIGGER_AUTO;
+    ui.scope_trigger_source = 1;
+    scope_ch_enabled[0] = 1;
+    scope_ch_enabled[1] = 1;
+    scope_apply_settings_keep_frame(0);
+    siggen_configure(1u,
+                     SIGGEN_WAVE_SINE,
+                     freq,
+                     50u,
+                     ui_settings.siggen_amp_tenths_v);
+    bode_siggen_active = 1;
+}
+
+static void bode_begin_sweep(void) {
+    uint16_t i;
+
+    if (bode_siggen_active) {
+        siggen_shutdown();
+        bode_siggen_active = 0;
+    }
+    bode_current_step = 0;
+    bode_is_sweeping = 1;
+    bode_dwell_frames = 0;
+    bode_hide_traces_saved = scope_hide_traces;
+    scope_hide_traces = 3;
+    for (i = 0; i < 120u; ++i) {
+        bode_gain_db[i] = 0.0f;
+        bode_phase_deg[i] = 0.0f;
+    }
+    bode_apply_step_freq();
+}
+
+static void scope_fft_src_apply_from(uint8_t old_src, uint8_t new_src) {
+    if (new_src == old_src) {
+        return;
+    }
+    if (old_src == 4u) {
+        bode_shutdown();
+    }
+    scope_fft_src = new_src;
+    if (new_src == 4u) {
+        if (scope_math_selected == 0u) {
+            scope_math_selected = 1u;
+        }
+        bode_begin_sweep();
+        bode_cursor_sub = 0;
+        ui.scope_display = SCOPE_DISPLAY_YT;
+    } else if (new_src == 3u) {
+        ui.scope_display = SCOPE_DISPLAY_XY;
+    } else {
+        ui.scope_display = SCOPE_DISPLAY_YT;
+    }
+    scope_trace_invalidate();
+}
+
+static void bode_extract_channel(uint8_t target_ch, float *dst) {
+    uint16_t visible_samples = scope_visible_sample_count();
+    uint16_t source_count;
+    int32_t h_offset;
+    int32_t base;
+    float sum = 0.0f;
+    uint16_t i;
+
+    if (visible_samples < 2u) {
+        for (i = 0; i < FFT_SIZE; ++i) {
+            dst[i] = 0.0f;
+        }
+        return;
+    }
+    if (visible_samples > SCOPE_SAMPLE_COUNT) {
+        visible_samples = SCOPE_SAMPLE_COUNT;
+    }
+
+    source_count = visible_samples < FFT_SIZE ? visible_samples : FFT_SIZE;
+    h_offset = scope_trigger_locked ? 0 : scope_h_pos_sample_offset();
+    base = (int32_t)scope_trigger_offset + h_offset;
+
+    for (i = 0; i < FFT_SIZE; ++i) {
+        dst[i] = 0.0f;
+    }
+
+    for (i = 0; i < source_count; ++i) {
+        float sample_pos;
+        uint16_t idx_low;
+        uint16_t idx_high;
+        float weight;
+        float value;
+
+        if (visible_samples <= FFT_SIZE) {
+            sample_pos = (float)i;
+        } else {
+            sample_pos = ((float)i * (float)(visible_samples - 1u)) / (float)(FFT_SIZE - 1u);
+        }
+        idx_low = (uint16_t)sample_pos;
+        idx_high = (uint16_t)(idx_low + 1u);
+        if (idx_high >= visible_samples) {
+            idx_high = (uint16_t)(visible_samples - 1u);
+        }
+        weight = sample_pos - (float)idx_low;
+
+        {
+            uint16_t sample_idx0 = (uint16_t)((uint32_t)(base + (int32_t)idx_low) & (SCOPE_SAMPLE_COUNT - 1u));
+            uint16_t sample_idx1 = (uint16_t)((uint32_t)(base + (int32_t)idx_high) & (SCOPE_SAMPLE_COUNT - 1u));
+            float v0 = (float)scope_raw_delta_mv(target_ch,
+                scope_samples[(uint16_t)(sample_idx0 * 2u + target_ch)]);
+            float v1 = (float)scope_raw_delta_mv(target_ch,
+                scope_samples[(uint16_t)(sample_idx1 * 2u + target_ch)]);
+            value = v0 + (v1 - v0) * weight;
+        }
+        dst[i] = value;
+        sum += value;
+    }
+
+    {
+        float mean = sum / (float)source_count;
+        for (i = 0; i < source_count; ++i) {
+            dst[i] -= mean;
+        }
+    }
+}
+
+static uint8_t bode_measure_step(uint8_t step) {
+    float mag_ch1;
+    float mag_ch2;
+    float phase_ch1;
+    float phase_ch2;
+    float effective_sample_ns;
+    float sample_rate_hz;
+    float hz_per_bin;
+    uint16_t bin;
+    uint16_t visible_samples = scope_visible_sample_count();
+
+    if (!scope_ch_enabled[0] || !scope_ch_enabled[1]) {
+        return 0;
+    }
+
+    bode_extract_channel(0, fft_input_buffer);
+    effective_sample_ns = (float)scope_sample_period_ns();
+    if (visible_samples > FFT_SIZE) {
+        effective_sample_ns *= (float)(visible_samples - 1u) / (float)(FFT_SIZE - 1u);
+    }
+    sample_rate_hz = 1000000000.0f / effective_sample_ns;
+    hz_per_bin = sample_rate_hz / (float)FFT_SIZE;
+    bin = (uint16_t)((float)bode_step_freq_hz / hz_per_bin + 0.5f);
+    if (bin < 1u) {
+        bin = 1u;
+    }
+    if (bin >= (uint16_t)(FFT_SIZE / 2u)) {
+        bin = (uint16_t)((FFT_SIZE / 2u) - 1u);
+    }
+
+    compute_fft_bin(fft_input_buffer, scope_fft_window, bin, &mag_ch1, &phase_ch1);
+    bode_extract_channel(1, fft_input_buffer);
+    compute_fft_bin(fft_input_buffer, scope_fft_window, bin, &mag_ch2, &phase_ch2);
+
+    if (mag_ch1 <= 0.0f || mag_ch2 <= 0.0f) {
+        return 0;
+    }
+
+    if (step < 120u) {
+        bode_gain_db[step] = bode_gain_db_from_ratio(mag_ch2, mag_ch1);
+        bode_phase_deg[step] = bode_wrap_deg((phase_ch2 - phase_ch1) * 57.2957795f);
+    }
+    return 1;
+}
+
+static void bode_sweep_service(void) {
+    if (scope_fft_src != 4u || !bode_is_sweeping) {
+        return;
+    }
+    if (bode_current_step >= bode_steps) {
+        bode_is_sweeping = 0;
+        if (bode_siggen_active) {
+            siggen_shutdown();
+            bode_siggen_active = 0;
+        }
+        return;
+    }
+    if (!scope_frame_valid) {
+        return;
+    }
+    if (bode_dwell_frames < BODE_DWELL_FRAMES) {
+        ++bode_dwell_frames;
+        return;
+    }
+    if (!bode_measure_step(bode_current_step)) {
+        return;
+    }
+
+    ++bode_current_step;
+    if (bode_current_step >= bode_steps) {
+        bode_is_sweeping = 0;
+        if (bode_siggen_active) {
+            siggen_shutdown();
+            bode_siggen_active = 0;
+        }
+        ui_render_scope_frame();
+        return;
+    }
+
+    bode_apply_step_freq();
+    ui_render_scope_frame();
+}
+
+static int16_t bode_map_y(uint16_t y_top, uint16_t panel_h, float value, float min_v, float max_v) {
+    float span = max_v - min_v;
+    float norm;
+
+    if (span <= 0.0f) {
+        return (int16_t)(y_top + panel_h / 2u);
+    }
+    if (value < min_v) {
+        value = min_v;
+    } else if (value > max_v) {
+        value = max_v;
+    }
+    norm = (value - min_v) / span;
+    return (int16_t)(y_top + panel_h - 1u - (uint16_t)(norm * (float)(panel_h - 1u)));
+}
+
+static void ui_draw_bode(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t gh) {
+    uint16_t mag_h;
+    uint16_t phase_y;
+    uint16_t phase_h;
+    uint16_t axis_color = RGB565(150, 150, 150);
+    uint16_t text_bg = RGB565(30, 30, 45);
+    uint16_t mag_color = RGB565(0, 180, 255);
+    uint16_t phase_color = RGB565(255, 180, 40);
+    uint8_t completed;
+    char label[16];
+    uint16_t x_start;
+    uint16_t x_end;
+    uint8_t i;
+
+    if (scope_fft_src != 4u || ui.scope_display != SCOPE_DISPLAY_YT) {
+        return;
+    }
+
+    mag_h = (uint16_t)((gh - 10u) / 2u);
+    phase_y = (uint16_t)(gy + mag_h + 6u);
+    phase_h = (uint16_t)(gh - mag_h - 6u);
+    completed = bode_is_sweeping ? (bode_current_step + 1u) : bode_steps;
+    if (completed > bode_steps) {
+        completed = bode_steps;
+    }
+    if (bode_steps < 2u) {
+        return;
+    }
+
+    x_start = gx;
+    x_end = (uint16_t)(gx + gw);
+
+
+    uint16_t mag_0db_y = (uint16_t)(gy + (mag_h / 4u));
+    lcd_line(x_start, mag_0db_y, x_end, mag_0db_y, axis_color);
+    lcd_line(x_start, (uint16_t)(gy + mag_h), x_end, (uint16_t)(gy + mag_h), axis_color);
+    uint16_t phase_center_y = (uint16_t)(phase_y + (phase_h / 2u));
+    lcd_line(x_start, phase_center_y, x_end, phase_center_y, axis_color);
+    lcd_line(x_start, (uint16_t)(phase_y + phase_h), x_end, (uint16_t)(phase_y + phase_h), axis_color);
+    lcd_text(gx, (uint16_t)(gy + 2u), "MAG", RGB565(180, 180, 180), text_bg, 1);
+    lcd_text((uint16_t)(gx + gw - 46u), (uint16_t)(gy + 2u), "+20DB", RGB565(140, 140, 140), text_bg, 1);
+    lcd_text((uint16_t)(gx + gw - 34u), (uint16_t)(mag_0db_y - 4u), "0DB", RGB565(140, 140, 140), text_bg, 1);
+    lcd_text(gx, (uint16_t)(gy + mag_h - 5u), "-60", RGB565(140, 140, 140), text_bg, 1);
+    lcd_text(gx, (uint16_t)(phase_y + 2u), "PHASE", RGB565(180, 180, 180), text_bg, 1);
+    lcd_text((uint16_t)(gx + gw - 40u), (uint16_t)(phase_y + 2u), "+180", RGB565(140, 140, 140), text_bg, 1);
+    lcd_text(gx, (uint16_t)(phase_center_y - 4u), "0", RGB565(140, 140, 140), text_bg, 1);
+    lcd_text(gx, (uint16_t)(phase_y + phase_h - 10u), "-180", RGB565(140, 140, 140), text_bg, 1);
+
+    scope_format_frequency_reading(label, bode_start_hz);
+    lcd_text((uint16_t)(gx + 28u), (uint16_t)(gy + mag_h - 10u), label, RGB565(180, 180, 180), text_bg, 1);
+    scope_format_frequency_reading(label, bode_stop_hz);
+    lcd_text((uint16_t)(gx + gw - 56u), (uint16_t)(gy + mag_h - 10u), label, RGB565(180, 180, 180), text_bg, 1);
+    // scope_format_frequency_reading(label, bode_start_hz);
+    // lcd_text((uint16_t)(gx + 28u), (uint16_t)(phase_y + phase_h - 10u), label, RGB565(180, 180, 180), text_bg, 1);
+    // scope_format_frequency_reading(label, bode_stop_hz);
+    // lcd_text((uint16_t)(gx + gw - 56u), (uint16_t)(phase_y + phase_h - 10u), label, RGB565(180, 180, 180), text_bg, 1);
+
+    for (i = 1; i < completed; ++i) {
+        uint16_t x0 = (uint16_t)(gx + ((uint32_t)(i - 1u) * gw) / (uint32_t)(bode_steps - 1u));
+        uint16_t x1 = (uint16_t)(gx + ((uint32_t)i * gw) / (uint32_t)(bode_steps - 1u));
+        int16_t y0 = bode_map_y(gy, mag_h, bode_gain_db[i - 1u], -60.0f, 20.0f);
+        int16_t y1 = bode_map_y(gy, mag_h, bode_gain_db[i], -60.0f, 20.0f);
+        int16_t p0 = bode_map_y(phase_y, phase_h, bode_phase_deg[i - 1u], -180.0f, 180.0f);
+        int16_t p1 = bode_map_y(phase_y, phase_h, bode_phase_deg[i], -180.0f, 180.0f);
+        lcd_line(x0, (uint16_t)y0, x1, (uint16_t)y1, mag_color);
+        lcd_line(x0, (uint16_t)p0, x1, (uint16_t)p1, phase_color);
+    }
+
+    if (bode_is_sweeping) {
+        char progress[20];
+        progress[0] = 'B';
+        progress[1] = 'O';
+        progress[2] = 'D';
+        progress[3] = 'E';
+        progress[4] = ' ';
+        scope_format_u32(&progress[5], (uint32_t)(bode_current_step + 1u));
+        ui_text_append(progress, "/", sizeof(progress));
+        {
+            char step_total[8];
+            scope_format_u32(step_total, (uint32_t)bode_steps);
+            ui_text_append(progress, step_total, sizeof(progress));
+        }
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + gh - 12u), progress, RGB565(255, 255, 0), text_bg, 1);
+        scope_format_frequency_reading(label, bode_step_freq_hz);
+        lcd_text((uint16_t)(gx + gw - 72u), (uint16_t)(gy + gh - 12u), label, RGB565(255, 255, 0), text_bg, 1);
+    } else if (completed > 0u) {
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + gh - 12u), "BODE DONE", RGB565(180, 220, 180), text_bg, 1);
+    }
 }
 
 static void draw_softkey(uint8_t slot, const char *label, uint16_t accent) {
@@ -2471,6 +3154,22 @@ static void scope_format_cursor_time_pos(char out[12], int16_t value, uint8_t ti
 }
 
 static const char *scope_cursor_slot_label(uint8_t idx) {
+    if (scope_fft_src == 4u && ui.scope_cursor_mode == SCOPE_CURSOR_BODE) {
+        if (bode_cursor_sub == 0u) return idx ? "F2" : "F1";
+        if (bode_cursor_sub == 1u) return idx ? "DB2" : "DB1";
+        return idx ? "P2" : "P1";
+    }
+    if (scope_fft_src == 4u) {
+        if (ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
+            return idx ? "DB2" : "DB1";
+        }
+        if (ui.scope_cursor_mode == SCOPE_CURSOR_LEVEL) {
+            return idx ? "P2" : "P1";
+        }
+    }
+    if ((scope_fft_src == 1u || scope_fft_src == 2u) && ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
+        return idx ? "F2" : "F1";
+    }
     if (ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
         return idx ? "T2" : "T1";
     }
@@ -2478,6 +3177,32 @@ static const char *scope_cursor_slot_label(uint8_t idx) {
         return idx ? "Y2" : "Y1";
     }
     return idx ? "C2" : "C1";
+}
+
+static void scope_format_signed_float(char out[12], float value, const char *suffix) {
+    uint8_t pos = 0;
+    uint32_t scaled;
+    char number[11];
+
+    if (value < 0) {
+        out[pos++] = '-';
+        value = -value;
+    } else {
+        out[pos++] = '+';
+    }
+    scaled = (uint32_t)(value * 10.0f + 0.5f);
+    scope_format_u32(number, scaled / 10u);
+    pos = scope_append_text(out, pos, 12, number);
+    if (pos < 11u) {
+        out[pos++] = '.';
+    }
+    if (pos < 11u) {
+        out[pos++] = (char)('0' + scaled % 10u);
+    }
+    while (*suffix && pos < 11u) {
+        out[pos++] = *suffix++;
+    }
+    out[pos] = 0;
 }
 
 static const char *scope_cursor_pos_label(uint8_t idx) {
@@ -2488,6 +3213,31 @@ static const char *scope_cursor_pos_label(uint8_t idx) {
         label[idx][0] = '-';
         label[idx][1] = '-';
         label[idx][2] = 0;
+    } else if (scope_fft_src == 4u && ui.scope_cursor_mode == SCOPE_CURSOR_BODE) {
+        if (bode_cursor_sub == 0u) {
+            uint8_t step = (uint8_t)((uint32_t)scope_cursor_x[idx] * (uint32_t)(bode_steps - 1u) / 255u);
+            if (step >= bode_steps) step = (uint8_t)(bode_steps - 1u);
+            scope_format_frequency_reading(label[idx], bode_step_freq_for(step, bode_steps));
+        } else {
+            float val;
+            if (bode_cursor_sub == 1u) {
+                val = 20.0f - (float)scope_cursor_y[idx] * 80.0f / 255.0f;
+                scope_format_signed_float(label[idx], val, "DB");
+            } else {
+                val = 180.0f - (float)scope_cursor_y[idx] * 360.0f / 255.0f;
+                scope_format_signed_float(label[idx], val, "DEG");
+            }
+        }
+    } else if ((scope_fft_src == 1u || scope_fft_src == 2u) && ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
+        float effective_sample_ns = (float)scope_sample_period_ns();
+        uint16_t vis = scope_visible_sample_count();
+        if (vis > SCOPE_SAMPLE_COUNT) vis = SCOPE_SAMPLE_COUNT;
+        if (vis > FFT_SIZE) {
+            effective_sample_ns *= (float)(vis - 1u) / (float)(FFT_SIZE - 1u);
+        }
+        float sample_rate_hz = 1000000000.0f / effective_sample_ns;
+        uint32_t freq = (uint32_t)(((float)scope_cursor_x[idx] / 255.0f) * (sample_rate_hz / 2.0f) + 0.5f);
+        scope_format_frequency_reading(label[idx], freq);
     } else if (ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
         scope_format_cursor_time_pos(label[idx],
                                      scope_cursor_time_value[idx],
@@ -2517,6 +3267,42 @@ static const char *scope_cursor_delta_chip_label(void) {
         label[0] = '-';
         label[1] = '-';
         label[2] = 0;
+    } else if (scope_fft_src == 4u && ui.scope_cursor_mode == SCOPE_CURSOR_BODE) {
+        if (bode_cursor_sub == 0u) {
+            uint8_t s0 = (uint8_t)((uint32_t)scope_cursor_x[0] * (uint32_t)(bode_steps - 1u) / 255u);
+            uint8_t s1 = (uint8_t)((uint32_t)scope_cursor_x[1] * (uint32_t)(bode_steps - 1u) / 255u);
+            if (s0 >= bode_steps) s0 = (uint8_t)(bode_steps - 1u);
+            if (s1 >= bode_steps) s1 = (uint8_t)(bode_steps - 1u);
+            uint32_t f0 = bode_step_freq_for(s0, bode_steps);
+            uint32_t f1 = bode_step_freq_for(s1, bode_steps);
+            uint32_t df = f0 > f1 ? f0 - f1 : f1 - f0;
+            label[0] = 'D'; label[1] = 'F'; label[2] = ' ';
+            scope_format_frequency_reading(&label[3], df);
+        } else if (bode_cursor_sub == 1u) {
+            float d0 = 20.0f - (float)scope_cursor_y[0] * 80.0f / 255.0f;
+            float d1 = 20.0f - (float)scope_cursor_y[1] * 80.0f / 255.0f;
+            float ddb = d0 > d1 ? d0 - d1 : d1 - d0;
+            label[0] = 'D'; label[1] = 'D'; label[2] = ' ';
+            scope_format_signed_float(&label[3], ddb, "DB");
+        } else {
+            float p0 = 180.0f - (float)scope_cursor_y[0] * 360.0f / 255.0f;
+            float p1 = 180.0f - (float)scope_cursor_y[1] * 360.0f / 255.0f;
+            float ddeg = p0 > p1 ? p0 - p1 : p1 - p0;
+            label[0] = 'D'; label[1] = 'P'; label[2] = ' ';
+            scope_format_signed_float(&label[3], ddeg, "DEG");
+        }
+    } else if ((scope_fft_src == 1u || scope_fft_src == 2u) && ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
+        float eff_ns = (float)scope_sample_period_ns();
+        uint16_t vis = scope_visible_sample_count();
+        if (vis > SCOPE_SAMPLE_COUNT) vis = SCOPE_SAMPLE_COUNT;
+        if (vis > FFT_SIZE) eff_ns *= (float)(vis - 1u) / (float)(FFT_SIZE - 1u);
+        float sr_hz = 1000000000.0f / eff_ns;
+        float f_max = sr_hz / 2.0f;
+        uint32_t f0 = (uint32_t)((float)scope_cursor_x[0] / 255.0f * f_max + 0.5f);
+        uint32_t f1 = (uint32_t)((float)scope_cursor_x[1] / 255.0f * f_max + 0.5f);
+        uint32_t df = f0 > f1 ? f0 - f1 : f1 - f0;
+        label[0] = 'D'; label[1] = 'F'; label[2] = ' ';
+        scope_format_frequency_reading(&label[3], df);
     } else if (ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
         scope_format_delta_time(label);
     } else {
@@ -5052,19 +5838,54 @@ static void draw_scope_xy(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t gh, ui
 
 static void draw_scope_cursors(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t gh, uint16_t bg) {
     (void)bg;
+    if (scope_fft_src == 4u && ui.scope_cursor_mode == SCOPE_CURSOR_BODE) {
+        uint16_t half_h = (uint16_t)(gh / 2u);
+        uint8_t sub = bode_cursor_sub;
+        for (uint8_t i = 0; i < 2u; ++i) {
+            uint16_t color = i == ui.scope_cursor_sel ? C_TEXT : C_MUTED;
+            if (sub == 0u) {
+                uint16_t x = (uint16_t)(gx + 1u + (uint32_t)scope_cursor_x[i] * (gw - 3u) / 255u);
+                lcd_rect(x, (uint16_t)(gy + 1u), 1, (uint16_t)(gh - 2u), color);
+                lcd_text((uint16_t)(x > 8u ? x - 7u : x), (uint16_t)(gy + 3u), i ? "F2" : "F1", color, bg, 1);
+            } else {
+                uint16_t base = (sub == 1u) ? gy : (uint16_t)(gy + half_h);
+                uint16_t y = (uint16_t)(base + 1u + (uint32_t)scope_cursor_y[i] * (half_h - 3u) / 255u);
+                lcd_rect((uint16_t)(gx + 1u), y, (uint16_t)(gw - 2u), 1, color);
+                const char *cl = (sub == 1u) ? (i ? "DB2" : "DB1") : (i ? "P2" : "P1");
+                lcd_text((uint16_t)(gx + 4u), (uint16_t)(y > 8u ? y - 7u : y), cl, color, bg, 1);
+            }
+        }
+        return;
+    }
     if (ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
         for (uint8_t i = 0; i < 2u; ++i) {
             uint16_t x = (uint16_t)(gx + 1u + (uint32_t)scope_cursor_x[i] * (gw - 3u) / 255u);
             uint16_t color = i == ui.scope_cursor_sel ? C_TEXT : C_MUTED;
             lcd_rect(x, (uint16_t)(gy + 1u), 1, (uint16_t)(gh - 2u), color);
-            lcd_text((uint16_t)(x > 8u ? x - 7u : x), (uint16_t)(gy + 3u), i ? "T2" : "T1", color, bg, 1);
+            const char *cl;
+            if (scope_fft_src == 4u) {
+                cl = i ? "DB2" : "DB1";
+            } else if (scope_fft_src == 1u || scope_fft_src == 2u) {
+                cl = i ? "F2" : "F1";
+            } else {
+                cl = i ? "T2" : "T1";
+            }
+            lcd_text((uint16_t)(x > 8u ? x - 7u : x), (uint16_t)(gy + 3u), cl, color, bg, 1);
         }
     } else if (ui.scope_cursor_mode == SCOPE_CURSOR_LEVEL) {
+        uint16_t half_h = (uint16_t)(gh / 2u);
         for (uint8_t i = 0; i < 2u; ++i) {
-            uint16_t y = (uint16_t)(gy + 1u + (uint32_t)scope_cursor_y[i] * (gh - 3u) / 255u);
+            uint16_t y;
+            if (scope_fft_src == 4u) {
+                uint16_t base = (i == 0u) ? gy : (uint16_t)(gy + half_h);
+                y = (uint16_t)(base + 1u + (uint32_t)scope_cursor_y[i] * (half_h - 3u) / 255u);
+            } else {
+                y = (uint16_t)(gy + 1u + (uint32_t)scope_cursor_y[i] * (gh - 3u) / 255u);
+            }
             uint16_t color = i == ui.scope_cursor_sel ? C_TEXT : C_MUTED;
             lcd_rect((uint16_t)(gx + 1u), y, (uint16_t)(gw - 2u), 1, color);
-            lcd_text((uint16_t)(gx + 4u), (uint16_t)(y > 8u ? y - 7u : y), i ? "Y2" : "Y1", color, bg, 1);
+            const char *cl = (scope_fft_src == 4u) ? (i ? "P2" : "P1") : (i ? "Y2" : "Y1");
+            lcd_text((uint16_t)(gx + 4u), (uint16_t)(y > 8u ? y - 7u : y), cl, color, bg, 1);
         }
     }
 }
@@ -5292,7 +6113,9 @@ static void draw_scope_chrome_live(void) {
             }
             draw_scope_channel_markers(gx, gy, gh, ch1_center, ch2_center, grid_bg);
         }
-        draw_scope_trigger_line(gx, gy, gw, gh, grid_bg);
+        if (scope_fft_src != 4u) {
+            draw_scope_trigger_line(gx, gy, gw, gh, grid_bg);
+        }
         draw_scope_cursors(gx, gy, gw, gh, grid_bg);
         draw_scope_cursor_readout(gx, gy, gw, gh, grid_bg);
         draw_scope_hpos_indicator(gx, gy, gw, gh, grid_bg);
@@ -5419,7 +6242,7 @@ static void draw_scope_immersive(void) {
     lcd_rect((uint16_t)(gx + ((uint32_t)gw * 6u) / SCOPE_X_DIVS), (uint16_t)(gy + 1u), 2, (uint16_t)(gh - 2u), RGB565(67, 85, 95));
     lcd_rect((uint16_t)(gx + 1u), (uint16_t)(gy + ((uint32_t)gh * 4u) / SCOPE_Y_DIVS), (uint16_t)(gw - 2u), 2, RGB565(67, 85, 95));
 
-    if (scope_frame_valid || !scope_hw_enabled()) {
+    if (scope_frame_valid || !scope_hw_enabled() || scope_fft_src == 4u) {
         if (ui.scope_display == SCOPE_DISPLAY_XY) {
             draw_scope_xy(gx, gy, gw, gh, C_SCOPE);
         } else {
@@ -5430,17 +6253,21 @@ static void draw_scope_immersive(void) {
             if (scope_slow_roll_active()) {
                 draw_scope_slow_roll_trace(0, plot_x0, plot_w, ch1_center, 64, gy, gh, C_CH1);
                 draw_scope_slow_roll_trace(1, plot_x0, plot_w, ch2_center, 64, gy, gh, C_CH2);
+            } else if (scope_fft_src == 4u) {
+                ui_draw_bode(gx, gy, gw, gh);
             } else {
                 draw_scope_afterglow_trace(0, plot_x0, plot_w, C_CH1);
                 draw_scope_afterglow_trace(1, plot_x0, plot_w, C_CH2);
                 draw_scope_trace(C_CH1, 0, plot_x0, ch1_center, 64, plot_w, gy, gh);
                 draw_scope_trace(C_CH2, 1, plot_x0, ch2_center, 64, plot_w, gy, gh);
             }
-            ui_draw_math_waveform(gx, gy, gw, gh);
-            ui_draw_fft_spectrum(gx, gy, gw, gh);
-            draw_scope_channel_markers(gx, gy, gh, ch1_center, ch2_center, grid_bg);
+            if (scope_fft_src != 4u) {
+                ui_draw_math_waveform(gx, gy, gw, gh);
+                ui_draw_fft_spectrum(gx, gy, gw, gh);
+                draw_scope_channel_markers(gx, gy, gh, ch1_center, ch2_center, grid_bg);
+                draw_scope_trigger_line(gx, gy, gw, gh, grid_bg);
+            }
         }
-        draw_scope_trigger_line(gx, gy, gw, gh, grid_bg);
         draw_scope_cursors(gx, gy, gw, gh, grid_bg);
         draw_scope_cursor_readout(gx, gy, gw, gh, grid_bg);
         draw_scope_hpos_indicator(gx, gy, gw, gh, grid_bg);
@@ -5475,6 +6302,8 @@ static uint8_t gen_clamped_amp_tenths(void) {
     return amp_tenths;
 }
 
+static void arb_load_waveform(void);
+
 static void gen_cycle_wave(int8_t dir) {
     uint8_t idx = 0;
     uint8_t count = (uint8_t)sizeof(gen_wave_order);
@@ -5493,15 +6322,29 @@ static void gen_cycle_wave(int8_t dir) {
     }
     ui.gen_wave = gen_wave_order[idx];
     gen_normalize_param();
+    if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
+        ui.gen_param = GEN_PARAM_FREQ;
+        arb_scan_files();
+        if (arb_file_index >= arb_file_count() && arb_file_count() > 0) {
+            arb_file_index = 0;
+        }
+        arb_load_waveform();
+    }
 }
 
 static uint8_t gen_wave_uses_duty(void) {
+    if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
+        return 1;
+    }
     return ui.gen_wave == SIGGEN_WAVE_SQUARE ||
            ui.gen_wave == SIGGEN_WAVE_TRIANGLE ||
            ui.gen_wave == SIGGEN_WAVE_SINKER_PULSE;
 }
 
 static uint8_t gen_param_available(uint8_t param) {
+    if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
+        return 1;
+    }
     return param != GEN_PARAM_DUTY || gen_wave_uses_duty();
 }
 
@@ -5617,6 +6460,18 @@ static uint16_t gen_preview_sample(uint8_t phase, uint16_t point) {
             return (uint16_t)(255u - (uint32_t)phase * 255u / split);
         }
         return 0;
+    } else if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
+        uint16_t count = arb_sample_count;
+        uint16_t idx;
+
+        if (count == 0) {
+            return 0;
+        }
+        idx = (uint16_t)((uint32_t)phase * count / 255u);
+        if (idx >= count) {
+            idx = (uint16_t)(count - 1u);
+        }
+        return arb_samples[idx];
     } else if (ui.gen_wave == SIGGEN_WAVE_LORENTZ) {
         return gen_preview_lorentz(phase);
     } else {
@@ -5704,7 +6559,7 @@ static void draw_gen_param_chip(uint16_t x, uint16_t y, uint16_t w, uint8_t para
     lcd_rect(x, y, w, 32, chip_bg);
     lcd_rect(x, y, w, 2, C_GEN);
     lcd_text((uint16_t)(x + 6u), (uint16_t)(y + 4u), gen_param_labels[param], fg, chip_bg, 1);
-    if (param == GEN_PARAM_FREQ) {
+    if (param == GEN_PARAM_FREQ && ui.gen_wave != SIGGEN_WAVE_ARBITRARY) {
         uint16_t value_y = (uint16_t)(y + 15u);
         uint16_t digit_x = (uint16_t)(x + 4u);
         format_gen_freq_digits(digits);
@@ -5718,7 +6573,7 @@ static void draw_gen_param_chip(uint16_t x, uint16_t y, uint16_t w, uint8_t para
         (void)shown_value;
         return;
     }
-    if (param == GEN_PARAM_DUTY && enabled) {
+    if (param == GEN_PARAM_DUTY && enabled && ui.gen_wave != SIGGEN_WAVE_ARBITRARY) {
         char duty_digits[4];
         uint16_t value_y = (uint16_t)(y + 15u);
         uint16_t digit_x = (uint16_t)(x + 8u);
@@ -5752,23 +6607,64 @@ static void draw_gen_param_chip(uint16_t x, uint16_t y, uint16_t w, uint8_t para
 
 static void draw_gen_param_row(uint16_t x, uint16_t y) {
     uint8_t wave = ui.gen_wave < SIGGEN_WAVE_COUNT ? ui.gen_wave : SIGGEN_WAVE_SINE;
+    const char *freq_val = "";
+    const char *duty_val = "";
+    const char *amp_val = "";
+
+    if (wave == SIGGEN_WAVE_ARBITRARY) {
+        freq_val = arb_file_index < arb_file_count() ? arb_file_name(arb_file_index) : "NO FILE";
+        {
+            static char pts_buf[8];
+            uint16_t cnt;
+            uint16_t div;
+            uint8_t pos;
+            uint8_t started;
+
+            cnt = arb_sample_count;
+            if (cnt == 0) {
+                cnt = 1;
+            }
+            pos = 0;
+            started = 0;
+            div = 1000;
+            while (div > 0) {
+                uint8_t digit = (uint8_t)(cnt / div);
+                cnt %= div;
+                if (digit > 0 || started || div == 1) {
+                    started = 1;
+                    pts_buf[pos++] = (char)('0' + digit);
+                }
+                div /= 10;
+            }
+            if (pos >= 4) {
+                pts_buf[pos++] = 'p';
+                pts_buf[pos++] = 't';
+            } else {
+                pts_buf[pos++] = 'p';
+                pts_buf[pos++] = 't';
+                pts_buf[pos++] = 's';
+            }
+            pts_buf[pos] = 0;
+            duty_val = pts_buf;
+        }
+    }
 
     draw_gen_param_chip(x, y, GEN_PARAM_CHIP_W, GEN_PARAM_WAVE, gen_wave_short_labels[wave]);
     draw_gen_param_chip((uint16_t)(x + GEN_PARAM_CHIP_W + GEN_PARAM_CHIP_GAP),
                         y,
                         GEN_PARAM_CHIP_W,
                         GEN_PARAM_FREQ,
-                        "");
+                        freq_val);
     draw_gen_param_chip((uint16_t)(x + (GEN_PARAM_CHIP_W + GEN_PARAM_CHIP_GAP) * 2u),
                         y,
                         GEN_PARAM_CHIP_W,
                         GEN_PARAM_DUTY,
-                        "");
+                        duty_val);
     draw_gen_param_chip((uint16_t)(x + (GEN_PARAM_CHIP_W + GEN_PARAM_CHIP_GAP) * 3u),
                         y,
                         GEN_PARAM_CHIP_W,
                         GEN_PARAM_AMP,
-                        "");
+                        amp_val);
 }
 
 static void draw_generator(void) {
@@ -5825,11 +6721,11 @@ static void ui_draw_gen_sweep_menu(void) {
     sweep_digits[3] = (char)('0' + (gen_sweep_ms % 10));
     sweep_digits[4] = '\0';
     
-    if (gen_sweep_edit_active && gen_sweep_row_selected == 1) {
+    if (ui_edit_digit_active && gen_sweep_row_selected == 1) {
         for (uint8_t d = 0; d < 4u; ++d) {
             uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
             char d_str[2] = { sweep_digits[d], '\0' };
-            if (d == gen_sweep_digit_index) {
+            if (d == ui_edit_digit_index) {
                 lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
                 lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
             } else {
@@ -5847,28 +6743,41 @@ static void ui_draw_gen_sweep_menu(void) {
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "START FREQ:", color_fg, color_bg, 1);
     
-    char start_digits[5];
-    start_digits[0] = (char)('0' + ((siggen_sweep_start_hz / 1000) % 10));
-    start_digits[1] = (char)('0' + ((siggen_sweep_start_hz / 100) % 10));
-    start_digits[2] = (char)('0' + ((siggen_sweep_start_hz / 10) % 10));
-    start_digits[3] = (char)('0' + (siggen_sweep_start_hz % 10));
-    start_digits[4] = '\0';
-    
-    if (gen_sweep_edit_active && gen_sweep_row_selected == 2) {
-        for (uint8_t d = 0; d < 4u; ++d) {
-            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
-            char d_str[2] = { start_digits[d], '\0' };
-            if (d == gen_sweep_digit_index) {
-                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
-            } else {
-                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+    {
+        uint16_t start_display = (uint16_t)freq_clamp_display(siggen_sweep_start_hz, sweep_start_unit);
+        char start_digits[5];
+        start_digits[0] = (char)('0' + ((start_display / 1000u) % 10u));
+        start_digits[1] = (char)('0' + ((start_display / 100u) % 10u));
+        start_digits[2] = (char)('0' + ((start_display / 10u) % 10u));
+        start_digits[3] = (char)('0' + (start_display % 10u));
+        start_digits[4] = '\0';
+        
+        uint8_t start_edit = (uint8_t)(ui_edit_digit_active && gen_sweep_row_selected == 2);
+        if (start_edit) {
+            for (uint8_t d = 0; d < 4u; ++d) {
+                uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+                char d_str[2] = { start_digits[d], '\0' };
+                if (d == ui_edit_digit_index) {
+                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                    lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                } else {
+                    lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+                }
+            }
+        } else {
+            lcd_text(box_x + 110, row_y + 3, start_digits, color_fg, color_bg, 1);
+        }
+        {
+            uint16_t ux = (uint16_t)(box_x + 110 + (4 * 6) + 2);
+            uint8_t uselected = (uint8_t)(start_edit && ui_edit_digit_index == 4u);
+            static const char * const sunit[] = {"Hz", "kHz", "MHz"};
+            uint8_t sunit_idx = sweep_start_unit < 3u ? sweep_start_unit : 0;
+            lcd_text(ux, row_y + 3, sunit[sunit_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+            if (uselected) {
+                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(sunit_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
             }
         }
-    } else {
-        lcd_text(box_x + 110, row_y + 3, start_digits, color_fg, color_bg, 1);
     }
-    lcd_text(box_x + 110 + (4 * 6) + 2, row_y + 3, "Hz", color_fg, color_bg, 1);
 
     row_y = box_y + 80;
     color_bg = (gen_sweep_row_selected == 3) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
@@ -5876,28 +6785,41 @@ static void ui_draw_gen_sweep_menu(void) {
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "STOP FREQ:", color_fg, color_bg, 1);
     
-    char stop_digits[5];
-    stop_digits[0] = (char)('0' + ((siggen_sweep_stop_hz / 1000) % 10));
-    stop_digits[1] = (char)('0' + ((siggen_sweep_stop_hz / 100) % 10));
-    stop_digits[2] = (char)('0' + ((siggen_sweep_stop_hz / 10) % 10));
-    stop_digits[3] = (char)('0' + (siggen_sweep_stop_hz % 10));
-    stop_digits[4] = '\0';
-    
-    if (gen_sweep_edit_active && gen_sweep_row_selected == 3) {
-        for (uint8_t d = 0; d < 4u; ++d) {
-            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
-            char d_str[2] = { stop_digits[d], '\0' };
-            if (d == gen_sweep_digit_index) {
-                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
-            } else {
-                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+    {
+        uint16_t stop_display = (uint16_t)freq_clamp_display(siggen_sweep_stop_hz, sweep_stop_unit);
+        char stop_digits[5];
+        stop_digits[0] = (char)('0' + ((stop_display / 1000u) % 10u));
+        stop_digits[1] = (char)('0' + ((stop_display / 100u) % 10u));
+        stop_digits[2] = (char)('0' + ((stop_display / 10u) % 10u));
+        stop_digits[3] = (char)('0' + (stop_display % 10u));
+        stop_digits[4] = '\0';
+        
+        uint8_t stop_edit = (uint8_t)(ui_edit_digit_active && gen_sweep_row_selected == 3);
+        if (stop_edit) {
+            for (uint8_t d = 0; d < 4u; ++d) {
+                uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+                char d_str[2] = { stop_digits[d], '\0' };
+                if (d == ui_edit_digit_index) {
+                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                    lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                } else {
+                    lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+                }
+            }
+        } else {
+            lcd_text(box_x + 110, row_y + 3, stop_digits, color_fg, color_bg, 1);
+        }
+        {
+            uint16_t ux = (uint16_t)(box_x + 110 + (4 * 6) + 2);
+            uint8_t uselected = (uint8_t)(stop_edit && ui_edit_digit_index == 4u);
+            static const char * const sunit[] = {"Hz", "kHz", "MHz"};
+            uint8_t sunit_idx = sweep_stop_unit < 3u ? sweep_stop_unit : 0;
+            lcd_text(ux, row_y + 3, sunit[sunit_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+            if (uselected) {
+                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(sunit_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
             }
         }
-    } else {
-        lcd_text(box_x + 110, row_y + 3, stop_digits, color_fg, color_bg, 1);
     }
-    lcd_text(box_x + 110 + (4 * 6) + 2, row_y + 3, "Hz", color_fg, color_bg, 1);
 
     row_y = box_y + 98;
     color_bg = (gen_sweep_row_selected == 4) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
@@ -5919,28 +6841,41 @@ static void ui_draw_gen_sweep_menu(void) {
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "FM FREQ:", color_fg, color_bg, 1);
     
-    char freq_digits[5];
-    freq_digits[0] = (char)('0' + ((gen_fm_freq_hz / 1000) % 10));
-    freq_digits[1] = (char)('0' + ((gen_fm_freq_hz / 100) % 10));
-    freq_digits[2] = (char)('0' + ((gen_fm_freq_hz / 10) % 10));
-    freq_digits[3] = (char)('0' + (gen_fm_freq_hz % 10));
-    freq_digits[4] = '\0';
-    
-    if (gen_sweep_edit_active && gen_sweep_row_selected == 6) {
-        for (uint8_t d = 0; d < 4u; ++d) {
-            uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
-            char d_str[2] = { freq_digits[d], '\0' };
-            if (d == gen_sweep_digit_index) {
-                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
-            } else {
-                lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+    {
+        uint16_t fm_display = (uint16_t)freq_clamp_display(gen_fm_freq_hz, fm_freq_unit);
+        char freq_digits[5];
+        freq_digits[0] = (char)('0' + ((fm_display / 1000u) % 10u));
+        freq_digits[1] = (char)('0' + ((fm_display / 100u) % 10u));
+        freq_digits[2] = (char)('0' + ((fm_display / 10u) % 10u));
+        freq_digits[3] = (char)('0' + (fm_display % 10u));
+        freq_digits[4] = '\0';
+        
+        uint8_t fm_edit = (uint8_t)(ui_edit_digit_active && gen_sweep_row_selected == 6);
+        if (fm_edit) {
+            for (uint8_t d = 0; d < 4u; ++d) {
+                uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
+                char d_str[2] = { freq_digits[d], '\0' };
+                if (d == ui_edit_digit_index) {
+                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
+                    lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                } else {
+                    lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
+                }
+            }
+        } else {
+            lcd_text(box_x + 110, row_y + 3, freq_digits, color_fg, color_bg, 1);
+        }
+        {
+            uint16_t ux = (uint16_t)(box_x + 110 + (4 * 6) + 2);
+            uint8_t uselected = (uint8_t)(fm_edit && ui_edit_digit_index == 4u);
+            static const char * const funit[] = {"Hz", "kHz", "MHz"};
+            uint8_t funit_idx = fm_freq_unit < 3u ? fm_freq_unit : 0;
+            lcd_text(ux, row_y + 3, funit[funit_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+            if (uselected) {
+                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(funit_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
             }
         }
-    } else {
-        lcd_text(box_x + 110, row_y + 3, freq_digits, color_fg, color_bg, 1);
     }
-    lcd_text(box_x + 110 + (4 * 6) + 2, row_y + 3, "Hz", color_fg, color_bg, 1);
 }
 
 static void draw_generator_immersive(void) {
@@ -6397,6 +7332,9 @@ static void ui_switch_mode(ui_mode_t mode) {
     }
     if (old_mode == UI_MODE_SCOPE && mode != UI_MODE_SCOPE) {
         scope_hw_slow_stop();
+        if (scope_fft_src == 4u) {
+            bode_shutdown();
+        }
     }
     if (mode != UI_MODE_DMM) {
         dmm_live_wire_alert = 0;
@@ -6426,6 +7364,9 @@ static void ui_switch_mode(ui_mode_t mode) {
         scope_auto_time_steps_left = 0;
 #if !SCOPE_UI_SAFE_STUB
         scope_apply_settings();
+        if (scope_fft_src == 4u) {
+            bode_begin_sweep();
+        }
 #else
         scope_trace_cache[0].valid = 0;
         scope_trace_cache[1].valid = 0;
@@ -6542,6 +7483,9 @@ void ui_init(void) {
     scope_fft_window = ui_settings.scope_fft_window;
     scope_fft_display = ui_settings.scope_fft_display;
     scope_hide_traces = ui_settings.scope_hide_traces;
+    bode_start_hz = ui_settings.bode_start_hz;
+    bode_stop_hz = ui_settings.bode_stop_hz;
+    bode_steps = ui_settings.bode_steps;
     ui.dmm_mode = dmm_sanitize_mode(ui_settings.dmm_mode);
     if (start_mode == UI_MODE_DMM) {
         ui.dmm_mode = DMM_MODE_AUTO;
@@ -6597,7 +7541,7 @@ static void gen_step_param(int8_t dir) {
         cycle_u8(&ui.gen_param, GEN_PARAM_COUNT, dir);
     } while (!gen_param_available(ui.gen_param));
     gen_freq_edit_pos = 0;
-    if (ui.gen_param == GEN_PARAM_FREQ) {
+    if (ui.gen_param == GEN_PARAM_FREQ && ui.gen_wave != SIGGEN_WAVE_ARBITRARY) {
         gen_freq_sync_editor_unit();
     }
 }
@@ -6607,12 +7551,15 @@ static void gen_select_param(uint8_t param) {
         ui.gen_param = param;
     }
     gen_freq_edit_pos = 0;
-    if (ui.gen_param == GEN_PARAM_FREQ) {
+    if (ui.gen_param == GEN_PARAM_FREQ && ui.gen_wave != SIGGEN_WAVE_ARBITRARY) {
         gen_freq_sync_editor_unit();
     }
 }
 
 static uint8_t gen_param_edit_last_pos(uint8_t param) {
+    if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
+        return 0;
+    }
     if (param == GEN_PARAM_FREQ) {
         return GEN_FREQ_EDIT_UNIT;
     }
@@ -6626,6 +7573,9 @@ static uint8_t gen_param_edit_last_pos(uint8_t param) {
 }
 
 static uint8_t gen_param_has_editor(uint8_t param) {
+    if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
+        return 0;
+    }
     return param == GEN_PARAM_FREQ || param == GEN_PARAM_DUTY || param == GEN_PARAM_AMP;
 }
 
@@ -6645,7 +7595,6 @@ static void gen_advance_editor_or_param(int8_t dir) {
             --gen_freq_edit_pos;
         } else {
             gen_step_param(-1);
-            gen_freq_edit_pos = gen_param_edit_last_pos(ui.gen_param);
         }
     }
 }
@@ -6658,7 +7607,7 @@ static void gen_select_or_advance_param(uint8_t param) {
             ui.gen_param = param;
         }
         gen_freq_edit_pos = 0;
-        if (ui.gen_param == GEN_PARAM_FREQ) {
+        if (ui.gen_param == GEN_PARAM_FREQ && ui.gen_wave != SIGGEN_WAVE_ARBITRARY) {
             gen_freq_sync_editor_unit();
         }
     }
@@ -6782,6 +7731,9 @@ void ui_note_runtime_settings(void) {
     ui_settings.scope_fft_window = scope_fft_window;
     ui_settings.scope_fft_display = scope_fft_display;
     ui_settings.scope_hide_traces = scope_hide_traces;
+    ui_settings.bode_start_hz = bode_start_hz;
+    ui_settings.bode_stop_hz = bode_stop_hz;
+    ui_settings.bode_steps = bode_steps;
 
     for (uint8_t ch = 0; ch < 2u; ++ch) {
         ui_settings.scope_ch_enabled[ch] = scope_ch_enabled[ch] ? 1u : 0u;
@@ -6799,6 +7751,13 @@ void ui_note_runtime_settings(void) {
     ui_settings.siggen_freq_unit = gen_freq_unit;
     ui_settings.siggen_running = 0;
     ui_settings.siggen_freq_hz = ui.gen_freq_hz;
+    ui_settings.siggen_sweep_mode = gen_sweep_mode;
+    ui_settings.siggen_sweep_ms = gen_sweep_ms;
+    ui_settings.siggen_sweep_start_hz = siggen_sweep_start_hz;
+    ui_settings.siggen_sweep_stop_hz = siggen_sweep_stop_hz;
+    ui_settings.siggen_fm_mode = gen_fm_mode;
+    ui_settings.siggen_fm_source = gen_fm_source;
+    ui_settings.siggen_fm_freq_hz = gen_fm_freq_hz;
     settings_note(&ui_settings);
 }
 
@@ -6847,9 +7806,19 @@ static uint32_t gen_get_current_sweep_freq(void) {
         if (gen_sweep_mode == 1) { 
             if (stop >= start) {
                 uint32_t delta = stop - start;
+                if (delta > 400000u) {
+                    uint32_t step_hz = delta / duration;
+                    if (step_hz < 1u) step_hz = 1u;
+                    return start + (gen_sweep_elapsed_ms * step_hz);
+                }
                 return start + ((delta * gen_sweep_elapsed_ms) / duration);
             } else {
                 uint32_t delta = start - stop;
+                if (delta > 400000u) {
+                    uint32_t step_hz = delta / duration;
+                    if (step_hz < 1u) step_hz = 1u;
+                    return start - (gen_sweep_elapsed_ms * step_hz);
+                }
                 return start - ((delta * gen_sweep_elapsed_ms) / duration);
             }
         }
@@ -6859,20 +7828,23 @@ static uint32_t gen_get_current_sweep_freq(void) {
             if (start == 0) start = 1;
             if (stop == 0)  stop = 1;
 
-            uint32_t progress = (gen_sweep_elapsed_ms * 1024) / duration;
+            uint32_t progress = (gen_sweep_elapsed_ms * 256u) / duration;
             uint32_t target;
 
             if (stop >= start) {
-                uint32_t ratio = (stop << 10) / start;
-                uint32_t factor = 1024 + (((ratio - 1024) * progress) >> 10);
-                target = (start * factor) >> 10;
+                uint32_t delta_f = stop - start;
+                
+                uint32_t log_curve = (progress * progress) >> 8; 
+                
+                target = start + ((delta_f * log_curve) >> 8);
                 
                 if (target < start) target = start;
                 if (target > stop)  target = stop;
             } else {
-                uint32_t ratio = (start << 10) / stop;
-                uint32_t factor = 1024 + (((ratio - 1024) * progress) >> 10);
-                target = (start << 10) / factor; 
+                uint32_t delta_f = start - stop;
+                uint32_t log_curve = (progress * progress) >> 8;
+                
+                target = start - ((delta_f * log_curve) >> 8);
 
                 if (target > start) target = start;
                 if (target < stop)  target = stop;
@@ -6884,12 +7856,10 @@ static uint32_t gen_get_current_sweep_freq(void) {
     if (gen_fm_mode != 0 && gen_fm_freq_hz != 0) {
         uint32_t carrier = ui.gen_freq_hz;
         
-        // maximum deviation to 25% of carrier up to a hard 1000Hz limit
         uint32_t deviation = carrier >> 2; 
         if (deviation > 1000u) deviation = 1000u;
         if (deviation == 0)    deviation = 1u;
 
-        // modulating wave period: T_ms = 1000 / gen_fm_freq_hz
         uint32_t period_ms = 1000u / gen_fm_freq_hz;
         if (period_ms == 0) period_ms = 1u;
 
@@ -6898,18 +7868,18 @@ static uint32_t gen_get_current_sweep_freq(void) {
 
         int32_t offset = 0;
 
-        if (gen_fm_source == 0) { // SINE LFO Shape (Piecewise Binary Approximation)
+        if (gen_fm_source == 0) { // sine
             if (cycle_pos < 256u)       offset = (int32_t)cycle_pos;
             else if (cycle_pos < 768u)  offset = 512 - (int32_t)cycle_pos;
             else                        offset = (int32_t)cycle_pos - 1024;
             offset = (offset * (int32_t)deviation) >> 8;
         }
-        else if (gen_fm_source == 1) { // TRIANGLE LFO Shape
+        else if (gen_fm_source == 1) { // triangle
             if (cycle_pos < 512u) offset = (int32_t)cycle_pos - 256;
             else                  offset = 768 - (int32_t)cycle_pos;
             offset = (offset * (int32_t)deviation) >> 8;
         }
-        else if (gen_fm_source == 2) { // SQUARE LFO Shape
+        else if (gen_fm_source == 2) { //square
             if (cycle_pos < 512u) offset = (int32_t)deviation;
             else                  offset = -(int32_t)deviation;
         }
@@ -6917,7 +7887,7 @@ static uint32_t gen_get_current_sweep_freq(void) {
         int32_t final_freq = (int32_t)carrier + offset;
         
         if (final_freq < 1)    return 1u;
-        if (final_freq > 4999) return 4999u;
+        if (final_freq > (int32_t)GEN_MAX_FREQ_HZ) return GEN_MAX_FREQ_HZ;
         return (uint32_t)final_freq;
     }
 
@@ -7104,7 +8074,26 @@ static void scope_cycle_display(int8_t dir) {
 }
 
 static void scope_cycle_cursor(void) {
-    cycle_u8(&ui.scope_cursor_mode, SCOPE_CURSOR_COUNT, 1);
+    if (scope_fft_src == 4u) {
+        if (ui.scope_cursor_mode == SCOPE_CURSOR_OFF) {
+            ui.scope_cursor_mode = SCOPE_CURSOR_BODE;
+            bode_cursor_sub = 0;
+        } else if (bode_cursor_sub == 0u) {
+            bode_cursor_sub = 1;
+        } else if (bode_cursor_sub == 1u) {
+            bode_cursor_sub = 2;
+        } else {
+            ui.scope_cursor_mode = SCOPE_CURSOR_OFF;
+        }
+    } else if (scope_fft_src == 1u || scope_fft_src == 2u) {
+        if (ui.scope_cursor_mode == SCOPE_CURSOR_OFF) {
+            ui.scope_cursor_mode = SCOPE_CURSOR_TIME;
+        } else {
+            ui.scope_cursor_mode = SCOPE_CURSOR_OFF;
+        }
+    } else {
+        cycle_u8(&ui.scope_cursor_mode, SCOPE_CURSOR_COUNT, 1);
+    }
     if (ui.scope_cursor_mode == SCOPE_CURSOR_TIME) {
         scope_cursor_time_sync_screen();
     } else if (ui.scope_cursor_mode == SCOPE_CURSOR_LEVEL) {
@@ -7306,8 +8295,23 @@ static void ui_apply_saved_runtime_settings(void) {
     ui.gen_amp_tenths_v = ui_settings.siggen_amp_tenths_v;
     ui.gen_freq_hz = ui_settings.siggen_freq_hz;
     gen_freq_unit = ui_settings.siggen_freq_unit;
+    gen_sweep_mode = ui_settings.siggen_sweep_mode;
+    gen_sweep_ms = (uint16_t)ui_settings.siggen_sweep_ms;
+    siggen_sweep_start_hz = ui_settings.siggen_sweep_start_hz;
+    siggen_sweep_stop_hz = ui_settings.siggen_sweep_stop_hz;
+    gen_fm_mode = ui_settings.siggen_fm_mode;
+    gen_fm_source = ui_settings.siggen_fm_source;
+    gen_fm_freq_hz = ui_settings.siggen_fm_freq_hz;
     gen_running = 0;
     gen_prepare_state();
+    if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
+        ui.gen_param = GEN_PARAM_FREQ;
+        arb_scan_files();
+        if (arb_file_index >= arb_file_count() && arb_file_count() > 0) {
+            arb_file_index = 0;
+        }
+        arb_load_waveform();
+    }
 
     scope_sanitize_state();
     scope_h_pos = scope_h_pos_from_value();
@@ -7329,9 +8333,16 @@ static void scope_step_timebase(int8_t dir) {
 }
 
 static void scope_adjust_cursor_steps(int8_t dir, uint8_t step) {
-    uint8_t *value = ui.scope_cursor_mode == SCOPE_CURSOR_LEVEL ?
-        &scope_cursor_y[ui.scope_cursor_sel] :
-        &scope_cursor_x[ui.scope_cursor_sel];
+    uint8_t *value;
+    if (scope_fft_src == 4u && ui.scope_cursor_mode == SCOPE_CURSOR_BODE) {
+        value = (bode_cursor_sub == 0u) ?
+            &scope_cursor_x[ui.scope_cursor_sel] :
+            &scope_cursor_y[ui.scope_cursor_sel];
+    } else {
+        value = ui.scope_cursor_mode == SCOPE_CURSOR_LEVEL ?
+            &scope_cursor_y[ui.scope_cursor_sel] :
+            &scope_cursor_x[ui.scope_cursor_sel];
+    }
     int16_t next = (int16_t)*value + (int16_t)(dir * (int8_t)step);
 
     if (next < 0) {
@@ -7342,7 +8353,7 @@ static void scope_adjust_cursor_steps(int8_t dir, uint8_t step) {
     *value = (uint8_t)next;
     if (ui.scope_cursor_mode == SCOPE_CURSOR_LEVEL) {
         scope_cursor_store_level_from_raw(ui.scope_cursor_sel);
-    } else {
+    } else if (ui.scope_cursor_mode != SCOPE_CURSOR_BODE || scope_fft_src != 4u) {
         scope_cursor_store_time_from_raw(ui.scope_cursor_sel);
     }
     scope_trace_invalidate();
@@ -7354,6 +8365,23 @@ static void scope_adjust_cursor(int8_t dir) {
 
 static void scope_adjust_cursor_menu_value(int8_t dir, uint8_t repeat) {
     uint8_t step = repeat ? 6u : 2u;
+
+    if (ui.scope_cursor_menu_sel == SCOPE_CURSOR_MENU_MODE) {
+        scope_cycle_cursor();
+        return;
+    }
+    if (scope_fft_src == 4u && ui.scope_cursor_mode == SCOPE_CURSOR_BODE) {
+        if (ui.scope_cursor_menu_sel == SCOPE_CURSOR_MENU_FIRST) {
+            ui.scope_cursor_sel = 0;
+        } else if (ui.scope_cursor_menu_sel == SCOPE_CURSOR_MENU_SECOND) {
+            ui.scope_cursor_sel = 1;
+        }
+        if (bode_cursor_sub != 0u) {
+            dir = (int8_t)-dir;
+        }
+        scope_adjust_cursor_steps(dir, step);
+        return;
+    }
 
     if (ui.scope_cursor_menu_sel == SCOPE_CURSOR_MENU_MODE) {
         scope_cycle_cursor();
@@ -8193,7 +9221,52 @@ static void dmm_step_all_modes(int8_t dir) {
     dmm_apply_selected_mode();
 }
 
+static void arb_load_waveform(void) {
+    if (arb_file_index < arb_file_count()) {
+        if (arb_load_file(arb_file_index, arb_samples, 2048)) {
+            arb_sample_count = arb_file_sample_count(arb_file_index);
+            if (arb_sample_count == 0) {
+                arb_sample_count = 1;
+            }
+            siggen_set_arb_waveform(arb_samples, arb_sample_count);
+            arb_loaded = 1;
+        } else {
+            arb_sample_count = 0;
+            arb_loaded = 0;
+        }
+    } else {
+        arb_sample_count = 0;
+        arb_loaded = 0;
+    }
+}
+
 static uint8_t gen_adjust_current_value(int8_t dir, uint8_t repeat) {
+    if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
+        if (ui.gen_param == GEN_PARAM_WAVE) {
+            gen_cycle_wave((int8_t)-dir);
+            gen_apply();
+            return 2;
+        }
+        if (repeat) {
+            return 0;
+        }
+        if (ui.gen_param == GEN_PARAM_FREQ) {
+            uint8_t count = arb_file_count();
+            if (count > 0) {
+                if (dir > 0) {
+                    arb_file_index = (uint8_t)((arb_file_index + 1u) % count);
+                } else {
+                    arb_file_index = arb_file_index == 0 ? (uint8_t)(count - 1u) : (uint8_t)(arb_file_index - 1u);
+                }
+                arb_load_waveform();
+                gen_apply();
+            }
+            return 2;
+        }
+        if (ui.gen_param == GEN_PARAM_DUTY) {
+            return 0;
+        }
+    }
     if (ui.gen_param == GEN_PARAM_WAVE) {
         gen_cycle_wave((int8_t)-dir);
         gen_apply();
@@ -8518,33 +9591,41 @@ static uint8_t ui_handle_keys_gen_sweep_menu(uint32_t events) {
 
         if (gen_sweep_row_selected == 1 || gen_sweep_row_selected == 2 || 
             gen_sweep_row_selected == 3 || gen_sweep_row_selected == 6) {
-            gen_sweep_edit_active = !gen_sweep_edit_active;
-            gen_sweep_digit_index = 0;
+            ui_edit_digit_active = !ui_edit_digit_active;
+            ui_edit_digit_index = 0;
         } else {
-            gen_sweep_edit_active = 0;
+            ui_edit_digit_active = 0;
         }
 
         ui_render_local_change();
         return 1;
     }
 
-    if (gen_sweep_edit_active) {
+    if (ui_edit_digit_active) {
         if (((gen_sweep_row_selected == 1 || gen_sweep_row_selected == 2 || gen_sweep_row_selected == 3) && gen_sweep_mode == 0) ||
             (gen_sweep_row_selected == 6 && gen_fm_mode == 0)) {
-            gen_sweep_edit_active = 0;
+            ui_edit_digit_active = 0;
             ui_render_local_change();
             return 1;
         }
 
         uint32_t current_val;
+        uint32_t multiplier = 1u;
+        uint8_t *unit_ptr = 0;
         if (gen_sweep_row_selected == 1) {
             current_val = gen_sweep_ms;
         } else if (gen_sweep_row_selected == 2) {
-            current_val = siggen_sweep_start_hz;
+            multiplier = gen_freq_unit_multiplier(sweep_start_unit);
+            current_val = freq_clamp_display(siggen_sweep_start_hz, sweep_start_unit);
+            unit_ptr = &sweep_start_unit;
         } else if (gen_sweep_row_selected == 3) {
-            current_val = siggen_sweep_stop_hz;
+            multiplier = gen_freq_unit_multiplier(sweep_stop_unit);
+            current_val = freq_clamp_display(siggen_sweep_stop_hz, sweep_stop_unit);
+            unit_ptr = &sweep_stop_unit;
         } else {
-            current_val = gen_fm_freq_hz; // Row 6
+            multiplier = gen_freq_unit_multiplier(fm_freq_unit);
+            current_val = freq_clamp_display(gen_fm_freq_hz, fm_freq_unit);
+            unit_ptr = &fm_freq_unit;
         }
         
         uint32_t thousands = (current_val / 1000) % 10;
@@ -8553,49 +9634,58 @@ static uint8_t ui_handle_keys_gen_sweep_menu(uint32_t events) {
         uint32_t ones = current_val % 10;
 
         if (events & KEY_LEFT) {
-            if (gen_sweep_digit_index > 0) {
-                gen_sweep_digit_index--;
+            if (ui_edit_digit_index > 0) {
+                ui_edit_digit_index--;
             } else {
-                gen_sweep_digit_index = 3;
+                ui_edit_digit_index = 4;
             }
         } 
         else if (events & KEY_RIGHT) {
-            if (gen_sweep_digit_index < 3) {
-                gen_sweep_digit_index++;
+            if (ui_edit_digit_index < 4) {
+                ui_edit_digit_index++;
             } else {
-                gen_sweep_digit_index = 0;
+                ui_edit_digit_index = 0;
             }
         } 
         else if (events & (KEY_UP | KEY_DOWN)) {
             int8_t delta = (events & KEY_DOWN) ? 1 : -1;
             
-            if (gen_sweep_digit_index == 0) thousands = (thousands + delta + 10) % 10;
-            else if (gen_sweep_digit_index == 1) hundreds = (hundreds + delta + 10) % 10;
-            else if (gen_sweep_digit_index == 2) tens = (tens + delta + 10) % 10;
-            else if (gen_sweep_digit_index == 3) ones = (ones + delta + 10) % 10;
+            if (ui_edit_digit_index < 4) {
+                if (ui_edit_digit_index == 0) thousands = (thousands + delta + 10) % 10;
+                else if (ui_edit_digit_index == 1) hundreds = (hundreds + delta + 10) % 10;
+                else if (ui_edit_digit_index == 2) tens = (tens + delta + 10) % 10;
+                else if (ui_edit_digit_index == 3) ones = (ones + delta + 10) % 10;
 
-            uint32_t new_val = (thousands * 1000) + (hundreds * 100) + (tens * 10) + ones;
+                uint32_t new_val = (thousands * 1000) + (hundreds * 100) + (tens * 10) + ones;
 
-            // Enforce constraints (Time: 100-9999 ms, Frequencies: 1-4999 Hz)
-            if (gen_sweep_row_selected == 1) {
-                if (new_val < 100) new_val = 100;
-                if (new_val > 9999) new_val = 9999;
-                gen_sweep_ms = (uint16_t)new_val;
-            } 
-            else if (gen_sweep_row_selected == 2) {
-                if (new_val < 1) new_val = 1;
-                if (new_val > 4999) new_val = 4999;
-                siggen_sweep_start_hz = new_val;
-            } 
-            else if (gen_sweep_row_selected == 3) {
-                if (new_val < 1) new_val = 1;
-                if (new_val > 4999) new_val = 4999;
-                siggen_sweep_stop_hz = new_val;
-            } 
-            else if (gen_sweep_row_selected == 6) {
-                if (new_val < 1) new_val = 1;
-                if (new_val > 4999) new_val = 4999;
-                gen_fm_freq_hz = (uint16_t)new_val;
+                if (gen_sweep_row_selected == 1) {
+                    if (new_val < 100) new_val = 100;
+                    if (new_val > 9999) new_val = 9999;
+                    gen_sweep_ms = (uint16_t)new_val;
+                }
+                else if (gen_sweep_row_selected == 2) {
+                    if (new_val < 1) new_val = 1;
+                    new_val *= multiplier;
+                    if (new_val > GEN_MAX_FREQ_HZ) new_val = GEN_MAX_FREQ_HZ;
+                    siggen_sweep_start_hz = new_val;
+                }
+                else if (gen_sweep_row_selected == 3) {
+                    if (new_val < 1) new_val = 1;
+                    new_val *= multiplier;
+                    if (new_val > GEN_MAX_FREQ_HZ) new_val = GEN_MAX_FREQ_HZ;
+                    siggen_sweep_stop_hz = new_val;
+                }
+                else if (gen_sweep_row_selected == 6) {
+                    if (new_val < 1) new_val = 1;
+                    new_val *= multiplier;
+                    if (new_val > GEN_MAX_FREQ_HZ) new_val = GEN_MAX_FREQ_HZ;
+                    gen_fm_freq_hz = new_val;
+                }
+            } else if (unit_ptr) {
+                int8_t new_unit = (int8_t)(*unit_ptr) + delta;
+                if (new_unit < 0) new_unit = 0;
+                if (new_unit > 2) new_unit = 2;
+                *unit_ptr = (uint8_t)new_unit;
             }
         }
         ui_render_local_change();
@@ -8640,9 +9730,217 @@ static uint8_t ui_handle_keys_gen_sweep_menu(uint32_t events) {
 
     if (events & KEY_MENU) {
         gen_sweep_menu_active = 0;
-        gen_sweep_edit_active = 0;
+        ui_edit_digit_active = 0;
         ui_render(); 
         return 1;
+    }
+
+    return 1;
+}
+
+static uint8_t ui_handle_keys_math_menu(uint32_t events) {
+    if (!ui_math_menu_visible) {
+        return 0;
+    }
+
+    if (events & KEY_SAVE_LONG) {
+        capture_screenshot_now();
+        return 1;
+    }
+
+    uint8_t current_item;
+    if (scope_fft_src == 4u) {
+        current_item = bode_menu_order[scope_math_selected];
+    } else {
+        current_item = math_menu_order[scope_math_selected];
+    }
+
+
+    if (events & KEY_OK) {
+        if (current_item == MENU_ITEM_BODE_START || 
+            current_item == MENU_ITEM_BODE_STOP || 
+            current_item == MENU_ITEM_BODE_STEPS) {
+            ui_edit_digit_active = !ui_edit_digit_active;
+            ui_edit_digit_index = 0;
+        } else if (current_item == MENU_ITEM_BODE_SWEEP) {
+            ui_edit_digit_active = 0;
+            bode_begin_sweep();
+        } else {
+            ui_edit_digit_active = 0;
+        }
+
+        ui_render_local_change();
+        return 1;
+    }
+
+    if (ui_edit_digit_active) {
+        if (current_item != MENU_ITEM_BODE_START && 
+            current_item != MENU_ITEM_BODE_STOP && 
+            current_item != MENU_ITEM_BODE_STEPS) {
+            ui_edit_digit_active = 0;
+            ui_render_local_change();
+            return 1;
+        }
+
+        uint32_t current_val;
+        uint32_t multiplier = 1u;
+        uint8_t *unit_ptr = 0;
+        if (current_item == MENU_ITEM_BODE_START) {
+            multiplier = gen_freq_unit_multiplier(bode_start_unit);
+            current_val = freq_clamp_display(bode_start_hz, bode_start_unit);
+            unit_ptr = &bode_start_unit;
+        } else if (current_item == MENU_ITEM_BODE_STOP) {
+            multiplier = gen_freq_unit_multiplier(bode_stop_unit);
+            current_val = freq_clamp_display(bode_stop_hz, bode_stop_unit);
+            unit_ptr = &bode_stop_unit;
+        } else {
+            current_val = bode_steps;
+        }
+        
+        uint32_t thousands = (current_val / 1000) % 10;
+        uint32_t hundreds  = (current_val / 100) % 10;
+        uint32_t tens      = (current_val / 10) % 10;
+        uint32_t ones      = current_val % 10;
+
+        if (events & KEY_LEFT) {
+            if (ui_edit_digit_index > 0) {
+                ui_edit_digit_index--;
+            } else {
+                ui_edit_digit_index = (current_item == MENU_ITEM_BODE_STEPS) ? 3 : 4;
+            }
+        } 
+        else if (events & KEY_RIGHT) {
+            uint8_t max_idx = (current_item == MENU_ITEM_BODE_STEPS) ? 3 : 4;
+            if (ui_edit_digit_index < max_idx) {
+                ui_edit_digit_index++;
+            } else {
+                ui_edit_digit_index = 0;
+            }
+        } 
+        else if (events & (KEY_UP | KEY_DOWN)) {
+            int8_t delta = (events & KEY_DOWN) ? 1 : -1;
+            
+            if (ui_edit_digit_index < 4) {
+                if (ui_edit_digit_index == 0) thousands = (thousands + delta + 10) % 10;
+                else if (ui_edit_digit_index == 1) hundreds = (hundreds + delta + 10) % 10;
+                else if (ui_edit_digit_index == 2) tens = (tens + delta + 10) % 10;
+                else if (ui_edit_digit_index == 3) ones = (ones + delta + 10) % 10;
+
+                uint32_t new_val = (thousands * 1000) + (hundreds * 100) + (tens * 10) + ones;
+
+                if (current_item == MENU_ITEM_BODE_START) {
+                    if (new_val < 1) new_val = 1;
+                    new_val *= multiplier;
+                    if (new_val > GEN_MAX_FREQ_HZ) new_val = GEN_MAX_FREQ_HZ;
+                    bode_start_hz = new_val;
+                } else if (current_item == MENU_ITEM_BODE_STOP) {
+                    if (new_val < 1) new_val = 1;
+                    new_val *= multiplier;
+                    if (new_val > GEN_MAX_FREQ_HZ) new_val = GEN_MAX_FREQ_HZ;
+                    bode_stop_hz = new_val;
+                } else {
+                    if (new_val > 9999) new_val = 9999;
+                    bode_steps = (uint16_t)new_val;
+                }
+            } else if (unit_ptr) {
+                int8_t new_unit = (int8_t)(*unit_ptr) + delta;
+                if (new_unit < 0) new_unit = 0;
+                if (new_unit > 2) new_unit = 2;
+                *unit_ptr = (uint8_t)new_unit;
+            }
+        }
+        ui_render_local_change();
+        return 1;
+    }
+
+    if (events & KEY_UP) {
+        math_menu_step_selected(1); 
+        ui_render_local_change();
+        return 1;
+    }
+    else if (events & KEY_DOWN) {
+        math_menu_step_selected(-1);
+        ui_render_local_change();
+        return 1;
+    }
+    else if (events & (KEY_LEFT | KEY_RIGHT)) {
+        int8_t step = (events & KEY_RIGHT) ? 1 : -1;
+
+        switch (current_item) {
+            case MENU_ITEM_PLOT:
+                if (step > 0) {
+                    if (scope_fft_src < 4) ++scope_fft_src; else scope_fft_src = 0;
+                } else {
+                    if (scope_fft_src > 0) --scope_fft_src; else scope_fft_src = 4;
+                }
+                ui.scope_display = (scope_fft_src == 3) ? SCOPE_DISPLAY_XY : SCOPE_DISPLAY_YT;
+                break;
+
+            case MENU_ITEM_MATH_MODE:
+                scope_math_mode = !scope_math_mode;
+                break;
+
+            case MENU_ITEM_MATH_OP:
+                if (scope_math_mode) {
+                    scope_math_op = (uint8_t)((scope_math_op + step + 3) % 3);
+                }
+                break;
+
+            case MENU_ITEM_FFT_WINDOW:
+                if (scope_fft_src == 1 || scope_fft_src == 2) {
+                    scope_fft_window = (uint8_t)((scope_fft_window + step + 4) % 4);
+                }
+                break;
+
+            case MENU_ITEM_FFT_DISPLAY:
+                if (scope_fft_src == 1 || scope_fft_src == 2) {
+                    scope_fft_display = (uint8_t)((scope_fft_display + step + 3) % 3);
+                    for (uint16_t i = 0; i < FFT_SIZE / 2u; ++i) {
+                        fft_history[i] = 0.0f;
+                    }
+                }
+                break;
+
+            case MENU_ITEM_HIDE_TRACES:
+                scope_hide_traces = (uint8_t)((scope_hide_traces + step + 4) % 4);
+                break;
+
+            case MENU_ITEM_BODE_STEPS:
+                break;
+        }
+        ui_render_local_change();
+        return 1;
+    }
+    else if (events & KEY_MENU) {
+        ui_math_menu_visible = 0;
+        ui_edit_digit_active = 0;
+
+        ui_settings.scope_math_mode = scope_math_mode; 
+        ui_settings.scope_math_op = scope_math_op;
+        ui_settings.scope_fft_window = scope_fft_window;
+        ui_settings.scope_fft_display = scope_fft_display;
+        ui_settings.scope_math_selected = scope_math_selected;
+        ui_settings.bode_start_hz = bode_start_hz;
+        ui_settings.bode_stop_hz = bode_stop_hz;
+        ui_settings.bode_steps = bode_steps;
+
+        if (scope_fft_src == 4u && bode_is_sweeping) {
+            scope_fft_src_menu_saved = scope_fft_src;
+            ui_settings.scope_fft_src = scope_fft_src;
+            ui_settings.scope_hide_traces = scope_hide_traces;
+            settings_note(&ui_settings);
+            settings_flush();
+            
+            ui_render_local_change(); 
+        } else {
+            scope_fft_src_apply_from(scope_fft_src_menu_saved, scope_fft_src);
+            scope_fft_src_menu_saved = scope_fft_src;
+            ui_settings.scope_fft_src = scope_fft_src;
+            ui_settings.scope_hide_traces = scope_hide_traces;
+
+            settings_note(&ui_settings);
+            settings_flush();
+        }
     }
 
     return 1;
@@ -8655,10 +9953,11 @@ void ui_handle_keys(uint32_t events) {
 
     if (events == 0) return;
 
-    if (gen_sweep_menu_active) {
-        if (ui_handle_keys_gen_sweep_menu(events)) {
-            return;
-        }
+    if (gen_sweep_menu_active && ui_handle_keys_gen_sweep_menu(events)) {
+        return;
+    }
+    if (ui_math_menu_visible && ui_handle_keys_math_menu(events)) {
+        return;
     }
 
     if (ui_math_menu_visible && (ui.mode != UI_MODE_SCOPE || ui.overlay != UI_OVERLAY_NONE)) {
@@ -8674,10 +9973,14 @@ void ui_handle_keys(uint32_t events) {
             scope_math_mode = ui_settings.scope_math_mode;
             scope_math_op = ui_settings.scope_math_op;
             scope_fft_src = ui_settings.scope_fft_src;
+            scope_fft_src_menu_saved = scope_fft_src;
             scope_math_selected = ui_settings.scope_math_selected;
             scope_fft_window = ui_settings.scope_fft_window;
             scope_fft_display = ui_settings.scope_fft_display;
             scope_hide_traces = ui_settings.scope_hide_traces;
+            bode_start_hz = ui_settings.bode_start_hz;
+            bode_stop_hz = ui_settings.bode_stop_hz;
+            bode_steps = ui_settings.bode_steps;
             if (scope_fft_src == 3) {
                 ui.scope_display = SCOPE_DISPLAY_XY; 
             } else {
@@ -8690,129 +9993,18 @@ void ui_handle_keys(uint32_t events) {
 
     if (gen_sweep_menu_active && (ui.mode != UI_MODE_GEN || ui.overlay != UI_OVERLAY_NONE)) {
         gen_sweep_menu_active = 0;
-        gen_sweep_edit_active = 0;
+        ui_edit_digit_active = 0;
         gen_sweep_row_selected = 0;
     }
 
     if ((events & KEY_CH1_LONG) && ui.mode == UI_MODE_GEN && !gen_sweep_menu_active) {
         gen_sweep_menu_active = 1;
         gen_sweep_row_selected = 0;
-        gen_sweep_edit_active = 0;
-        gen_sweep_digit_index = 0;
+        ui_edit_digit_active = 0;
+        ui_edit_digit_index = 0;
 
         ui_render_local_change();
         return;
-    }
-
-    if (ui_math_menu_visible && ui.mode == UI_MODE_SCOPE && ui.overlay == UI_OVERLAY_NONE) {
-        if (events & KEY_SAVE_LONG) {
-            capture_screenshot_now();
-            return; 
-        }
-
-        if (events & KEY_DOWN) {
-            if (scope_math_selected > 0) scope_math_selected--;
-            else scope_math_selected = 5; // Wrap around to bottom row
-        }
-        else if (events & KEY_UP) {
-            if (scope_math_selected < 5) scope_math_selected++;
-            else scope_math_selected = 0;
-        }
-        
-        else if (events & KEY_LEFT) {
-            if (scope_math_selected == 0) { // Math Mode Toggle
-                scope_math_mode = !scope_math_mode;
-            }
-            else if (scope_math_selected == 1) { // Operator Selection
-                if (scope_math_op > 0) scope_math_op--;
-                else scope_math_op = 2;
-            }
-            else if (scope_math_selected == 2) { // FFT Mode De/Selection
-                if (scope_fft_src > 0) scope_fft_src--;
-                else scope_fft_src = 3;
-                if (scope_fft_src == 3) {
-                        ui.scope_display = SCOPE_DISPLAY_XY; 
-                    } else {
-                        ui.scope_display = SCOPE_DISPLAY_YT;
-                    }
-            }
-            else if (scope_math_selected == 3) { 
-                if (scope_fft_src != 3) { // Protect option
-                    if (scope_fft_window > 0) scope_fft_window--;
-                    else scope_fft_window = 3; 
-                }
-            } 
-            else if (scope_math_selected == 4) { 
-                if (scope_fft_src != 3) { // Protect option
-                    if (scope_fft_display > 0) scope_fft_display--;
-                    else scope_fft_display = 2; 
-                    for (uint16_t i = 0; i < FFT_SIZE / 2u; ++i) {
-                        fft_history[i] = 0.0f;
-                    }
-                }
-            }
-            else if (scope_math_selected == 5) { 
-                if (scope_hide_traces > 0) scope_hide_traces--;
-                else scope_hide_traces = 3;
-            }
-        }
-        else if (events & KEY_RIGHT) {
-            if (scope_math_selected == 0) { // Math Mode Toggle
-                scope_math_mode = !scope_math_mode;
-            }
-            else if (scope_math_selected == 1) { // Operator Selection
-                if (scope_math_op < 2) scope_math_op++;
-                else scope_math_op = 0;
-            }
-            else if (scope_math_selected == 2) { // FFT Mode De/Selection
-                if (scope_fft_src < 3) scope_fft_src++;
-                else scope_fft_src = 0;
-                if (scope_fft_src == 3) {
-                        ui.scope_display = SCOPE_DISPLAY_XY; 
-                    } else {
-                        ui.scope_display = SCOPE_DISPLAY_YT;
-                    }
-            }
-            else if (scope_math_selected == 3) { 
-                if (scope_fft_src != 3) { // Protect option
-                    if (scope_fft_window < 3) scope_fft_window++;
-                    else  scope_fft_window = 0;
-                }
-            } 
-            else if (scope_math_selected == 4) { 
-                if (scope_fft_src != 3) { // Protect option
-                    if (scope_fft_display < 2) scope_fft_display++;
-                    else scope_fft_display = 0; 
-                    for (uint16_t i = 0; i < FFT_SIZE / 2u; ++i) {
-                        fft_history[i] = 0.0f;
-                    }
-                }
-            }
-            else if (scope_math_selected == 5) {
-                if (scope_hide_traces < 3) scope_hide_traces++;
-                else scope_hide_traces = 0;
-            }
-        }
-        
-        // Dismiss Menu
-        else if (events & (KEY_OK | KEY_MENU)) {
-            ui_math_menu_visible = 0;
-
-            ui_settings.scope_math_mode = scope_math_mode; 
-            ui_settings.scope_math_op = scope_math_op;
-            ui_settings.scope_fft_src = scope_fft_src;    
-            ui_settings.scope_fft_window = scope_fft_window;
-            ui_settings.scope_fft_display = scope_fft_display;
-            ui_settings.scope_hide_traces = scope_hide_traces;
-            ui_settings.scope_math_selected = scope_math_selected;
-
-            settings_note(&ui_settings);
-            settings_flush();
-
-        }
-
-        ui_render_local_change();
-        return; // Retain focus
     }
 
     if (events & KEY_SAVE_LONG) {
@@ -9333,7 +10525,11 @@ void ui_tick(uint32_t elapsed_ms) {
                 uint16_t interval = (uint16_t)((scope_frame_age_ms + 5u) / 10u);
                 scope_frame_interval_x10ms = interval > 999u ? 999u : interval;
                 scope_frame_age_ms = 0;
-                if (!rendered) {
+                
+                bode_sweep_service();
+                if (scope_fft_src == 4u && bode_is_sweeping) {
+                    ui_render_scope_frame();
+                } else if (!rendered) {
                     ui_render_scope_frame();
                 }
             }
