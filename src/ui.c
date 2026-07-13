@@ -278,12 +278,12 @@ static uint32_t siggen_sweep_stop_hz = 9999;
 static uint16_t gen_sweep_ms = 1000;
 static uint8_t gen_fm_mode = 0;
 static uint8_t gen_fm_source = 0;
-static uint32_t gen_fm_freq_hz = 1000;
+static uint32_t gen_fm_freq_hz = 5;
 static uint32_t gen_sweep_elapsed_ms = 0;
 static uint8_t sweep_start_unit = 0;
 static uint8_t sweep_stop_unit = 0;
 static uint8_t fm_freq_unit = 0;
-static uint32_t gen_fm_elapsed_ms = 0;
+static uint16_t gen_fm_phase;
 static uint8_t arb_file_index;
 static uint8_t arb_loaded;
 static uint16_t arb_sample_count;
@@ -364,16 +364,25 @@ static uint8_t bode_stop_unit = 0;
 static uint8_t bode_current_step = 0;
 static uint8_t bode_is_sweeping = 0;
 static uint8_t bode_cursor_sub = 0;  // 0=F (freq), 1=DB, 2=DEG
-static float bode_gain_db[120];
-static float bode_phase_deg[120];
+enum {
+    BODE_MAX_STEPS = 80u,
+    BODE_DWELL_FRAMES = 4u,
+};
+static float bode_gain_db[BODE_MAX_STEPS];
+static float bode_phase_deg[BODE_MAX_STEPS];
 static uint8_t bode_dwell_frames = 0;
 static uint32_t bode_step_freq_hz = 0;
 static uint8_t bode_siggen_active = 0;
 static uint8_t scope_fft_src_menu_saved = 0;
-static uint8_t bode_hide_traces_saved = 0;
-enum {
-    BODE_DWELL_FRAMES = 4u,
-};
+typedef struct {
+    uint8_t valid;
+    uint8_t scope_timebase;
+    uint8_t trigger_source;
+    uint8_t trigger_mode;
+    uint8_t ch_enabled[2];
+    uint8_t hide_traces;
+} bode_saved_state_t;
+static bode_saved_state_t bode_saved;
 static int32_t dmm_rel_ref_milli;
 static char dmm_hold_value[10];
 static char dmm_hold_unit[6];
@@ -738,7 +747,7 @@ static void ui_render_scope_frame(void);
 static uint32_t bode_step_freq_for(uint8_t step, uint8_t total_steps);
 static uint8_t bode_auto_timebase(uint32_t freq_hz);
 static void bode_begin_sweep(void);
-static void bode_shutdown(void);
+static void bode_shutdown(uint8_t restore_scope_hw);
 static void bode_apply_step_freq(void);
 static uint8_t bode_measure_step(uint8_t step);
 static void bode_sweep_service(void);
@@ -2048,11 +2057,11 @@ static void ui_draw_fft_spectrum(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t
              1);
 }
 
-static float bode_ln(float x) {
+static float fast_ln(float x) {
     int8_t exp = 0;
 
     if (x <= 0.0f) {
-        return -10.0f;
+        return -20.0f;
     }
     while (x >= 2.0f) {
         x *= 0.5f;
@@ -2062,19 +2071,71 @@ static float bode_ln(float x) {
         x *= 2.0f;
         --exp;
     }
-    {
-        float t = x - 1.0f;
-        float t2 = t * t;
-        float ln = t - t2 * 0.5f + t2 * t * 0.3333333f;
-        return ln + (float)exp * 0.69314718f;
+    float y = (x - 1.0f) / (x + 1.0f);
+    float y2 = y * y;
+    float term = y;
+    float sum = term;
+    term *= y2;
+    sum += term * 0.33333333f;
+    term *= y2;
+    sum += term * 0.2f;
+    term *= y2;
+    sum += term * 0.14285714f;
+    term *= y2;
+    sum += term * 0.11111111f;
+    return 2.0f * sum + (float)exp * 0.69314718f;
+}
+
+static float fast_exp(float x) {
+    int8_t power = 0;
+
+    while (x > 0.34657359f) {
+        x -= 0.69314718f;
+        ++power;
     }
+    while (x < -0.34657359f) {
+        x += 0.69314718f;
+        --power;
+    }
+
+    float x2 = x * x;
+    float result = 1.0f + x + x2 * 0.5f + x2 * x * 0.16666667f +
+                   x2 * x2 * 0.04166667f + x2 * x2 * x * 0.00833333f;
+    while (power > 0) {
+        result *= 2.0f;
+        --power;
+    }
+    while (power < 0) {
+        result *= 0.5f;
+        ++power;
+    }
+    return result;
+}
+
+static uint32_t log_interpolate_u32(uint32_t start, uint32_t stop, float progress) {
+    if (start < 1u) start = 1u;
+    if (stop < 1u) stop = 1u;
+    if (progress <= 0.0f) return start;
+    if (progress >= 1.0f) return stop;
+
+    float ratio = (float)stop / (float)start;
+    float value = (float)start * fast_exp(fast_ln(ratio) * progress);
+    uint32_t rounded = (uint32_t)(value + 0.5f);
+    if (stop >= start) {
+        if (rounded < start) rounded = start;
+        if (rounded > stop) rounded = stop;
+    } else {
+        if (rounded > start) rounded = start;
+        if (rounded < stop) rounded = stop;
+    }
+    return rounded;
 }
 
 static float bode_gain_db_from_ratio(float mag_out, float mag_in) {
     if (mag_in <= 0.0f || mag_out <= 0.0f) {
         return -120.0f;
     }
-    return 8.6858896f * bode_ln(mag_out / mag_in);
+    return 8.6858896f * fast_ln(mag_out / mag_in);
 }
 
 static float bode_wrap_deg(float deg) {
@@ -2090,9 +2151,6 @@ static float bode_wrap_deg(float deg) {
 static uint32_t bode_step_freq_for(uint8_t step, uint8_t total_steps) {
     uint32_t start = bode_start_hz;
     uint32_t stop = bode_stop_hz;
-    uint32_t progress;
-    uint32_t target;
-
     if (total_steps <= 1u) {
         return start ? start : 1u;
     }
@@ -2106,43 +2164,19 @@ static uint32_t bode_step_freq_for(uint8_t step, uint8_t total_steps) {
         step = (uint8_t)(total_steps - 1u);
     }
 
-    progress = ((uint32_t)step * 1024u) / (uint32_t)(total_steps - 1u);
-    if (stop >= start) {
-        uint32_t ratio = (stop << 10) / start;
-        uint32_t factor = 1024u + (((ratio - 1024u) * progress) >> 10);
-        target = (start * factor) >> 10;
-        if (target < start) {
-            target = start;
-        }
-        if (target > stop) {
-            target = stop;
-        }
-        return target;
-    }
-
-    {
-        uint32_t ratio = (start << 10) / stop;
-        uint32_t factor = 1024u + (((ratio - 1024u) * progress) >> 10);
-        target = (start << 10) / factor;
-        if (target > start) {
-            target = start;
-        }
-        if (target < stop) {
-            target = stop;
-        }
-        return target;
-    }
+    return log_interpolate_u32(start, stop,
+                               (float)step / (float)(total_steps - 1u));
 }
 
 static uint8_t bode_auto_timebase(uint32_t freq_hz) {
-    uint32_t min_screen_ns;
+    uint64_t min_screen_ns;
 
     if (freq_hz < 1u) {
         freq_hz = 1u;
     }
-    min_screen_ns = 3000000000u / freq_hz;
+    min_screen_ns = 3000000000ull / freq_hz;
     for (uint8_t i = 0; i < SCOPE_TIMEBASE_COUNT; ++i) {
-        uint32_t screen_ns = scope_timebase_unit_ns[i] * SCOPE_X_DIVS * 10u;
+        uint64_t screen_ns = (uint64_t)scope_timebase_unit_ns[i] * SCOPE_X_DIVS * 10u;
         if (screen_ns >= min_screen_ns) {
             return i;
         }
@@ -2150,13 +2184,37 @@ static uint8_t bode_auto_timebase(uint32_t freq_hz) {
     return (uint8_t)(SCOPE_TIMEBASE_COUNT - 1u);
 }
 
-static void bode_shutdown(void) {
-    if (bode_siggen_active) {
-        siggen_shutdown();
-        bode_siggen_active = 0;
+static void bode_restore_generator(void) {
+    if (!bode_siggen_active) {
+        return;
     }
+    bode_siggen_active = 0;
+    if (gen_running) {
+        gen_apply();
+    } else {
+        siggen_shutdown();
+        gen_output_applied = 0;
+    }
+}
+
+static void bode_shutdown(uint8_t restore_scope_hw) {
+    bode_restore_generator();
     bode_is_sweeping = 0;
-    scope_hide_traces = bode_hide_traces_saved;
+    if (!bode_saved.valid) {
+        return;
+    }
+
+    ui.scope_timebase = bode_saved.scope_timebase;
+    ui.scope_trigger_source = bode_saved.trigger_source;
+    ui.scope_trigger_mode = bode_saved.trigger_mode;
+    scope_ch_enabled[0] = bode_saved.ch_enabled[0];
+    scope_ch_enabled[1] = bode_saved.ch_enabled[1];
+    scope_hide_traces = bode_saved.hide_traces;
+    bode_saved.valid = 0;
+
+    if (restore_scope_hw && ui.mode == UI_MODE_SCOPE) {
+        scope_apply_settings_keep_frame(0);
+    }
 }
 
 static void bode_apply_step_freq(void) {
@@ -2181,16 +2239,21 @@ static void bode_apply_step_freq(void) {
 static void bode_begin_sweep(void) {
     uint16_t i;
 
-    if (bode_siggen_active) {
-        siggen_shutdown();
-        bode_siggen_active = 0;
+    if (!bode_saved.valid) {
+        bode_saved.valid = 1;
+        bode_saved.scope_timebase = ui.scope_timebase;
+        bode_saved.trigger_source = ui.scope_trigger_source;
+        bode_saved.trigger_mode = ui.scope_trigger_mode;
+        bode_saved.ch_enabled[0] = scope_ch_enabled[0];
+        bode_saved.ch_enabled[1] = scope_ch_enabled[1];
+        bode_saved.hide_traces = scope_hide_traces;
     }
+    bode_restore_generator();
     bode_current_step = 0;
     bode_is_sweeping = 1;
     bode_dwell_frames = 0;
-    bode_hide_traces_saved = scope_hide_traces;
     scope_hide_traces = 3;
-    for (i = 0; i < 120u; ++i) {
+    for (i = 0; i < BODE_MAX_STEPS; ++i) {
         bode_gain_db[i] = 0.0f;
         bode_phase_deg[i] = 0.0f;
     }
@@ -2202,7 +2265,7 @@ static void scope_fft_src_apply_from(uint8_t old_src, uint8_t new_src) {
         return;
     }
     if (old_src == 4u) {
-        bode_shutdown();
+        bode_shutdown(1);
     }
     scope_fft_src = new_src;
     if (new_src == 4u) {
@@ -2324,7 +2387,7 @@ static uint8_t bode_measure_step(uint8_t step) {
         return 0;
     }
 
-    if (step < 120u) {
+    if (step < BODE_MAX_STEPS) {
         bode_gain_db[step] = bode_gain_db_from_ratio(mag_ch2, mag_ch1);
         bode_phase_deg[step] = bode_wrap_deg((phase_ch2 - phase_ch1) * 57.2957795f);
     }
@@ -2337,10 +2400,7 @@ static void bode_sweep_service(void) {
     }
     if (bode_current_step >= bode_steps) {
         bode_is_sweeping = 0;
-        if (bode_siggen_active) {
-            siggen_shutdown();
-            bode_siggen_active = 0;
-        }
+        bode_restore_generator();
         return;
     }
     if (!scope_frame_valid) {
@@ -2357,10 +2417,7 @@ static void bode_sweep_service(void) {
     ++bode_current_step;
     if (bode_current_step >= bode_steps) {
         bode_is_sweeping = 0;
-        if (bode_siggen_active) {
-            siggen_shutdown();
-            bode_siggen_active = 0;
-        }
+        bode_restore_generator();
         ui_render_scope_frame();
         return;
     }
@@ -7333,7 +7390,7 @@ static void ui_switch_mode(ui_mode_t mode) {
     if (old_mode == UI_MODE_SCOPE && mode != UI_MODE_SCOPE) {
         scope_hw_slow_stop();
         if (scope_fft_src == 4u) {
-            bode_shutdown();
+            bode_shutdown(0);
         }
     }
     if (mode != UI_MODE_DMM) {
@@ -7792,100 +7849,52 @@ static void gen_prepare_state(void) {
 }
 
 static uint32_t gen_get_current_sweep_freq(void) {
-
     if (gen_sweep_mode != 0 && gen_sweep_ms != 0) {
         uint32_t start = siggen_sweep_start_hz;
         uint32_t stop = siggen_sweep_stop_hz;
         uint32_t duration = gen_sweep_ms;
+        float progress;
 
         if (gen_sweep_elapsed_ms >= duration) {
-            return stop; 
+            return stop;
         }
+        progress = (float)gen_sweep_elapsed_ms / (float)duration;
 
-        // lin
-        if (gen_sweep_mode == 1) { 
-            if (stop >= start) {
-                uint32_t delta = stop - start;
-                if (delta > 400000u) {
-                    uint32_t step_hz = delta / duration;
-                    if (step_hz < 1u) step_hz = 1u;
-                    return start + (gen_sweep_elapsed_ms * step_hz);
-                }
-                return start + ((delta * gen_sweep_elapsed_ms) / duration);
-            } else {
-                uint32_t delta = start - stop;
-                if (delta > 400000u) {
-                    uint32_t step_hz = delta / duration;
-                    if (step_hz < 1u) step_hz = 1u;
-                    return start - (gen_sweep_elapsed_ms * step_hz);
-                }
-                return start - ((delta * gen_sweep_elapsed_ms) / duration);
-            }
+        if (gen_sweep_mode == 1) {
+            float value = (float)start + ((float)stop - (float)start) * progress;
+            return (uint32_t)(value + 0.5f);
         }
-        
-        // log
-        else if (gen_sweep_mode == 2) {
-            if (start == 0) start = 1;
-            if (stop == 0)  stop = 1;
-
-            uint32_t progress = (gen_sweep_elapsed_ms * 256u) / duration;
-            uint32_t target;
-
-            if (stop >= start) {
-                uint32_t delta_f = stop - start;
-                
-                uint32_t log_curve = (progress * progress) >> 8; 
-                
-                target = start + ((delta_f * log_curve) >> 8);
-                
-                if (target < start) target = start;
-                if (target > stop)  target = stop;
-            } else {
-                uint32_t delta_f = start - stop;
-                uint32_t log_curve = (progress * progress) >> 8;
-                
-                target = start - ((delta_f * log_curve) >> 8);
-
-                if (target > start) target = start;
-                if (target < stop)  target = stop;
-            }
-            return target;
+        if (gen_sweep_mode == 2) {
+            return log_interpolate_u32(start, stop, progress);
         }
     }
 
     if (gen_fm_mode != 0 && gen_fm_freq_hz != 0) {
         uint32_t carrier = ui.gen_freq_hz;
-        
-        uint32_t deviation = carrier >> 2; 
+        uint32_t deviation = carrier >> 2;
         if (deviation > 1000u) deviation = 1000u;
         if (deviation == 0)    deviation = 1u;
-
-        uint32_t period_ms = 1000u / gen_fm_freq_hz;
-        if (period_ms == 0) period_ms = 1u;
-
-        uint32_t cycle_pos = (gen_fm_elapsed_ms * 1024u) / period_ms;
-        cycle_pos %= 1024u;
-
         int32_t offset = 0;
 
-        if (gen_fm_source == 0) { // sine
-            if (cycle_pos < 256u)       offset = (int32_t)cycle_pos;
-            else if (cycle_pos < 768u)  offset = 512 - (int32_t)cycle_pos;
-            else                        offset = (int32_t)cycle_pos - 1024;
-            offset = (offset * (int32_t)deviation) >> 8;
-        }
-        else if (gen_fm_source == 1) { // triangle
-            if (cycle_pos < 512u) offset = (int32_t)cycle_pos - 256;
-            else                  offset = 768 - (int32_t)cycle_pos;
-            offset = (offset * (int32_t)deviation) >> 8;
-        }
-        else if (gen_fm_source == 2) { //square
-            if (cycle_pos < 512u) offset = (int32_t)deviation;
-            else                  offset = -(int32_t)deviation;
+        if (gen_fm_source == 0) {
+            uint8_t index = (uint8_t)(gen_fm_phase >> 10);
+            uint8_t next = (uint8_t)((index + 1u) & 63u);
+            uint16_t frac = (uint16_t)(gen_fm_phase & 1023u);
+            int32_t sine = (int32_t)scope_sine_lut[index] * (1024 - frac) +
+                           (int32_t)scope_sine_lut[next] * frac;
+            sine = (sine + (sine >= 0 ? 512 : -512)) / 1024;
+            offset = sine * (int32_t)deviation / 64;
+        } else if (gen_fm_source == 1) {
+            int32_t triangle = gen_fm_phase < 32768u ?
+                (int32_t)gen_fm_phase * 2 - 32768 :
+                98303 - (int32_t)gen_fm_phase * 2;
+            offset = triangle * (int32_t)deviation / 32768;
+        } else if (gen_fm_source == 2) {
+            offset = gen_fm_phase < 32768u ?
+                (int32_t)deviation : -(int32_t)deviation;
         }
 
         int32_t final_freq = (int32_t)carrier + offset;
-        
         if (final_freq < 1)    return 1u;
         if (final_freq > (int32_t)GEN_MAX_FREQ_HZ) return GEN_MAX_FREQ_HZ;
         return (uint32_t)final_freq;
@@ -8302,6 +8311,13 @@ static void ui_apply_saved_runtime_settings(void) {
     gen_fm_mode = ui_settings.siggen_fm_mode;
     gen_fm_source = ui_settings.siggen_fm_source;
     gen_fm_freq_hz = ui_settings.siggen_fm_freq_hz;
+    if (gen_sweep_mode && gen_fm_mode) {
+        gen_fm_mode = 0;
+    }
+    if (gen_fm_freq_hz < 1u || gen_fm_freq_hz > SETTINGS_SIGGEN_FM_MAX_HZ) {
+        gen_fm_freq_hz = 5u;
+    }
+    fm_freq_unit = 0;
     gen_running = 0;
     gen_prepare_state();
     if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
@@ -9623,11 +9639,10 @@ static uint8_t ui_handle_keys_gen_sweep_menu(uint32_t events) {
             current_val = freq_clamp_display(siggen_sweep_stop_hz, sweep_stop_unit);
             unit_ptr = &sweep_stop_unit;
         } else {
-            multiplier = gen_freq_unit_multiplier(fm_freq_unit);
-            current_val = freq_clamp_display(gen_fm_freq_hz, fm_freq_unit);
-            unit_ptr = &fm_freq_unit;
+            current_val = gen_fm_freq_hz;
         }
-        
+
+        uint8_t max_edit_index = gen_sweep_row_selected == 6 ? 3u : 4u;
         uint32_t thousands = (current_val / 1000) % 10;
         uint32_t hundreds = (current_val / 100) % 10;
         uint32_t tens = (current_val / 10) % 10;
@@ -9637,11 +9652,11 @@ static uint8_t ui_handle_keys_gen_sweep_menu(uint32_t events) {
             if (ui_edit_digit_index > 0) {
                 ui_edit_digit_index--;
             } else {
-                ui_edit_digit_index = 4;
+                ui_edit_digit_index = max_edit_index;
             }
         } 
         else if (events & KEY_RIGHT) {
-            if (ui_edit_digit_index < 4) {
+            if (ui_edit_digit_index < max_edit_index) {
                 ui_edit_digit_index++;
             } else {
                 ui_edit_digit_index = 0;
@@ -9677,8 +9692,7 @@ static uint8_t ui_handle_keys_gen_sweep_menu(uint32_t events) {
                 }
                 else if (gen_sweep_row_selected == 6) {
                     if (new_val < 1) new_val = 1;
-                    new_val *= multiplier;
-                    if (new_val > GEN_MAX_FREQ_HZ) new_val = GEN_MAX_FREQ_HZ;
+                    if (new_val > SETTINGS_SIGGEN_FM_MAX_HZ) new_val = SETTINGS_SIGGEN_FM_MAX_HZ;
                     gen_fm_freq_hz = new_val;
                 }
             } else if (unit_ptr) {
@@ -9716,9 +9730,17 @@ static uint8_t ui_handle_keys_gen_sweep_menu(uint32_t events) {
         switch (gen_sweep_row_selected) {
             case 0:
                 gen_sweep_mode = (uint8_t)((gen_sweep_mode + step + 3) % 3);
+                if (gen_sweep_mode) {
+                    gen_fm_mode = 0;
+                    gen_fm_phase = 0;
+                }
                 break;
             case 4:
                 gen_fm_mode = (uint8_t)((gen_fm_mode + step + 2) % 2);
+                if (gen_fm_mode) {
+                    gen_sweep_mode = 0;
+                    gen_sweep_elapsed_ms = 0;
+                }
                 break;
             case 5:
                 gen_fm_source = (uint8_t)((gen_fm_source + step + 3) % 3);
@@ -10443,18 +10465,16 @@ void ui_tick(uint32_t elapsed_ms) {
         }
 
         if (gen_fm_mode != 0) {
-            gen_fm_elapsed_ms += elapsed_ms;
-            if (gen_fm_elapsed_ms > 10000) {
-                gen_fm_elapsed_ms %= 10000;
-            }
+            uint32_t advance = gen_fm_freq_hz * elapsed_ms * 65536u / 1000u;
+            gen_fm_phase = (uint16_t)(gen_fm_phase + advance);
         } else {
-            gen_fm_elapsed_ms = 0;
+            gen_fm_phase = 0;
         }
-        
+
         gen_apply();
     } else {
         gen_sweep_elapsed_ms = 0;
-        gen_fm_elapsed_ms = 0;
+        gen_fm_phase = 0;
     }
 
     if (ui.overlay != UI_OVERLAY_NONE) {

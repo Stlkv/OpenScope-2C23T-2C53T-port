@@ -5,6 +5,7 @@ typedef struct {
     float imag;
 } complex_t;
 
+static complex_t fft_work[FFT_SIZE];
 
 // taylor series trig approx
 static float local_sin(float x) {
@@ -124,20 +125,17 @@ static void fft_compute_complex(const float *input_real, uint8_t window_type, co
 }
 
 void compute_fft(const float *input_real, float *output_magnitude, uint8_t window_type) {
-    static complex_t data[FFT_SIZE];
-
-    fft_compute_complex(input_real, window_type, data);
+    fft_compute_complex(input_real, window_type, fft_work);
 
     for (int i = 0; i < FFT_SIZE / 2; i++) {
-        float r = data[i].real;
-        float im = data[i].imag;
+        float r = fft_work[i].real;
+        float im = fft_work[i].imag;
         output_magnitude[i] = local_sqrt(r * r + im * im);
     }
 }
 
 void compute_fft_bin(const float *input_real, uint8_t window_type, uint16_t bin,
                      float *out_magnitude, float *out_phase_rad) {
-    static complex_t data[FFT_SIZE];
     uint16_t idx;
 
     if (out_magnitude) {
@@ -150,7 +148,7 @@ void compute_fft_bin(const float *input_real, uint8_t window_type, uint16_t bin,
         return;
     }
 
-    fft_compute_complex(input_real, window_type, data);
+    fft_compute_complex(input_real, window_type, fft_work);
 
     idx = bin;
     if (idx >= (uint16_t)(FFT_SIZE / 2)) {
@@ -161,8 +159,8 @@ void compute_fft_bin(const float *input_real, uint8_t window_type, uint16_t bin,
     }
 
     {
-        float r = data[idx].real;
-        float im = data[idx].imag;
+        float r = fft_work[idx].real;
+        float im = fft_work[idx].imag;
         if (out_magnitude) {
             *out_magnitude = local_sqrt(r * r + im * im);
         }

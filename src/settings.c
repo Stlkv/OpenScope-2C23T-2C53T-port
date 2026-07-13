@@ -41,7 +41,8 @@ enum {
     SETTINGS_SCOPE_BIAS_DEFAULT = 1861u,
     SETTINGS_SCOPE_BIAS_RATE_DEFAULT = 505u,
     SETTINGS_SCOPE_CAL_WORDS = SETTINGS_SCOPE_CHANNEL_COUNT * SETTINGS_SCOPE_RANGE_COUNT * 2,
-    SETTINGS_STATE_WORDS = 11u,
+    SETTINGS_STATE_WORDS = SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI -
+                           SETTINGS_STATE_SCOPE_CORE + 1u,
     SETTINGS_WRITE_BYTES = 4u * (1u + SETTINGS_SCOPE_CAL_WORDS + SETTINGS_STATE_WORDS),
     FLASH_BANK2_BASE = 0x08080000u,
     FLASH_STS_BSY = 1u << 0,
@@ -110,7 +111,7 @@ static void settings_defaults(settings_state_t *settings) {
     settings->siggen_sweep_stop_hz = 4999;
     settings->siggen_fm_mode = 0;
     settings->siggen_fm_source = 0;
-    settings->siggen_fm_freq_hz = 100;
+    settings->siggen_fm_freq_hz = 5;
     settings->bode_start_hz = 100u;
     settings->bode_stop_hz = 100000u;
     settings->bode_steps = 40u;
@@ -310,7 +311,8 @@ static void settings_clamp(settings_state_t *settings) {
     if (settings->scope_fft_src >= 5u) {
         settings->scope_fft_src = 0u;
     }
-    if (settings->scope_math_selected >= 6u) {
+    if (settings->scope_math_selected >= 6u ||
+        (settings->scope_fft_src == 4u && settings->scope_math_selected >= 5u)) {
         settings->scope_math_selected = 0u; // Default to Row 0
     }
     if (settings->scope_fft_window >= 4u) {
@@ -355,7 +357,7 @@ static void settings_clamp(settings_state_t *settings) {
     if (settings->siggen_fm_source >= 3) settings->siggen_fm_source = 0;
     
     if (settings->siggen_fm_freq_hz < 1) settings->siggen_fm_freq_hz = 1;
-    if (settings->siggen_fm_freq_hz > SETTINGS_SIGGEN_MAX_FREQ_HZ) settings->siggen_fm_freq_hz = SETTINGS_SIGGEN_MAX_FREQ_HZ;
+    if (settings->siggen_fm_freq_hz > SETTINGS_SIGGEN_FM_MAX_HZ) settings->siggen_fm_freq_hz = SETTINGS_SIGGEN_FM_MAX_HZ;
     if (settings->bode_start_hz < 10u) {
         settings->bode_start_hz = 10u;
     } else if (settings->bode_start_hz > SETTINGS_SIGGEN_MAX_FREQ_HZ) {
@@ -565,11 +567,12 @@ static uint8_t settings_state_record_valid(uint32_t record, settings_state_t *se
     } else if (type == SETTINGS_STATE_MATH_MENU) {
         settings->scope_math_mode     = (uint8_t)(payload & 0x01u);
         settings->scope_math_op       = (uint8_t)((payload >> 1) & 0x03u);
-        settings->scope_fft_src       = (uint8_t)((payload >> 3) & 0x07u);
-        settings->scope_math_selected = (uint8_t)((payload >> 6) & 0x07u);
-        settings->scope_fft_window    = (uint8_t)((payload >> 9) & 0x03u);
-        settings->scope_fft_display   = (uint8_t)((payload >> 11) & 0x03u);
-        settings->scope_hide_traces   = (uint8_t)((payload >> 13) & 0x03u);
+        settings->scope_fft_src       = (uint8_t)(((payload >> 3) & 0x03u) |
+                                                  ((payload >> 12) & 0x04u));
+        settings->scope_math_selected = (uint8_t)((payload >> 5) & 0x07u);
+        settings->scope_fft_window    = (uint8_t)((payload >> 8) & 0x03u);
+        settings->scope_fft_display   = (uint8_t)((payload >> 10) & 0x03u);
+        settings->scope_hide_traces   = (uint8_t)((payload >> 12) & 0x03u);
     } else if (type == SETTINGS_STATE_BODE_START_LO) {
         settings->bode_start_hz = (settings->bode_start_hz & 0xFFFF0000u) | payload;
     } else if (type == SETTINGS_STATE_BODE_START_HI) {
@@ -669,11 +672,12 @@ static void settings_write_state_records(uint32_t *addr, const settings_state_t 
 
     payload = (uint16_t)((settings->scope_math_mode & 0x01u) |
                          ((settings->scope_math_op & 0x03u) << 1) |
-                         ((settings->scope_fft_src & 0x07u) << 3) |
-                         ((settings->scope_math_selected & 0x07u) << 6) |
-                         ((settings->scope_fft_window & 0x03u) << 9) |
-                         ((settings->scope_fft_display & 0x03u) << 11) |
-                         ((settings->scope_hide_traces & 0x03u) << 13));
+                         ((settings->scope_fft_src & 0x03u) << 3) |
+                         ((settings->scope_math_selected & 0x07u) << 5) |
+                         ((settings->scope_fft_window & 0x03u) << 8) |
+                         ((settings->scope_fft_display & 0x03u) << 10) |
+                         ((settings->scope_hide_traces & 0x03u) << 12) |
+                         ((settings->scope_fft_src & 0x04u) << 12));
     flash_program_word(*addr, settings_state_record(SETTINGS_STATE_MATH_MENU, payload));
     *addr += 4u;
 

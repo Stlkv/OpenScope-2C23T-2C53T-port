@@ -27,6 +27,7 @@ enum {
     SETTINGS_SIGGEN_DEFAULT_AMP_TENTHS = 33,
     SETTINGS_SIGGEN_DEFAULT_FREQ_HZ = 1000,
     SETTINGS_SIGGEN_MAX_FREQ_HZ = 2000000,
+    SETTINGS_SIGGEN_FM_MAX_HZ = 10,
     SETTINGS_SIGGEN_SWEEP_MODE_COUNT = 3, // 0 = OFF, 1 = LINEAR, 2 = LOG
     SETTINGS_SIGGEN_FM_MODE_COUNT = 2, // 0 = OFF, 1 = ON
     SETTINGS_SIGGEN_FM_SOURCE_COUNT = 3, // 0 = SINE, 1 = TRIANGLE, 2 = SQUARE
@@ -80,7 +81,7 @@ typedef struct {
     uint32_t siggen_sweep_stop_hz;
     uint8_t siggen_fm_mode;
     uint8_t siggen_fm_source;
-    uint32_t siggen_fm_freq_hz;  // Range: 1Hz to 9999Hz (the HW limit)
+    uint32_t siggen_fm_freq_hz;  // Low-rate MCU modulation: 1Hz to 10Hz
     uint32_t bode_start_hz;
     uint32_t bode_stop_hz;
     uint8_t bode_steps;
