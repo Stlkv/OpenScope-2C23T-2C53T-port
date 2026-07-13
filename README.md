@@ -25,7 +25,7 @@ In addition to the stock multimeter, oscilloscope, and signal generator function
 - **Oscilloscope Analytical / Math menu** opened by long-pressing `CH1`, with channel math, XY mode, trace hiding, FFT, and Bode plot tools.
 - **FFT spectrum view** with selectable window functions plus normal, averaging, and max-hold displays.
 - **Signal-generator sweep and FM menu** opened by long-pressing `CH1`, with linear/logarithmic sweeps and sine, triangle, or square frequency modulation.
-- **Arbitrary waveform playback from CSV files** stored on the device's USB drive. See the ready-to-use [example waveform](examples/sine.csv).
+- **Arbitrary waveform playback from CSV files** stored on the device's USB drive. See the ready-to-use [sine](examples/sine.csv) and [action-potential](https://github.com/user-attachments/files/29925821/HH.csv) examples.
 - **Redesigned UI and control flow** for multimeter, oscilloscope, signal generator, menu, and settings screens.
 - **Improved oscilloscope controls** with channel menus, trigger setup, move/cursor/measurement menus, rolling display, and clearer scale/readout handling.
 - **Runtime USB mass storage** while the device is running.
@@ -59,7 +59,7 @@ Use the up/down arrow keys to select a setting and the left/right arrow keys to 
 
 ## Arbitrary CSV Waveforms
 
-The signal generator can load custom single-period waveforms from CSV files stored in the root directory of the device's USB drive. A directly usable format example is available at [examples/sine.csv](examples/sine.csv).
+The signal generator can load custom single-period waveforms from CSV files stored in the root directory of the device's USB drive. Directly usable examples are available for a [sine wave](examples/sine.csv) and a 1,024-point [action potential](https://github.com/user-attachments/files/29925821/HH.csv).
 
 CSV requirements:
 
