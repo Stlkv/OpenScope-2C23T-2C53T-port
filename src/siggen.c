@@ -18,6 +18,8 @@ static uint8_t last_duty_percent = 0xFFu;
 static uint8_t last_amplitude_tenths_v = 0xFFu;
 static uint32_t last_freq_hz;
 static uint8_t sample_buffer[FPGA_SAMPLE_COUNT];
+static uint8_t arb_samples[FPGA_SAMPLE_COUNT];
+static uint16_t arb_count;
 
 static const int8_t sine_lut[64] = {
     0, 6, 13, 19, 25, 31, 36, 41,
@@ -104,6 +106,26 @@ static void build_waveform(uint8_t enabled, uint8_t wave, uint8_t duty_percent, 
 
     if (wave == SIGGEN_WAVE_DC) {
         sample_buffer_fill(full_scale);
+        return;
+    }
+    if (wave == SIGGEN_WAVE_ARBITRARY) {
+        if (arb_count == 0) {
+            sample_buffer_fill(0);
+            return;
+        }
+        uint16_t n = arb_count < FPGA_SAMPLE_COUNT ? arb_count : FPGA_SAMPLE_COUNT;
+        if (FPGA_SAMPLE_COUNT % n == 0u) {
+            for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
+                uint16_t src_idx = i % n;
+                sample_buffer[i] = (uint8_t)((uint32_t)arb_samples[src_idx] * full_scale / 255u);
+            }
+        } else {
+            sample_buffer_fill(0);
+            uint16_t pad = (uint16_t)((FPGA_SAMPLE_COUNT - n) / 2u);
+            for (uint16_t i = 0; i < n; ++i) {
+                sample_buffer[pad + i] = (uint8_t)((uint32_t)arb_samples[i] * full_scale / 255u);
+            }
+        }
         return;
     }
     if (wave == SIGGEN_WAVE_SQUARE) {
@@ -261,6 +283,25 @@ void siggen_configure(uint8_t enabled, uint8_t wave, uint32_t freq_hz, uint8_t d
     last_freq_hz = freq_hz;
     last_duty_percent = duty_percent;
     last_amplitude_tenths_v = amplitude_tenths_v;
+}
+
+void siggen_set_arb_waveform(const uint8_t *samples, uint16_t count) {
+    uint16_t n = count < FPGA_SAMPLE_COUNT ? count : FPGA_SAMPLE_COUNT;
+    uint16_t i;
+
+    for (i = 0; i < n; ++i) {
+        arb_samples[i] = samples[i];
+    }
+    for (; i < FPGA_SAMPLE_COUNT; ++i) {
+        arb_samples[i] = 0;
+    }
+    arb_count = count;
+    last_wave = 0xFF;
+}
+
+const uint8_t *siggen_get_arb_waveform(uint16_t *count) {
+    *count = arb_count;
+    return arb_samples;
 }
 
 void siggen_shutdown(void) {

@@ -32,6 +32,28 @@ static float local_cos(float x) {
     return local_sin(x + 1.57079632f);
 }
 
+static float local_atan2(float y, float x) {
+    if (x == 0.0f) {
+        return y > 0.0f ? 1.57079632f : -1.57079632f;
+    }
+
+    float ax = x < 0.0f ? -x : x;
+    float ay = y < 0.0f ? -y : y;
+    float a = (ax < ay) ? ax / ay : ay / ax;
+    float s = a * a;
+    float r = (((-0.0464964749f * s + 0.15931422f) * s - 0.327622764f) * s * a + a);
+    if (ay > ax) {
+        r = 1.57079632f - r;
+    }
+    if (x < 0.0f) {
+        r = 3.14159265f - r;
+    }
+    if (y < 0.0f) {
+        r = -r;
+    }
+    return r;
+}
+
 // Newton-Raphson sqrt. appx.
 static float local_sqrt(float x) {
     if (x <= 0.0f) return 0.0f;
@@ -58,37 +80,24 @@ static uint8_t fft_bit_reverse(uint8_t index) {
     return rev;
 }
 
-// Coley-Tukey FFT
-void compute_fft(const float *input_real, float *output_magnitude, uint8_t window_type) {
-    static complex_t data[FFT_SIZE];
-    
-    // Bit-reversal sorting step combined with Windowing Function
+static void fft_compute_complex(const float *input_real, uint8_t window_type, complex_t *data) {
     for (int i = 0; i < FFT_SIZE; i++) {
         uint8_t rev_idx = fft_bit_reverse((uint8_t)i);
-        
-        // Default multiplier is 1.0f (Rectangle Window)
-        float w = 1.0f; 
-        
-        // Calculate common angle for Hann, Hamming, and Blackman
+        float w = 1.0f;
         float angle = (2.0f * 3.14159265f * (float)i) / (float)(FFT_SIZE - 1);
 
-        if (window_type == 0) { // HANN
+        if (window_type == 0) {
             w = 0.5f * (1.0f - local_cos(angle));
-        } 
-        else if (window_type == 1) { // HAMMING
+        } else if (window_type == 1) {
             w = 0.54f - 0.46f * local_cos(angle);
-        } 
-        else if (window_type == 2) { // BLACKMAN
+        } else if (window_type == 2) {
             w = 0.42f - 0.5f * local_cos(angle) + 0.08f * local_cos(2.0f * angle);
         }
-        // window_type == 3 is RECTANGLE, leaves w = 1.0f
 
-        // Apply window shaping curve to incoming real voltage trace
         data[rev_idx].real = input_real[i] * w;
         data[rev_idx].imag = 0.0f;
     }
 
-    // Cooley-Tukey Radix-2 processing loop
     for (int size = 2; size <= FFT_SIZE; size <<= 1) {
         int half_size = size >> 1;
         float tab_step = -2.0f * 3.14159265f / (float)size;
@@ -96,7 +105,6 @@ void compute_fft(const float *input_real, float *output_magnitude, uint8_t windo
         for (int i = 0; i < FFT_SIZE; i += size) {
             for (int j = 0; j < half_size; j++) {
                 float angle = (float)j * tab_step;
-                
                 float twiddle_real = local_cos(angle);
                 float twiddle_imag = local_sin(angle);
 
@@ -113,12 +121,54 @@ void compute_fft(const float *input_real, float *output_magnitude, uint8_t windo
             }
         }
     }
+}
 
-    // Absolute complex magnitude calculation pass
+void compute_fft(const float *input_real, float *output_magnitude, uint8_t window_type) {
+    static complex_t data[FFT_SIZE];
+
+    fft_compute_complex(input_real, window_type, data);
+
     for (int i = 0; i < FFT_SIZE / 2; i++) {
         float r = data[i].real;
         float im = data[i].imag;
         output_magnitude[i] = local_sqrt(r * r + im * im);
+    }
+}
+
+void compute_fft_bin(const float *input_real, uint8_t window_type, uint16_t bin,
+                     float *out_magnitude, float *out_phase_rad) {
+    static complex_t data[FFT_SIZE];
+    uint16_t idx;
+
+    if (out_magnitude) {
+        *out_magnitude = 0.0f;
+    }
+    if (out_phase_rad) {
+        *out_phase_rad = 0.0f;
+    }
+    if (!out_magnitude && !out_phase_rad) {
+        return;
+    }
+
+    fft_compute_complex(input_real, window_type, data);
+
+    idx = bin;
+    if (idx >= (uint16_t)(FFT_SIZE / 2)) {
+        idx = (uint16_t)((FFT_SIZE / 2) - 1u);
+    }
+    if (idx < 1u) {
+        idx = 1u;
+    }
+
+    {
+        float r = data[idx].real;
+        float im = data[idx].imag;
+        if (out_magnitude) {
+            *out_magnitude = local_sqrt(r * r + im * im);
+        }
+        if (out_phase_rad) {
+            *out_phase_rad = local_atan2(im, r);
+        }
     }
 }
 
