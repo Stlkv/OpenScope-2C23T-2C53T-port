@@ -12,6 +12,8 @@ This firmware is still under active development. Use it at your own risk.
 |---|---|---|
 | <img src="https://github.com/user-attachments/assets/17989306-4eee-4da2-8fed-e7fec0660791" width="320"/> | <img src="https://github.com/user-attachments/assets/371b7de3-4b3e-49d5-ad8f-349b1c0e128d" width="320"/> | <img src="https://github.com/user-attachments/assets/eeacebf9-699b-4f2b-977f-c0a2f7650e51" width="320"/> |
 | <img src="https://github.com/user-attachments/assets/47e9052f-8960-4eac-9fb4-16ef131bd813" width="320"/> | <img src="https://github.com/user-attachments/assets/3981d5a3-6cb1-40ab-9c0e-28fe0b2cc03d" width="320"/> | <img src="https://github.com/user-attachments/assets/66c54716-2391-4c1f-9770-989d7f27e5eb" width="320"/> |
+| <img src="https://github.com/user-attachments/files/29745784/img_01.bmp" width="320"/> | <img src="https://github.com/user-attachments/files/29745786/img_02.bmp" width="320"/> | <img src="https://github.com/user-attachments/files/29925826/img_05.bmp" width="320"/> |
+| <img src="https://github.com/user-attachments/files/29925825/img_04.bmp" width="320"/> | | |
 
 
 ## What This Adds
