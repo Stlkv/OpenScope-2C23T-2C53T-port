@@ -13,20 +13,106 @@
 
 #if HW_TARGET_2C53T
 /*
- * 2C53T: the FPGA transport differs from both 2C23T variants (hardware SPI3
- * on PB3/4/5 with CS on PB6, per-channel 0x04/0x05 reads, PC0 data-ready),
- * and several pins the 2C23T paths drive are buttons / analog-frontend
- * controls on the 2C53T (PA15, PC8, PC0-PC7, PC9). Until a real 2C53T
- * transport exists, all FPGA access is stubbed out: the UI runs, the scope
- * shows no trace, the signal generator reports not-ready.
+ * 2C53T warm-handoff transport (READ-ONLY, experimental).
+ *
+ * The 2C53T FPGA link is hardware SPI3 (PB3 SCK / PB4 MISO / PB5 MOSI,
+ * JTAG pins released via AFIO remap), software CS on PB6 (idle HIGH),
+ * SPI mode 3, with PC6 = SPI enable (HIGH), PB11 = active mode (HIGH)
+ * and PC0 = data-ready from the FPGA.
+ *
+ * Acquisition protocol (from the OpenScope-2C53T issue-#18 Saleae capture
+ * of a stock boot): one CS-LOW window per channel — opcode 0x04 (CH1) /
+ * 0x05 (CH2), then 2 more status bytes, then 1023 unsigned samples,
+ * 1026 bytes total. Stock applies an ADC offset of -28.
+ *
+ * This build deliberately performs NO configuration: no bitstream upload,
+ * no config commands (all three known config-entry routes are measured
+ * dead on this FPGA — it only accepts configuration in ways stock somehow
+ * triggers). Instead it relies on a WARM HANDOFF: boot stock, let it
+ * configure the FPGA and enter scope mode, then re-flash this firmware
+ * via MENU + pinhole-reset (board power never drops, USB attached).
+ * If the FPGA's SRAM design and acquisition state survive the MCU swap,
+ * the reads below return live waveforms; if not, they return flat 0xFF —
+ * either result is a useful experiment.
  */
+
+enum {
+    FPGA53_SPI_STS_RXNE = 1u << 0,
+    FPGA53_SPI_STS_TXE = 1u << 1,
+    FPGA53_SPI_STS_BSY = 1u << 7,
+    FPGA53_XFER_TIMEOUT = 100000u,
+    FPGA53_ADC_OFFSET = 28u, /* subtracted from raw samples, per stock */
+    FPGA53_CH_SAMPLES = 1023u,
+    FPGA53_FORCED_READ_POLLS = 200u,
+};
+
+#ifndef FPGA_SPI_BR
+#define FPGA_SPI_BR 2u
+#endif
+
+static uint8_t fpga_loaded;
+static uint8_t fpga53_frame[FPGA_SCOPE_BUFFER_BYTES];
+static uint8_t fpga53_ch_buf[FPGA53_CH_SAMPLES];
+static uint16_t fpga53_notready_polls;
+static uint8_t fpga53_force_read;
+
+static uint8_t fpga53_xfer(uint8_t tx) {
+    uint32_t timeout = FPGA53_XFER_TIMEOUT;
+    while (!(SPI_STS(SPI3_BASE) & FPGA53_SPI_STS_TXE)) {
+        if (!--timeout) {
+            return 0xFFu;
+        }
+    }
+    SPI_DT(SPI3_BASE) = tx;
+    timeout = FPGA53_XFER_TIMEOUT;
+    while (!(SPI_STS(SPI3_BASE) & FPGA53_SPI_STS_RXNE)) {
+        if (!--timeout) {
+            return 0xFFu;
+        }
+    }
+    return (uint8_t)SPI_DT(SPI3_BASE);
+}
+
 void fpga_init_once(void) {
+    if (fpga_loaded) {
+        return;
+    }
+
+    RCC_APB1ENR |= 1u << 15; // SPI3
+    AFIO_MAPR = (AFIO_MAPR & ~(7u << 24)) | (2u << 24); // release PB3/PB4/PB5 from JTAG
+
+    /* Pre-load safe output levels BEFORE switching pin modes (no glitches):
+     * CS idle HIGH, SPI-enable HIGH, active-mode HIGH — same levels stock
+     * holds in scope mode, so the warm handoff does not disturb the FPGA. */
+    gpio_set(GPIOB_BASE, (1u << 6) | (1u << 11));
+    gpio_set(GPIOC_BASE, 1u << 6);
+
+    gpio_config_mask(GPIOB_BASE, (1u << 3) | (1u << 5), 0xBu); // SCK/MOSI AF push-pull
+    gpio_config_mask(GPIOB_BASE, 1u << 4, 0x4u);               // MISO floating input
+    gpio_config_mask(GPIOB_BASE, (1u << 6) | (1u << 11), 0x1u); // CS, active-mode
+    gpio_config_mask(GPIOC_BASE, 1u << 6, 0x1u);               // SPI enable
+    gpio_config_mask(GPIOC_BASE, 1u << 0, 0x4u);               // PC0 data-ready input
+
+    /* SPI mode 3, master, software NSS, 8-bit */
+    SPI_CTRL1(SPI3_BASE) = 0;
+    SPI_CTRL2(SPI3_BASE) = 0;
+    SPI_CTRL1(SPI3_BASE) = (1u << 9) | (1u << 8) | (1u << 2) |
+                           (((uint32_t)FPGA_SPI_BR & 7u) << 3) |
+                           (1u << 1) | (1u << 0);
+    SPI_CTRL1(SPI3_BASE) |= 1u << 6; // SPE
+
+    fpga53_notready_polls = 0;
+    fpga53_force_read = 0;
+    fpga_loaded = 1u;
 }
 
 uint8_t fpga_ready(void) {
-    return 0;
+    return fpga_loaded;
 }
 
+/* Read-only build: timing / signal-buffer writes are not implemented for
+ * the 2C53T yet. The capture rate stays whatever stock configured before
+ * the warm handoff, so the UI timebase is cosmetic for now. */
 void fpga_write_timing(uint32_t tuning_word, uint32_t span) {
     (void)tuning_word;
     (void)span;
@@ -45,16 +131,72 @@ void fpga_capture_latch(void) {
 }
 
 uint8_t fpga_capture_ready(void) {
+    if (GPIO_IDR(GPIOC_BASE) & 1u) { // PC0 data-ready
+        fpga53_notready_polls = 0;
+        return 1u;
+    }
+    /* Diagnostic fallback: if data-ready never rises, force one read every
+     * N polls so the screen shows the bus state (flat 0xFF = FPGA silent)
+     * instead of waiting forever. */
+    if (++fpga53_notready_polls >= FPGA53_FORCED_READ_POLLS) {
+        fpga53_notready_polls = 0;
+        fpga53_force_read = 1u;
+        return 1u;
+    }
     return 0;
 }
 
 void fpga_capture_ready_irq_handler(void) {
 }
 
+static void fpga53_read_channel(uint8_t opcode) {
+    gpio_clear(GPIOB_BASE, 1u << 6); // CS assert
+    (void)fpga53_xfer(opcode);
+    (void)fpga53_xfer(0xFFu);
+    (void)fpga53_xfer(0xFFu);
+    for (uint16_t i = 0; i < FPGA53_CH_SAMPLES; ++i) {
+        uint8_t raw = fpga53_xfer(0xFFu);
+        int16_t cal = (int16_t)raw - (int16_t)FPGA53_ADC_OFFSET;
+        if (cal < 0) {
+            cal = 0;
+        }
+        fpga53_ch_buf[i] = (uint8_t)cal;
+    }
+    gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
+}
+
 uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
-    (void)dst;
-    (void)len;
-    return 0;
+    if (!dst || !fpga_loaded) {
+        return 0;
+    }
+    fpga53_force_read = 0;
+
+    /* 1023 samples per channel, UI expects FPGA_SAMPLE_COUNT (2048)
+     * interleaved pairs — stretch 2x (nearest neighbour). */
+    fpga53_read_channel(0x04u);
+    for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
+        uint16_t src = (uint16_t)(i >> 1);
+        if (src >= FPGA53_CH_SAMPLES) {
+            src = FPGA53_CH_SAMPLES - 1u;
+        }
+        fpga53_frame[(uint16_t)(i * 2u)] = fpga53_ch_buf[src];
+    }
+    fpga53_read_channel(0x05u);
+    for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
+        uint16_t src = (uint16_t)(i >> 1);
+        if (src >= FPGA53_CH_SAMPLES) {
+            src = FPGA53_CH_SAMPLES - 1u;
+        }
+        fpga53_frame[(uint16_t)(i * 2u + 1u)] = fpga53_ch_buf[src];
+    }
+
+    if (len > FPGA_SCOPE_BUFFER_BYTES) {
+        len = FPGA_SCOPE_BUFFER_BYTES;
+    }
+    for (uint16_t i = 0; i < len; ++i) {
+        dst[i] = fpga53_frame[(uint16_t)(FPGA_SCOPE_BUFFER_BYTES - len + i)];
+    }
+    return 1u;
 }
 
 uint8_t fpga_capture_read_slow_point(uint8_t sample[2]) {

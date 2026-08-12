@@ -116,6 +116,6 @@ release-hw4:
 # Experimental 2C53T port: 2C53T button matrix / power / backlight,
 # FPGA stubbed (no scope trace), linked for the stock 2C53T IAP bootloader.
 release-2c53t:
-	$(MAKE) BUILD=$(BUILD_ROOT)/2c53t APP_BASE=0x08007000 HW_TARGET=2c53t HW_TARGET_HW40=1 HW_TARGET_2C53T=1 SCOPE_HW_CAPTURE=0 EXTRA_CFLAGS="-Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-unused-but-set-variable" all
+	$(MAKE) BUILD=$(BUILD_ROOT)/2c53t APP_BASE=0x08007000 HW_TARGET=2c53t HW_TARGET_HW40=1 HW_TARGET_2C53T=1 SCOPE_HW_CAPTURE=1 SCOPE_ANALOG_CONFIG=0 SCOPE_ATTENUATOR_CONFIG=0 EXTRA_CFLAGS="-Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-unused-but-set-variable" all
 	@mkdir -p $(DIST)
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-08007000.bin
