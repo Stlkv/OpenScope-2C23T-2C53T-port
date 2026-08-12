@@ -6169,26 +6169,19 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     dbg[p++] = 'D';
     dbg[p++] = (char)('0' + (dg.dup ? 1 : 0));
     dbg[p++] = ' ';
+    dbg[p++] = 'A';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.sweep_val));
+    dbg[p++] = (char)(dg.sweep_hit ? '!' : '.');
+    dbg[p++] = ' ';
     dbg[p++] = 'Q';
     for (uint8_t i = 0; i < 5u; ++i) {
         p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.cst[i]));
     }
     dbg[p++] = ' ';
-    dbg[p++] = 'N';
-    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.init_calls));
-    dbg[p++] = 'G';
-    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.cfg_calls));
-    dbg[p++] = 'T';
-    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.poll_calls));
-    dbg[p++] = ' ';
     dbg[p++] = 'X';
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.fe_idx));
     dbg[p++] = 'Y';
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.fe_idx_b));
-    dbg[p++] = ' ';
-    dbg[p++] = 'A';
-    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.sweep_val));
-    dbg[p++] = (char)(dg.sweep_hit ? '!' : '.');
     dbg[p] = '\0';
     lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, RGB565(255, 255, 255), grid_bg, 1);
 }
