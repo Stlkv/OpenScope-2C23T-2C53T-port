@@ -50,12 +50,39 @@ enum {
 #define FPGA53_V04_CONFIG 0
 #endif
 
+/* Delay before the post-config SPI3 writes. Stock waits ~600ms between the
+ * 0x3A config close and the five config writes (issue-#18 capture); a fresh
+ * Gowin design needs PLL lock + internal reset release before its control
+ * registers accept writes. */
+#ifndef FPGA53_SEND_CFG_DELAY_MS
+#define FPGA53_SEND_CFG_DELAY_MS 0
+#endif
+
+/* How many times to re-issue the five config writes + status read while the
+ * status reply differs from stock's armed reply (00 01 42 2E 2E). */
+#ifndef FPGA53_SEND_CFG_RETRIES
+#define FPGA53_SEND_CFG_RETRIES 1
+#endif
+
 #ifndef FPGA53_SWEEP_PRECMD
 #define FPGA53_SWEEP_PRECMD 0
 #endif
 
 #ifndef FPGA53_SWEEP_CFG02
 #define FPGA53_SWEEP_CFG02 0
+#endif
+
+/* Arm-bit hunt: sweep register 0x01's value with PC0-pulse autodetect. */
+#ifndef FPGA53_SWEEP_CFG01
+#define FPGA53_SWEEP_CFG01 0
+#endif
+
+/* Hold the stock-driven-but-unmapped pins HIGH: PD3 (static HIGH from SPI3
+ * bring-up), PD2 (asserted on scope-mode entry — top run-line candidate),
+ * PC4 (mode-flag-2 level). Post-config run relevance was untestable until a
+ * live self-configured FPGA existed (unmapped_mcu_fpga_pin_candidates.md). */
+#ifndef FPGA53_RUN_PINS
+#define FPGA53_RUN_PINS 0
 #endif
 
 #ifndef FPGA53_SWAP_ORDER
@@ -87,6 +114,7 @@ static uint8_t fpga53_frame[FPGA_SCOPE_BUFFER_BYTES];
 static uint8_t fpga53_ch_buf[FPGA53_CH_SAMPLES];
 static uint16_t fpga53_notready_polls;
 static uint8_t fpga53_force_read;
+static uint8_t fpga53_cfg01_started;
 static fpga53_diag_t fpga53_diag = { .fe_idx = 0xFFu, .fe_idx_b = 0xFFu };
 
 void fpga53_note_configure(void) {
@@ -317,11 +345,26 @@ void fpga_init_once(void) {
     gpio_config_mask(GPIOB_BASE, (1u << 6) | (1u << 11), 0x1u);
     gpio_config_mask(GPIOC_BASE, 1u << 6, 0x1u);
 
+#if FPGA53_RUN_PINS
+    /* PD3: stock holds it HIGH from SPI3 bring-up onward. */
+    gpio_set(GPIOD_BASE, 1u << 3);
+    gpio_config_mask(GPIOD_BASE, 1u << 3, 0x1u);
+#endif
+
 #if FPGA53_V04_CONFIG
     /* Attempt full FPGA configuration (V0.4 sequence) before bringing up
      * the SPI3 transport. Works from a cold boot if it works at all. */
     delay_ms(2); // PB11/PC6 settle (stock raises PB11 ~1ms before traffic)
     fpga53_v04_configure();
+#endif
+
+#if FPGA53_RUN_PINS
+    /* PD2 (scope-mode-entry level, run-line suspect) + PC4 (mode-flag-2
+     * level): stock asserts both only after the upload — mirror that. */
+    gpio_set(GPIOD_BASE, 1u << 2);
+    gpio_config_mask(GPIOD_BASE, 1u << 2, 0x1u);
+    gpio_set(GPIOC_BASE, 1u << 4);
+    gpio_config_mask(GPIOC_BASE, 1u << 4, 0x1u);
 #endif
 
     gpio_config_mask(GPIOB_BASE, (1u << 3) | (1u << 5), 0xBu); // SCK/MOSI AF push-pull
@@ -356,24 +399,44 @@ void fpga_init_once(void) {
      * FPGA53_SEND_CFG=1 for an A/B experiment. */
 #if FPGA53_SEND_CFG
     {
+#if FPGA53_SEND_CFG_DELAY_MS
+        delay_ms(FPGA53_SEND_CFG_DELAY_MS);
+#endif
         static const uint8_t cfg[5][2] = {
             {0x01u, 0x08u}, {0x02u, FPGA53_CFG02_VAL}, {0x06u, 0x00u},
             {0x07u, 0x00u}, {0x08u, 0xADu},
         };
-        for (uint8_t i = 0; i < 5u; ++i) {
+        /* Stock's reply to the 0x03 status read once capture is armed. */
+        static const uint8_t cst_ok[5] = {0x00u, 0x01u, 0x42u, 0x2Eu, 0x2Eu};
+        for (uint8_t attempt = 0; attempt < FPGA53_SEND_CFG_RETRIES; ++attempt) {
+            if (attempt) {
+                delay_ms(200);
+            }
+            for (uint8_t i = 0; i < 5u; ++i) {
+                gpio_clear(GPIOB_BASE, 1u << 6);
+                (void)fpga53_xfer(cfg[i][0]);
+                (void)fpga53_xfer(cfg[i][1]);
+                gpio_set(GPIOB_BASE, 1u << 6);
+                delay_ms(1);
+            }
             gpio_clear(GPIOB_BASE, 1u << 6);
-            (void)fpga53_xfer(cfg[i][0]);
-            (void)fpga53_xfer(cfg[i][1]);
+            fpga53_diag.cst[0] = fpga53_xfer(0x03u);
+            fpga53_diag.cst[1] = fpga53_xfer(0xFFu);
+            fpga53_diag.cst[2] = fpga53_xfer(0xFFu);
+            fpga53_diag.cst[3] = fpga53_xfer(0xFFu);
+            fpga53_diag.cst[4] = fpga53_xfer(0xFFu);
             gpio_set(GPIOB_BASE, 1u << 6);
-            delay_ms(1);
+            uint8_t match = 1u;
+            for (uint8_t i = 0; i < 5u; ++i) {
+                if (fpga53_diag.cst[i] != cst_ok[i]) {
+                    match = 0;
+                    break;
+                }
+            }
+            if (match) {
+                break;
+            }
         }
-        gpio_clear(GPIOB_BASE, 1u << 6);
-        fpga53_diag.cst[0] = fpga53_xfer(0x03u);
-        fpga53_diag.cst[1] = fpga53_xfer(0xFFu);
-        fpga53_diag.cst[2] = fpga53_xfer(0xFFu);
-        fpga53_diag.cst[3] = fpga53_xfer(0xFFu);
-        fpga53_diag.cst[4] = fpga53_xfer(0xFFu);
-        gpio_set(GPIOB_BASE, 1u << 6);
     }
 #endif
 
@@ -408,9 +471,36 @@ void fpga_capture_latch(void) {
 
 uint8_t fpga_capture_ready(void) {
     if (GPIO_IDR(GPIOC_BASE) & 1u) { // PC0 data-ready
+#if FPGA53_SWEEP_CFG01
+        /* PC0 rose after a 01-register sweep write: freeze the sweep so the
+         * winning value stays in the A field (shown as A<val>!). */
+        if (fpga53_cfg01_started && !fpga53_diag.sweep_hit) {
+            fpga53_diag.sweep_hit = 1u;
+        }
+#endif
         fpga53_notready_polls = 0;
         return 1u;
     }
+#if FPGA53_SWEEP_CFG01
+    /* Arm-bit hunt: while PC0 is dead, walk register 0x01 through all 256
+     * values (stock sends 01 08). Two polls of dwell per value; skip until
+     * the boot one-shot buffer has been consumed by the first read, so the
+     * leftover ready level cannot fake a hit. */
+    if (!fpga53_diag.sweep_hit && fpga53_diag.reads >= 1u) {
+        static uint8_t cfg01_dwell;
+        if (++cfg01_dwell >= 2u) {
+            cfg01_dwell = 0;
+            fpga53_diag.sweep_val = fpga53_cfg01_started
+                                        ? (uint8_t)(fpga53_diag.sweep_val + 1u)
+                                        : 0u;
+            fpga53_cfg01_started = 1u;
+            gpio_clear(GPIOB_BASE, 1u << 6);
+            (void)fpga53_xfer(0x01u);
+            (void)fpga53_xfer(fpga53_diag.sweep_val);
+            gpio_set(GPIOB_BASE, 1u << 6);
+        }
+    }
+#endif
     /* Diagnostic fallback: if data-ready never rises, force one read every
      * N polls so the screen shows the bus state (flat 0xFF = FPGA silent)
      * instead of waiting forever. */
@@ -646,6 +736,19 @@ enum {
 
 #ifndef FPGA53_SWEEP_CFG02
 #define FPGA53_SWEEP_CFG02 0
+#endif
+
+/* Arm-bit hunt: sweep register 0x01's value with PC0-pulse autodetect. */
+#ifndef FPGA53_SWEEP_CFG01
+#define FPGA53_SWEEP_CFG01 0
+#endif
+
+/* Hold the stock-driven-but-unmapped pins HIGH: PD3 (static HIGH from SPI3
+ * bring-up), PD2 (asserted on scope-mode entry — top run-line candidate),
+ * PC4 (mode-flag-2 level). Post-config run relevance was untestable until a
+ * live self-configured FPGA existed (unmapped_mcu_fpga_pin_candidates.md). */
+#ifndef FPGA53_RUN_PINS
+#define FPGA53_RUN_PINS 0
 #endif
 
 #ifndef FPGA53_SWAP_ORDER

@@ -6203,6 +6203,63 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
         }
         dbg[p] = '\0';
         lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u), dbg, RGB565(255, 255, 0), grid_bg, 1);
+
+        /* Line 4: automatic verdicts. The 0x80 first-window marker can land
+         * on the top byte of any of the 32-bit reads (and on cst[0]), so all
+         * comparisons strip bit 31 / bit 7. */
+        {
+            static const uint8_t cst_ok[5] = {0x00u, 0x01u, 0x42u, 0x2Eu, 0x2Eu};
+            const uint16_t ok_c = RGB565(0, 255, 0);
+            const uint16_t bad_c = RGB565(255, 80, 80);
+            const uint16_t warn_c = RGB565(255, 200, 0);
+            uint32_t id_m = dg.v04_id & 0x7FFFFFFFu;
+            uint32_t stb_m = dg.v04_stb & 0x7FFFFFFFu;
+            uint32_t sta_m = dg.v04_sta & 0x7FFFFFFFu;
+            uint8_t q_ok = 1u;
+            for (uint8_t i = 0; i < 5u; ++i) {
+                uint8_t v = dg.cst[i];
+                if (i == 0u) {
+                    v &= 0x7Fu;
+                }
+                if (v != cst_ok[i]) {
+                    q_ok = 0;
+                    break;
+                }
+            }
+            const char *tok[5];
+            uint16_t col[5];
+            uint8_t id_ok = (id_m == 0x0120681Bu);
+            uint8_t cold = (stb_m == 0x00039020u);
+            uint8_t cfg_ok = (sta_m == 0x0003F460u);
+            uint8_t eng_ok = (dg.pc0 || dg.reads > dg.forced);
+            tok[0] = id_ok ? "ID:OK" : "ID:BAD";
+            col[0] = id_ok ? ok_c : bad_c;
+            tok[1] = cold ? "COLD" : "WARM";
+            col[1] = cold ? ok_c : warn_c;
+            if (cfg_ok) {
+                tok[2] = "CFG:OK";
+                col[2] = ok_c;
+            } else if (sta_m != stb_m) {
+                tok[2] = "CFG:NEW";
+                col[2] = warn_c;
+            } else {
+                tok[2] = "CFG:NO";
+                col[2] = bad_c;
+            }
+            tok[3] = q_ok ? "Q:OK" : "Q:BAD";
+            col[3] = q_ok ? ok_c : bad_c;
+            tok[4] = eng_ok ? "ENG:RUN" : "ENG:DEAD";
+            col[4] = eng_ok ? ok_c : bad_c;
+            uint16_t vx = (uint16_t)(gx + 4u);
+            for (uint8_t i = 0; i < 5u; ++i) {
+                lcd_text(vx, (uint16_t)(gy + 33u), tok[i], col[i], grid_bg, 1);
+                vx = (uint16_t)(vx + lcd_text_width(tok[i], 1) + 6u);
+            }
+            /* Line 5: expected reference values, for on-screen comparison. */
+            lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 43u),
+                     "exp B=00039020 A=0003F460 Q=0001422E2E",
+                     RGB565(160, 160, 160), grid_bg, 1);
+        }
     }
 }
 #endif
