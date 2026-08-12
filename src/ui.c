@@ -6161,10 +6161,13 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     dbg[p++] = '-';
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax));
     dbg[p++] = ' ';
-    dbg[p++] = 'Q';
-    for (uint8_t i = 0; i < 5u; ++i) {
-        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.cst[i]));
-    }
+    dbg[p++] = 'b';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smin2));
+    dbg[p++] = '-';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax2));
+    dbg[p++] = ' ';
+    dbg[p++] = 'D';
+    dbg[p++] = (char)('0' + (dg.dup ? 1 : 0));
     dbg[p++] = ' ';
     dbg[p++] = 'N';
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.init_calls));

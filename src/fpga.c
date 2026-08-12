@@ -90,6 +90,9 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     for (uint8_t i = 0; i < 5u; ++i) {
         d->cst[i] = fpga53_diag.cst[i];
     }
+    d->smin2 = fpga53_diag.smin2;
+    d->smax2 = fpga53_diag.smax2;
+    d->dup = fpga53_diag.dup;
 }
 
 static uint8_t fpga53_xfer(uint8_t tx) {
@@ -226,9 +229,12 @@ uint8_t fpga_capture_ready(void) {
 void fpga_capture_ready_irq_handler(void) {
 }
 
+static uint32_t fpga53_win_sum[2];
+
 static void fpga53_read_channel(uint8_t opcode) {
     uint8_t rmin = 0xFFu;
     uint8_t rmax = 0;
+    uint32_t sum = 0;
 
     gpio_clear(GPIOB_BASE, 1u << 6); // CS assert
     uint8_t r0 = fpga53_xfer(opcode);
@@ -246,6 +252,7 @@ static void fpga53_read_channel(uint8_t opcode) {
         if (cal < 0) {
             cal = 0;
         }
+        sum = sum * 31u + raw;
         fpga53_ch_buf[i] = (uint8_t)cal;
     }
     gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
@@ -256,6 +263,12 @@ static void fpga53_read_channel(uint8_t opcode) {
         fpga53_diag.r2 = r2;
         fpga53_diag.smin = rmin;
         fpga53_diag.smax = rmax;
+        fpga53_win_sum[0] = sum;
+    } else {
+        fpga53_diag.smin2 = rmin;
+        fpga53_diag.smax2 = rmax;
+        fpga53_win_sum[1] = sum;
+        fpga53_diag.dup = (fpga53_win_sum[0] == fpga53_win_sum[1]) ? 1u : 0u;
     }
 }
 
