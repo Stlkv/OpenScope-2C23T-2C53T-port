@@ -3,6 +3,7 @@
 #include "board.h"
 #include "dmm.h"
 #include "display.h"
+#include "fpga.h"
 #include "fw_update.h"
 #include "hw.h"
 #include "screenshot.h"
@@ -754,6 +755,28 @@ static void bode_sweep_service(void);
 static void bode_extract_channel(uint8_t target_ch, float *dst);
 static void scope_fft_src_apply_from(uint8_t old_src, uint8_t new_src);
 static void ui_draw_bode(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t gh);
+
+#if HW_TARGET_2C53T
+static uint8_t ui_dbg_dec(char *dst, uint16_t v) {
+    char tmp[5];
+    uint8_t n = 0;
+    do {
+        tmp[n++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v && n < 5u);
+    for (uint8_t i = 0; i < n; ++i) {
+        dst[i] = tmp[(uint8_t)(n - 1u - i)];
+    }
+    return n;
+}
+
+static uint8_t ui_dbg_hex(char *dst, uint8_t v) {
+    static const char h[] = "0123456789ABCDEF";
+    dst[0] = h[(v >> 4) & 0xFu];
+    dst[1] = h[v & 0xFu];
+    return 2;
+}
+#endif
 
 static uint16_t mode_accent(void) {
     if (ui.mode == UI_MODE_SCOPE) {
@@ -6180,6 +6203,47 @@ static void draw_scope_chrome_live(void) {
     } else {
         lcd_text_center(gx, 103, gw, scope_hw_ready() ? "WAIT" : "FPGA", C_MUTED, grid_bg, 2);
     }
+
+#if HW_TARGET_2C53T
+    {
+        /* Warm-handoff transport telemetry:
+         * I<init> P<pc0> R<reads> C<forced> S<st> F<frm> W<wait> E<err> | r0 r1 r2 min-max */
+        fpga53_diag_t dg;
+        char dbg[64];
+        uint8_t p = 0;
+        fpga53_get_diag(&dg);
+        dbg[p++] = 'I';
+        dbg[p++] = (char)('0' + (dg.inited ? 1 : 0));
+        dbg[p++] = ' ';
+        dbg[p++] = 'P';
+        dbg[p++] = (char)('0' + (dg.pc0 ? 1 : 0));
+        dbg[p++] = ' ';
+        dbg[p++] = 'R';
+        p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.reads));
+        dbg[p++] = ' ';
+        dbg[p++] = 'C';
+        p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.forced));
+        dbg[p++] = ' ';
+        dbg[p++] = 'S';
+        dbg[p++] = (char)('0' + (scope_hw_last_status() % 10u));
+        dbg[p++] = ' ';
+        dbg[p++] = 'F';
+        p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_frame_count()));
+        dbg[p++] = ' ';
+        dbg[p++] = 'W';
+        p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_wait_count()));
+        dbg[p++] = ' ';
+        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r0));
+        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r1));
+        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r2));
+        dbg[p++] = ' ';
+        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smin));
+        dbg[p++] = '-';
+        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax));
+        dbg[p] = '\0';
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, C_MUTED, grid_bg, 1);
+    }
+#endif
 
     draw_scope_channel_headers(18, 262, 61, grid_bg);
 

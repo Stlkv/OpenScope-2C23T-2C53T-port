@@ -55,6 +55,24 @@ static uint8_t fpga53_frame[FPGA_SCOPE_BUFFER_BYTES];
 static uint8_t fpga53_ch_buf[FPGA53_CH_SAMPLES];
 static uint16_t fpga53_notready_polls;
 static uint8_t fpga53_force_read;
+static fpga53_diag_t fpga53_diag;
+
+void fpga53_get_diag(fpga53_diag_t *d) {
+    if (!d) {
+        return;
+    }
+    fpga53_diag.inited = fpga_loaded;
+    fpga53_diag.pc0 = (GPIO_IDR(GPIOC_BASE) & 1u) ? 1u : 0u;
+    d->inited = fpga53_diag.inited;
+    d->pc0 = fpga53_diag.pc0;
+    d->reads = fpga53_diag.reads;
+    d->forced = fpga53_diag.forced;
+    d->r0 = fpga53_diag.r0;
+    d->r1 = fpga53_diag.r1;
+    d->r2 = fpga53_diag.r2;
+    d->smin = fpga53_diag.smin;
+    d->smax = fpga53_diag.smax;
+}
 
 static uint8_t fpga53_xfer(uint8_t tx) {
     uint32_t timeout = FPGA53_XFER_TIMEOUT;
@@ -141,6 +159,7 @@ uint8_t fpga_capture_ready(void) {
     if (++fpga53_notready_polls >= FPGA53_FORCED_READ_POLLS) {
         fpga53_notready_polls = 0;
         fpga53_force_read = 1u;
+        ++fpga53_diag.forced;
         return 1u;
     }
     return 0;
@@ -150,12 +169,21 @@ void fpga_capture_ready_irq_handler(void) {
 }
 
 static void fpga53_read_channel(uint8_t opcode) {
+    uint8_t rmin = 0xFFu;
+    uint8_t rmax = 0;
+
     gpio_clear(GPIOB_BASE, 1u << 6); // CS assert
-    (void)fpga53_xfer(opcode);
-    (void)fpga53_xfer(0xFFu);
-    (void)fpga53_xfer(0xFFu);
+    uint8_t r0 = fpga53_xfer(opcode);
+    uint8_t r1 = fpga53_xfer(0xFFu);
+    uint8_t r2 = fpga53_xfer(0xFFu);
     for (uint16_t i = 0; i < FPGA53_CH_SAMPLES; ++i) {
         uint8_t raw = fpga53_xfer(0xFFu);
+        if (raw < rmin) {
+            rmin = raw;
+        }
+        if (raw > rmax) {
+            rmax = raw;
+        }
         int16_t cal = (int16_t)raw - (int16_t)FPGA53_ADC_OFFSET;
         if (cal < 0) {
             cal = 0;
@@ -163,6 +191,14 @@ static void fpga53_read_channel(uint8_t opcode) {
         fpga53_ch_buf[i] = (uint8_t)cal;
     }
     gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
+
+    if (opcode == 0x04u) {
+        fpga53_diag.r0 = r0;
+        fpga53_diag.r1 = r1;
+        fpga53_diag.r2 = r2;
+        fpga53_diag.smin = rmin;
+        fpga53_diag.smax = rmax;
+    }
 }
 
 uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
@@ -170,6 +206,7 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
         return 0;
     }
     fpga53_force_read = 0;
+    ++fpga53_diag.reads;
 
     /* 1023 samples per channel, UI expects FPGA_SAMPLE_COUNT (2048)
      * interleaved pairs — stretch 2x (nearest neighbour). */
