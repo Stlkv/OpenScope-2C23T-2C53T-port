@@ -70,6 +70,10 @@ enum {
 #define FPGA53_CFG02_VAL 0x03u
 #endif
 
+#ifndef FPGA53_DUAL_READ
+#define FPGA53_DUAL_READ 0
+#endif
+
 #ifndef FPGA_SPI_BR
 #define FPGA_SPI_BR 2u
 #endif
@@ -368,6 +372,51 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
     fpga53_force_read = 0;
     ++fpga53_diag.reads;
 
+#if FPGA53_DUAL_READ
+    /* Stock RE dual-mode read (acquisition FSM case 4): one CS window,
+     * 0xFF command byte, then a CH1 block followed by a CH2 block. Uses
+     * 1024 samples per channel here. Diag: first window stats -> CH1 block,
+     * second stats -> CH2 block. */
+    {
+        uint8_t v;
+        uint8_t mn = 0xFFu, mx = 0;
+        gpio_clear(GPIOB_BASE, 1u << 6);
+        fpga53_diag.r0 = fpga53_xfer(0xFFu);
+        for (uint16_t i = 0; i < 1024u; ++i) {
+            v = fpga53_xfer(0xFFu);
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            int16_t c = (int16_t)v - (int16_t)FPGA53_ADC_OFFSET;
+            if (c < 0) c = 0;
+            fpga53_frame[(uint16_t)(((i * 2u) % FPGA_SAMPLE_COUNT) * 2u)] = (uint8_t)c;
+            fpga53_frame[(uint16_t)((((i * 2u) + 1u) % FPGA_SAMPLE_COUNT) * 2u)] = (uint8_t)c;
+        }
+        fpga53_diag.smin = mn;
+        fpga53_diag.smax = mx;
+        mn = 0xFFu;
+        mx = 0;
+        for (uint16_t i = 0; i < 1024u; ++i) {
+            v = fpga53_xfer(0xFFu);
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            int16_t c = (int16_t)v - (int16_t)FPGA53_ADC_OFFSET;
+            if (c < 0) c = 0;
+            fpga53_frame[(uint16_t)((((i * 2u) % FPGA_SAMPLE_COUNT) * 2u) + 1u)] = (uint8_t)c;
+            fpga53_frame[(uint16_t)(((((i * 2u) + 1u) % FPGA_SAMPLE_COUNT) * 2u) + 1u)] = (uint8_t)c;
+        }
+        fpga53_diag.smin2 = mn;
+        fpga53_diag.smax2 = mx;
+        gpio_set(GPIOB_BASE, 1u << 6);
+    }
+    if (len > FPGA_SCOPE_BUFFER_BYTES) {
+        len = FPGA_SCOPE_BUFFER_BYTES;
+    }
+    for (uint16_t i = 0; i < len; ++i) {
+        dst[i] = fpga53_frame[(uint16_t)(FPGA_SCOPE_BUFFER_BYTES - len + i)];
+    }
+    return 1u;
+#endif
+
 #if FPGA53_PRE_CMD
     /* Stock sends a one-byte pre-acquisition command 0x80|voltage_range in
      * its own CS window before reading (per the stock-firmware RE). Try a
@@ -505,6 +554,10 @@ enum {
 
 #ifndef FPGA53_CFG02_VAL
 #define FPGA53_CFG02_VAL 0x03u
+#endif
+
+#ifndef FPGA53_DUAL_READ
+#define FPGA53_DUAL_READ 0
 #endif
 
 #ifndef FPGA_SPI_BR
