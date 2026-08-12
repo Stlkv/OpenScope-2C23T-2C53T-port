@@ -50,6 +50,10 @@ enum {
 #define FPGA53_SWEEP_PRECMD 0
 #endif
 
+#ifndef FPGA53_SWEEP_CFG02
+#define FPGA53_SWEEP_CFG02 0
+#endif
+
 #ifndef FPGA53_SWAP_ORDER
 #define FPGA53_SWAP_ORDER 0
 #endif
@@ -369,6 +373,33 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
     gpio_set(GPIOB_BASE, 1u << 6);
 #endif
 
+#if FPGA53_SWEEP_CFG02
+    /* Auto-sweep the value of config register 0x02 (stock sends 02 03 after
+     * FPGA configuration — channel-mask suspect). Writes "02 <val>" once per
+     * dwell step; freezes when the CH2 window spread crosses the threshold. */
+    {
+        enum { SWEEP02_DWELL_FRAMES = 6, SWEEP02_SPREAD_THRESHOLD = 12 };
+        static uint8_t sweep02_frame;
+        static uint8_t sweep02_started;
+
+        if (!fpga53_diag.sweep_hit) {
+            if ((uint8_t)(fpga53_diag.smax2 - fpga53_diag.smin2) >= SWEEP02_SPREAD_THRESHOLD) {
+                fpga53_diag.sweep_hit = 1u;
+            } else if (!sweep02_started || ++sweep02_frame >= SWEEP02_DWELL_FRAMES) {
+                sweep02_frame = 0;
+                fpga53_diag.sweep_val = sweep02_started
+                                            ? (uint8_t)(fpga53_diag.sweep_val + 1u)
+                                            : 0u;
+                sweep02_started = 1u;
+                gpio_clear(GPIOB_BASE, 1u << 6);
+                (void)fpga53_xfer(0x02u);
+                (void)fpga53_xfer(fpga53_diag.sweep_val);
+                gpio_set(GPIOB_BASE, 1u << 6);
+            }
+        }
+    }
+#endif
+
 #if FPGA53_SWEEP_PRECMD
     /* Auto-sweep the pre-command byte 0x80..0xFF, dwelling several frames
      * on each value. If the CH2 window's spread exceeds the threshold, the
@@ -450,6 +481,10 @@ enum {
 
 #ifndef FPGA53_SWEEP_PRECMD
 #define FPGA53_SWEEP_PRECMD 0
+#endif
+
+#ifndef FPGA53_SWEEP_CFG02
+#define FPGA53_SWEEP_CFG02 0
 #endif
 
 #ifndef FPGA53_SWAP_ORDER
