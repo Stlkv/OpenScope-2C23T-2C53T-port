@@ -6118,6 +6118,47 @@ static void draw_scope_trace(uint16_t color,
     }
 }
 
+#if HW_TARGET_2C53T
+static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
+    /* Warm-handoff transport telemetry:
+     * I<init> P<pc0> R<reads> C<forced> S<st> F<frm> W<wait> | r0 r1 r2 min-max */
+    fpga53_diag_t dg;
+    char dbg[64];
+    uint8_t p = 0;
+    fpga53_get_diag(&dg);
+    dbg[p++] = 'I';
+    dbg[p++] = (char)('0' + (dg.inited ? 1 : 0));
+    dbg[p++] = ' ';
+    dbg[p++] = 'P';
+    dbg[p++] = (char)('0' + (dg.pc0 ? 1 : 0));
+    dbg[p++] = ' ';
+    dbg[p++] = 'R';
+    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.reads));
+    dbg[p++] = ' ';
+    dbg[p++] = 'C';
+    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.forced));
+    dbg[p++] = ' ';
+    dbg[p++] = 'S';
+    dbg[p++] = (char)('0' + (scope_hw_last_status() % 10u));
+    dbg[p++] = ' ';
+    dbg[p++] = 'F';
+    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_frame_count()));
+    dbg[p++] = ' ';
+    dbg[p++] = 'W';
+    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_wait_count()));
+    dbg[p++] = ' ';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r0));
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r1));
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r2));
+    dbg[p++] = ' ';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smin));
+    dbg[p++] = '-';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax));
+    dbg[p] = '\0';
+    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, C_MUTED, grid_bg, 1);
+}
+#endif
+
 static void draw_scope_chrome_live(void) {
     uint16_t gx = 10;
     uint16_t gy = 55;
@@ -6205,44 +6246,7 @@ static void draw_scope_chrome_live(void) {
     }
 
 #if HW_TARGET_2C53T
-    {
-        /* Warm-handoff transport telemetry:
-         * I<init> P<pc0> R<reads> C<forced> S<st> F<frm> W<wait> E<err> | r0 r1 r2 min-max */
-        fpga53_diag_t dg;
-        char dbg[64];
-        uint8_t p = 0;
-        fpga53_get_diag(&dg);
-        dbg[p++] = 'I';
-        dbg[p++] = (char)('0' + (dg.inited ? 1 : 0));
-        dbg[p++] = ' ';
-        dbg[p++] = 'P';
-        dbg[p++] = (char)('0' + (dg.pc0 ? 1 : 0));
-        dbg[p++] = ' ';
-        dbg[p++] = 'R';
-        p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.reads));
-        dbg[p++] = ' ';
-        dbg[p++] = 'C';
-        p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.forced));
-        dbg[p++] = ' ';
-        dbg[p++] = 'S';
-        dbg[p++] = (char)('0' + (scope_hw_last_status() % 10u));
-        dbg[p++] = ' ';
-        dbg[p++] = 'F';
-        p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_frame_count()));
-        dbg[p++] = ' ';
-        dbg[p++] = 'W';
-        p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_wait_count()));
-        dbg[p++] = ' ';
-        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r0));
-        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r1));
-        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r2));
-        dbg[p++] = ' ';
-        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smin));
-        dbg[p++] = '-';
-        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax));
-        dbg[p] = '\0';
-        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, C_MUTED, grid_bg, 1);
-    }
+    draw_fpga53_debug_line(gx, gy, grid_bg);
 #endif
 
     draw_scope_channel_headers(18, 262, 61, grid_bg);
@@ -6397,6 +6401,9 @@ static void draw_scope_immersive(void) {
         lcd_text_center(gx, (uint16_t)(gy + 82u), gw, scope_hw_ready() ? "WAIT" : "FPGA", C_MUTED, grid_bg, 2);
     }
 
+#if HW_TARGET_2C53T
+    draw_fpga53_debug_line(gx, gy, grid_bg);
+#endif
     draw_scope_scale_status(220, grid_bg);
     ui_draw_math_menu();
 }
