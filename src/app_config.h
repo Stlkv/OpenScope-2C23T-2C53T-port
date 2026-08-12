@@ -16,7 +16,13 @@
 #define HW_TARGET_HW40 0
 #endif
 
-#if HW_TARGET_HW40
+#ifndef HW_TARGET_2C53T
+#define HW_TARGET_2C53T 0
+#endif
+
+#if HW_TARGET_2C53T
+#define HW_TARGET_NAME "2C53T"
+#elif HW_TARGET_HW40
 #define HW_TARGET_NAME "HW4.0"
 #else
 #define HW_TARGET_NAME "<HW4.0"

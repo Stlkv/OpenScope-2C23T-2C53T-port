@@ -278,6 +278,15 @@ void scope_hw_configure_channels(uint8_t timebase,
                                  uint8_t ch2_dc,
                                  uint16_t ch1_dac,
                                  uint16_t ch2_dac) {
+#if !SCOPE_HW_CAPTURE
+    (void)timebase;
+    (void)ch1_vdiv;
+    (void)ch2_vdiv;
+    (void)ch1_dc;
+    (void)ch2_dc;
+    (void)ch1_dac;
+    (void)ch2_dac;
+#endif
 #if SCOPE_HW_CAPTURE
     fpga_init_once();
     if (!fpga_ready()) {

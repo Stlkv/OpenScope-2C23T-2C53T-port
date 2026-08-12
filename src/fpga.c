@@ -7,6 +7,63 @@
 
 #include <stdint.h>
 
+#ifndef HW_TARGET_2C53T
+#define HW_TARGET_2C53T 0
+#endif
+
+#if HW_TARGET_2C53T
+/*
+ * 2C53T: the FPGA transport differs from both 2C23T variants (hardware SPI3
+ * on PB3/4/5 with CS on PB6, per-channel 0x04/0x05 reads, PC0 data-ready),
+ * and several pins the 2C23T paths drive are buttons / analog-frontend
+ * controls on the 2C53T (PA15, PC8, PC0-PC7, PC9). Until a real 2C53T
+ * transport exists, all FPGA access is stubbed out: the UI runs, the scope
+ * shows no trace, the signal generator reports not-ready.
+ */
+void fpga_init_once(void) {
+}
+
+uint8_t fpga_ready(void) {
+    return 0;
+}
+
+void fpga_write_timing(uint32_t tuning_word, uint32_t span) {
+    (void)tuning_word;
+    (void)span;
+}
+
+void fpga_write_scope_timing(uint32_t span) {
+    (void)span;
+}
+
+void fpga_write_signal_buffer(const uint8_t *data, uint16_t len) {
+    (void)data;
+    (void)len;
+}
+
+void fpga_capture_latch(void) {
+}
+
+uint8_t fpga_capture_ready(void) {
+    return 0;
+}
+
+void fpga_capture_ready_irq_handler(void) {
+}
+
+uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
+    (void)dst;
+    (void)len;
+    return 0;
+}
+
+uint8_t fpga_capture_read_slow_point(uint8_t sample[2]) {
+    (void)sample;
+    return 0;
+}
+
+#else /* !HW_TARGET_2C53T */
+
 enum {
     FPGA_LATCH_SETTLE_MS = 1,
     SPI_CAPTURE_TIMEOUT = 60000u,
@@ -518,3 +575,5 @@ uint8_t fpga_capture_read_slow_point(uint8_t sample[2]) {
 }
 
 #endif
+
+#endif /* !HW_TARGET_2C53T */

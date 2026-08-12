@@ -5,6 +5,11 @@
 
 #include <stdint.h>
 
+#ifndef HW_TARGET_2C53T
+#define HW_TARGET_2C53T 0
+#endif
+
+#if !HW_TARGET_2C53T
 typedef struct {
     uint32_t base;
     uint16_t mask;
@@ -29,6 +34,7 @@ static const key_pin_t key_pins[] = {
     {GPIOE_BASE, 1u << 3, KEY_SAVE, 0},
     {GPIOD_BASE, 1u << 3, KEY_POWER, 0},
 };
+#endif /* !HW_TARGET_2C53T */
 
 static uint16_t g_battery_mv;
 static uint8_t g_battery_percent;
@@ -74,6 +80,16 @@ void board_init(void) {
     RCC_APB2ENR |= (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6);
     RCC_AHBENR |= (1u << 8);
 
+#if HW_TARGET_2C53T
+    gpio_config_mask(GPIOC_BASE, 1u << 9, 0x1); // PC9 power hold, must go HIGH first
+    gpio_set(GPIOC_BASE, 1u << 9);
+
+    gpio_config_mask(GPIOB_BASE, 1u << 8, 0x1); // PB8 LCD backlight, off until display ready
+    gpio_clear(GPIOB_BASE, 1u << 8);
+
+    gpio_config_mask(GPIOD_BASE, 1u << 6, 0x1); // PD6 LCD reset (same as 2C23T)
+    gpio_set(GPIOD_BASE, 1u << 6);
+#else
     gpio_config_mask(GPIOB_BASE, 1u << 2, 0x1); // PB2 power hold
     gpio_set(GPIOB_BASE, 1u << 2);
 
@@ -91,6 +107,7 @@ void board_init(void) {
 
     gpio_config_mask(GPIOD_BASE, 1u << 6, 0x1); // PD6 LCD reset
     gpio_set(GPIOD_BASE, 1u << 6);
+#endif
 }
 
 void load_counter_init(void) {
@@ -110,6 +127,10 @@ uint32_t load_counter_elapsed(uint32_t start, uint32_t end) {
 
 void power_key_exti_init(void) {
     g_power_off_requested = 0;
+#if HW_TARGET_2C53T
+    /* 2C53T POWER (PC8) is polled via the key matrix scan; no EXTI needed. */
+    __asm__ volatile("cpsie i");
+#else
     AFIO_EXTICR1 = (AFIO_EXTICR1 & ~(0xFu << 12)) | (0x3u << 12); // EXTI3 = port D
     EXTI_PR = 1u << 3;
     EXTI_RTSR &= ~(1u << 3);
@@ -117,6 +138,7 @@ void power_key_exti_init(void) {
     EXTI_IMR |= 1u << 3;
     REG32(NVIC_ISER0) = 1u << 9; // EXTI3 IRQ
     __asm__ volatile("cpsie i");
+#endif
 }
 
 void power_key_irq_handler(void) {
@@ -130,7 +152,11 @@ uint8_t board_power_off_requested(void) {
 }
 
 void board_power_off(void) {
+#if HW_TARGET_2C53T
+    gpio_clear(GPIOC_BASE, 1u << 9);
+#else
     gpio_clear(GPIOB_BASE, 1u << 2);
+#endif
     while (1) {
     }
 }
@@ -150,6 +176,24 @@ static void tmr5_update_counter(void) {
     }
 }
 
+#if HW_TARGET_2C53T
+void board_backlight_set(uint8_t on) {
+    g_backlight_on = on ? 1u : 0u;
+    if (on) {
+        gpio_set(GPIOB_BASE, 1u << 8); // PB8 plain GPIO backlight
+    } else {
+        gpio_clear(GPIOB_BASE, 1u << 8);
+    }
+    tmr5_update_counter();
+}
+
+void board_backlight_set_level(uint8_t percent) {
+    if (percent > 100u) {
+        percent = 100u;
+    }
+    g_backlight_percent = percent; // no PWM on PB8; brightness setting is cosmetic
+}
+#else
 void board_backlight_set(uint8_t on) {
     g_backlight_on = on ? 1u : 0u;
     if (on) {
@@ -171,13 +215,18 @@ void board_backlight_set_level(uint8_t percent) {
     g_backlight_percent = percent;
     TMR_C1DT(TMR5_BASE) = percent_to_timer_compare(g_backlight_percent, 999u);
 }
+#endif
 
 void board_buzzer_init(void) {
     RCC_APB1ENR |= 1u << 3; // TMR5
 
+#if !HW_TARGET_2C53T
+    /* PA0/PA1 are backlight/buzzer only on the 2C23T; on the 2C53T their role
+     * is unknown, so they are deliberately left untouched (no buzzer output). */
     gpio_config_mask(GPIOA_BASE, 1u << 0, 0x1); // PA0 backlight stays off until display is ready
     gpio_clear(GPIOA_BASE, 1u << 0);
     gpio_config_mask(GPIOA_BASE, 1u << 1, 0xBu); // TMR5 CH2, AF push-pull
+#endif
 #if !HW_TARGET_HW40
     gpio_config_mask(GPIOC_BASE, 1u << 7, 0x8u); // DMM beep request, active low
     gpio_set(GPIOC_BASE, 1u << 7);
@@ -206,6 +255,12 @@ void board_buzzer_init(void) {
 }
 
 static void board_buzzer_set_at(uint8_t on, uint8_t percent) {
+#if HW_TARGET_2C53T
+    /* No buzzer pin mapped on the 2C53T yet — stay silent. */
+    (void)on;
+    (void)percent;
+    return;
+#endif
     on = on ? 1u : 0u;
     if (percent > 100u) {
         percent = 100u;
@@ -361,16 +416,26 @@ static uint16_t battery_adc_read_raw(void) {
 }
 
 void battery_init(void) {
+#if HW_TARGET_2C53T
+    gpio_config_mask(GPIOB_BASE, 1u << 1, 0x0); // PB1 ADC input (ADC1 ch9 on 2C53T)
+#else
     gpio_config_mask(GPIOA_BASE, 1u << 2, 0x0); // PA2 ADC input
+#endif
 
     RCC_APB2ENR |= 1u << 9; // ADC1 clock
     RCC_CFGR = (RCC_CFGR & ~(3u << 14)) | (2u << 14); // ADC clock = PCLK2 / 6
 
     ADC_CR1(ADC1_BASE) = 0;
     ADC_CR2(ADC1_BASE) = 0;
+#if HW_TARGET_2C53T
+    ADC_SMPR2(ADC1_BASE) = (ADC_SMPR2(ADC1_BASE) & ~(7u << 27)) | (7u << 27);
+    ADC_SQR1(ADC1_BASE) = 0;
+    ADC_SQR3(ADC1_BASE) = 9u;
+#else
     ADC_SMPR2(ADC1_BASE) = (ADC_SMPR2(ADC1_BASE) & ~(7u << 6)) | (7u << 6);
     ADC_SQR1(ADC1_BASE) = 0;
     ADC_SQR3(ADC1_BASE) = 2u;
+#endif
 
     ADC_CR2(ADC1_BASE) |= 1u; // ADON
     delay_ms(2);
@@ -416,7 +481,13 @@ void battery_update(void) {
 }
 
 void battery_update_charging_status(void) {
+#if HW_TARGET_2C53T
+    /* No dedicated charger-status GPIO known on the 2C53T; use the same
+     * >4.3V heuristic as the OpenScope 2C53T firmware. */
+    g_battery_charging = g_battery_mv > 4300u ? 1u : 0u;
+#else
     g_battery_charging = gpio_read(GPIOB_BASE, 1u << 0) ? 0u : 1u;
+#endif
 }
 
 uint16_t battery_millivolts(void) {
@@ -431,6 +502,126 @@ uint8_t battery_is_charging(void) {
     return g_battery_charging;
 }
 
+#if HW_TARGET_2C53T
+/*
+ * 2C53T keypad: bidirectional 4x3 matrix + 3 passive pins.
+ * Rows PA7/PB0/PC5/PE2, columns PA8/PC10/PE3; passive PC8 (POWER,
+ * active LOW), PB7 (PRM, active HIGH), PC13 (UP, active LOW).
+ * Scan algorithm ported from OpenScope-2C53T button_scan.c
+ * (hardware-confirmed 15/15, extracted from stock firmware).
+ *
+ * Physical -> logical mapping: like-named keys map 1:1; the three
+ * 2C53T-only buttons map to the 2C23T softkeys: SELECT->F2,
+ * TRIGGER->F3, PRM->F4 (MOVE is F1 on both).
+ */
+
+static void matrix_pin_in_pullup(uint32_t base, uint16_t mask) {
+    gpio_config_mask(base, mask, 0x8);
+    gpio_set(base, mask);
+}
+
+static void matrix_pin_out_low(uint32_t base, uint16_t mask) {
+    gpio_config_mask(base, mask, 0x1);
+    gpio_clear(base, mask);
+}
+
+static void matrix_settle(void) {
+    for (volatile uint32_t i = 0; i < 8u; ++i) {
+        __asm__ volatile("nop");
+    }
+}
+
+static void matrix_park(void) {
+    matrix_pin_in_pullup(GPIOA_BASE, (1u << 7) | (1u << 8));
+    matrix_pin_in_pullup(GPIOB_BASE, 1u << 0);
+    matrix_pin_in_pullup(GPIOC_BASE, (1u << 5) | (1u << 10));
+    matrix_pin_in_pullup(GPIOE_BASE, (1u << 2) | (1u << 3));
+}
+
+void input_init(void) {
+    gpio_config_mask(GPIOC_BASE, 1u << 8, 0x8); // PC8 POWER, active low
+    gpio_set(GPIOC_BASE, 1u << 8);
+    gpio_config_mask(GPIOB_BASE, 1u << 7, 0x8); // PB7 PRM, active HIGH -> pull-down
+    gpio_clear(GPIOB_BASE, 1u << 7);
+    gpio_config_mask(GPIOC_BASE, 1u << 13, 0x8); // PC13 UP, active low
+    gpio_set(GPIOC_BASE, 1u << 13);
+    matrix_park();
+}
+
+uint32_t input_read_keys(void) {
+    uint32_t keys = 0;
+    uint8_t row = 0;
+
+    /* Passive pins */
+    if (!gpio_read(GPIOC_BASE, 1u << 8)) {
+        keys |= KEY_POWER;
+    }
+    if (gpio_read(GPIOB_BASE, 1u << 7)) {
+        keys |= KEY_F4; /* PRM */
+    }
+    if (!gpio_read(GPIOC_BASE, 1u << 13)) {
+        keys |= KEY_UP;
+    }
+
+    /* Phase 1: rows input pull-up, columns output LOW */
+    matrix_pin_in_pullup(GPIOA_BASE, 1u << 7);
+    matrix_pin_in_pullup(GPIOB_BASE, 1u << 0);
+    matrix_pin_in_pullup(GPIOC_BASE, 1u << 5);
+    matrix_pin_in_pullup(GPIOE_BASE, 1u << 2);
+    matrix_pin_out_low(GPIOA_BASE, 1u << 8);
+    matrix_pin_out_low(GPIOC_BASE, 1u << 10);
+    matrix_pin_out_low(GPIOE_BASE, 1u << 3);
+    matrix_settle();
+
+    if (!gpio_read(GPIOA_BASE, 1u << 7)) {
+        row |= 1u;
+    }
+    if (!gpio_read(GPIOC_BASE, 1u << 5)) {
+        row |= 2u;
+    }
+    if (!gpio_read(GPIOB_BASE, 1u << 0)) {
+        row |= 4u;
+    }
+    if (!gpio_read(GPIOE_BASE, 1u << 2)) {
+        row |= 8u;
+    }
+
+    /* Exactly one active row required, otherwise skip the matrix */
+    if (row == 1u || row == 2u || row == 4u || row == 8u) {
+        /* Phase 2: swap — rows output LOW, columns input pull-up */
+        matrix_pin_in_pullup(GPIOA_BASE, 1u << 8);
+        matrix_pin_in_pullup(GPIOC_BASE, 1u << 10);
+        matrix_pin_in_pullup(GPIOE_BASE, 1u << 3);
+        matrix_pin_out_low(GPIOA_BASE, 1u << 7);
+        matrix_pin_out_low(GPIOB_BASE, 1u << 0);
+        matrix_pin_out_low(GPIOC_BASE, 1u << 5);
+        matrix_pin_out_low(GPIOE_BASE, 1u << 2);
+        matrix_settle();
+
+        if (!gpio_read(GPIOE_BASE, 1u << 3)) { /* col PE3 */
+            keys |= (row == 1u) ? KEY_CH2
+                  : (row == 2u) ? KEY_DOWN
+                  : (row == 4u) ? KEY_SAVE
+                                : KEY_MENU;
+        }
+        if (!gpio_read(GPIOA_BASE, 1u << 8)) { /* col PA8 */
+            keys |= (row == 1u) ? KEY_F3 /* TRIGGER */
+                  : (row == 2u) ? KEY_F2 /* SELECT */
+                  : (row == 4u) ? KEY_MOVE
+                                : KEY_RIGHT;
+        }
+        if (!gpio_read(GPIOC_BASE, 1u << 10)) { /* col PC10 */
+            keys |= (row == 1u) ? KEY_LEFT
+                  : (row == 2u) ? KEY_CH1
+                  : (row == 4u) ? KEY_OK
+                                : KEY_AUTO;
+        }
+    }
+
+    matrix_park();
+    return keys;
+}
+#else
 void input_init(void) {
     for (uint32_t i = 0; i < sizeof(key_pins) / sizeof(key_pins[0]); ++i) {
         gpio_config_mask(key_pins[i].base, key_pins[i].mask, 0x8);
@@ -453,6 +644,7 @@ uint32_t input_read_keys(void) {
     }
     return keys;
 }
+#endif /* HW_TARGET_2C53T */
 
 static uint32_t input_debounced_keys(void) {
     enum {

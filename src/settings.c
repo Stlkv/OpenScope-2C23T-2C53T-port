@@ -1,5 +1,9 @@
 #include "settings.h"
 
+#ifndef HW_TARGET_2C53T
+#define HW_TARGET_2C53T 0
+#endif
+
 #include "hw.h"
 
 #include <stdint.h>
@@ -75,7 +79,11 @@ static void settings_defaults(settings_state_t *settings) {
     settings->dmm_mode = 0;
     settings->beep_level = 3;
     settings->brightness_level = 4;
+#if HW_TARGET_2C53T
+    settings->startup_screen = SETTINGS_START_SCOPE;
+#else
     settings->startup_screen = SETTINGS_START_DMM;
+#endif
     settings->last_screen = 0;
     settings->sleep_enabled = 0;
     settings->scope_timebase = SETTINGS_SCOPE_TIMEBASE_DEFAULT;
@@ -257,7 +265,11 @@ static void settings_clamp(settings_state_t *settings) {
         settings->brightness_level = 4;
     }
     if (settings->startup_screen >= SETTINGS_START_COUNT) {
+#if HW_TARGET_2C53T
+        settings->startup_screen = SETTINGS_START_SCOPE;
+#else
         settings->startup_screen = SETTINGS_START_DMM;
+#endif
     }
     if (settings->last_screen > 2u) {
         settings->last_screen = 0;
