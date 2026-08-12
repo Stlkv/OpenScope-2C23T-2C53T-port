@@ -27,6 +27,9 @@ typedef struct {
     uint8_t dup;          /* 1 = CH2 window byte-identical to CH1 window */
     uint8_t fe_idx;       /* frontend experiment pattern A (PC12/PE4/PE5/PE6), 0xFF = untouched */
     uint8_t fe_idx_b;     /* frontend experiment pattern B (PA15/PA10/PB9/PA6), 0xFF = untouched */
+    uint32_t v04_id;      /* V0.4 config attempt: IDCODE readback */
+    uint32_t v04_stb;     /* status before upload */
+    uint32_t v04_sta;     /* status after upload */
     uint8_t sweep_val;    /* auto-sweep: current pre-cmd byte */
     uint8_t sweep_hit;    /* auto-sweep: 1 = CH2 spread detected, sweep frozen */
 } fpga53_diag_t;

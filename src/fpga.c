@@ -46,6 +46,10 @@ enum {
     FPGA53_FORCED_READ_POLLS = 200u,
 };
 
+#ifndef FPGA53_V04_CONFIG
+#define FPGA53_V04_CONFIG 0
+#endif
+
 #ifndef FPGA53_SWEEP_PRECMD
 #define FPGA53_SWEEP_PRECMD 0
 #endif
@@ -186,7 +190,98 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->fe_idx_b = fpga53_diag.fe_idx_b;
     d->sweep_val = fpga53_diag.sweep_val;
     d->sweep_hit = fpga53_diag.sweep_hit;
+    d->v04_id = fpga53_diag.v04_id;
+    d->v04_stb = fpga53_diag.v04_stb;
+    d->v04_sta = fpga53_diag.v04_sta;
 }
+
+
+#if FPGA53_V04_CONFIG
+/*
+ * Config-entry attempt using the 2C23T V0.4 loader sequence (documented by
+ * maksidze in OpenScope-2C53T issue #18): bit-banged SSPI, framing exactly
+ * as the proven-working V0.4 firmware does it —
+ *   IDCODE(0x11) -> USERCODE(0x13) -> STATUS(0x41) -> INIT_ADDR(0x12 00)
+ *   -> CONFIG_ENABLE(0x15 00) -> flush -> CS-LOW 0x3B + full bitstream
+ *   -> STATUS -> CONFIG_DISABLE(0x3A 00)
+ * with the 2C53T payload (byte-exact vs the stock Saleae capture) and the
+ * 2C53T pins: PB3=CLK, PB4=MISO, PB5=MOSI, CS=PB6. No reset pulse (the
+ * 2C53T stock boot capture shows none; the V0.4 reset pin maps to the
+ * 2C53T POWER button, so it must not be driven).
+ */
+#include "fpga_bitstream_2c53t.h"
+
+static uint8_t v04_xfer(uint8_t value) {
+    uint8_t result = 0;
+    for (uint8_t i = 0; i < 8u; ++i) {
+        gpio_clear(GPIOB_BASE, 1u << 3);
+        if (value & 0x80u) {
+            gpio_set(GPIOB_BASE, 1u << 5);
+        } else {
+            gpio_clear(GPIOB_BASE, 1u << 5);
+        }
+        gpio_set(GPIOB_BASE, 1u << 3);
+        result = (uint8_t)(result << 1);
+        value = (uint8_t)(value << 1);
+        if (GPIO_IDR(GPIOB_BASE) & (1u << 4)) {
+            result |= 1u;
+        }
+    }
+    return result;
+}
+
+static uint32_t v04_read_reg32(uint32_t addr) {
+    uint8_t b[4];
+    (void)v04_xfer(0);
+    gpio_clear(GPIOB_BASE, 1u << 6);
+    (void)v04_xfer((uint8_t)(addr >> 24));
+    (void)v04_xfer((uint8_t)(addr >> 16));
+    (void)v04_xfer((uint8_t)(addr >> 8));
+    (void)v04_xfer((uint8_t)addr);
+    for (uint8_t i = 0; i < 4u; ++i) {
+        b[i] = v04_xfer(0);
+    }
+    gpio_set(GPIOB_BASE, 1u << 6);
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+}
+
+static void v04_cmd16(uint16_t cmd) {
+    (void)v04_xfer(0);
+    gpio_clear(GPIOB_BASE, 1u << 6);
+    (void)v04_xfer((uint8_t)(cmd >> 8));
+    (void)v04_xfer((uint8_t)cmd);
+    gpio_set(GPIOB_BASE, 1u << 6);
+}
+
+static void fpga53_v04_configure(void) {
+    /* Bit-bang pin setup: CLK/MOSI/CS outputs, MISO floating input.
+     * CS idle HIGH, CLK idle HIGH (mode-3 idle), PC6/PB11 already HIGH. */
+    gpio_set(GPIOB_BASE, (1u << 3) | (1u << 6));
+    gpio_clear(GPIOB_BASE, 1u << 5);
+    gpio_config_mask(GPIOB_BASE, (1u << 3) | (1u << 5) | (1u << 6), 0x1u);
+    gpio_config_mask(GPIOB_BASE, 1u << 4, 0x4u);
+
+    fpga53_diag.v04_id = v04_read_reg32(0x11000000u);
+    (void)v04_read_reg32(0x13000000u);
+    fpga53_diag.v04_stb = v04_read_reg32(0x41000000u);
+
+    v04_cmd16(0x1200u); /* INIT_ADDR */
+    v04_cmd16(0x1500u); /* CONFIG_ENABLE */
+
+    (void)v04_xfer(0);
+    gpio_clear(GPIOB_BASE, 1u << 6);
+    (void)v04_xfer(0x3Bu);
+    for (uint32_t i = 0; i < FPGA_H2_CAL_TABLE_SIZE; ++i) {
+        (void)v04_xfer(fpga_h2_cal_table[i]);
+    }
+    gpio_set(GPIOB_BASE, 1u << 6);
+
+    fpga53_diag.v04_sta = v04_read_reg32(0x41000000u);
+    v04_cmd16(0x3A00u); /* CONFIG_DISABLE */
+    delay_ms(100);
+}
+#endif /* FPGA53_V04_CONFIG */
 
 static uint8_t fpga53_xfer(uint8_t tx) {
     uint32_t timeout = FPGA53_XFER_TIMEOUT;
@@ -219,6 +314,15 @@ void fpga_init_once(void) {
      * holds in scope mode, so the warm handoff does not disturb the FPGA. */
     gpio_set(GPIOB_BASE, (1u << 6) | (1u << 11));
     gpio_set(GPIOC_BASE, 1u << 6);
+    gpio_config_mask(GPIOB_BASE, (1u << 6) | (1u << 11), 0x1u);
+    gpio_config_mask(GPIOC_BASE, 1u << 6, 0x1u);
+
+#if FPGA53_V04_CONFIG
+    /* Attempt full FPGA configuration (V0.4 sequence) before bringing up
+     * the SPI3 transport. Works from a cold boot if it works at all. */
+    delay_ms(2); // PB11/PC6 settle (stock raises PB11 ~1ms before traffic)
+    fpga53_v04_configure();
+#endif
 
     gpio_config_mask(GPIOB_BASE, (1u << 3) | (1u << 5), 0xBu); // SCK/MOSI AF push-pull
     gpio_config_mask(GPIOB_BASE, 1u << 4, 0x4u);               // MISO floating input
@@ -531,6 +635,10 @@ enum {
     SPI_STS_TXE = 1u << 1,
     SPI_STS_BSY = 1u << 7,
 };
+
+#ifndef FPGA53_V04_CONFIG
+#define FPGA53_V04_CONFIG 0
+#endif
 
 #ifndef FPGA53_SWEEP_PRECMD
 #define FPGA53_SWEEP_PRECMD 0

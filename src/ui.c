@@ -6184,6 +6184,26 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.fe_idx_b));
     dbg[p] = '\0';
     lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, RGB565(255, 255, 255), grid_bg, 1);
+
+    if (dg.v04_id) {
+        p = 0;
+        dbg[p++] = 'V';
+        for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
+            p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_id >> sh)));
+        }
+        dbg[p++] = ' ';
+        dbg[p++] = 'B';
+        for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
+            p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_stb >> sh)));
+        }
+        dbg[p++] = ' ';
+        dbg[p++] = 'A';
+        for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
+            p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_sta >> sh)));
+        }
+        dbg[p] = '\0';
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u), dbg, RGB565(255, 255, 0), grid_bg, 1);
+    }
 }
 #endif
 
