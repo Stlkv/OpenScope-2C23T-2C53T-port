@@ -25,12 +25,14 @@ typedef struct {
     uint8_t cst[5];       /* SPI3 status-read 0x03 reply (stock: 00 01 42 2E 2E) */
     uint8_t smin2, smax2; /* raw CH2-window sample range, last read */
     uint8_t dup;          /* 1 = CH2 window byte-identical to CH1 window */
-    uint8_t fe_idx;       /* frontend experiment pattern, 0xFF = untouched */
+    uint8_t fe_idx;       /* frontend experiment pattern A (PC12/PE4/PE5/PE6), 0xFF = untouched */
+    uint8_t fe_idx_b;     /* frontend experiment pattern B (PA15/PA10/PB9/PA6), 0xFF = untouched */
 } fpga53_diag_t;
 void fpga53_get_diag(fpga53_diag_t *d);
 void fpga53_note_configure(void);
 void fpga53_note_poll(void);
 void fpga53_fe_cycle(void);
+void fpga53_fe_cycle_b(void);
 #endif
 
 void fpga_init_once(void);

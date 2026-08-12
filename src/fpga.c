@@ -59,7 +59,7 @@ static uint8_t fpga53_frame[FPGA_SCOPE_BUFFER_BYTES];
 static uint8_t fpga53_ch_buf[FPGA53_CH_SAMPLES];
 static uint16_t fpga53_notready_polls;
 static uint8_t fpga53_force_read;
-static fpga53_diag_t fpga53_diag = { .fe_idx = 0xFFu };
+static fpga53_diag_t fpga53_diag = { .fe_idx = 0xFFu, .fe_idx_b = 0xFFu };
 
 void fpga53_note_configure(void) {
     ++fpga53_diag.cfg_calls;
@@ -103,6 +103,37 @@ void fpga53_fe_cycle(void) {
     gpio_config_mask(GPIOE_BASE, (1u << 4) | (1u << 5) | (1u << 6), 0x1u);
 }
 
+/* Bank B: gain-select / undocumented frontend pins.
+ * Bits: idx3=PA15, idx2=PA10, idx1=PB9, idx0=PA6. */
+void fpga53_fe_cycle_b(void) {
+    uint8_t idx = fpga53_diag.fe_idx_b;
+    idx = (uint8_t)((idx == 0xFFu) ? 0u : ((idx + 1u) & 0x0Fu));
+    fpga53_diag.fe_idx_b = idx;
+
+    if (idx & 0x08u) {
+        gpio_set(GPIOA_BASE, 1u << 15);
+    } else {
+        gpio_clear(GPIOA_BASE, 1u << 15);
+    }
+    if (idx & 0x04u) {
+        gpio_set(GPIOA_BASE, 1u << 10);
+    } else {
+        gpio_clear(GPIOA_BASE, 1u << 10);
+    }
+    if (idx & 0x02u) {
+        gpio_set(GPIOB_BASE, 1u << 9);
+    } else {
+        gpio_clear(GPIOB_BASE, 1u << 9);
+    }
+    if (idx & 0x01u) {
+        gpio_set(GPIOA_BASE, 1u << 6);
+    } else {
+        gpio_clear(GPIOA_BASE, 1u << 6);
+    }
+    gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10) | (1u << 6), 0x1u);
+    gpio_config_mask(GPIOB_BASE, 1u << 9, 0x1u);
+}
+
 void fpga53_get_diag(fpga53_diag_t *d) {
     if (!d) {
         return;
@@ -128,6 +159,7 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->smax2 = fpga53_diag.smax2;
     d->dup = fpga53_diag.dup;
     d->fe_idx = fpga53_diag.fe_idx;
+    d->fe_idx_b = fpga53_diag.fe_idx_b;
 }
 
 static uint8_t fpga53_xfer(uint8_t tx) {

@@ -6178,6 +6178,8 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     dbg[p++] = ' ';
     dbg[p++] = 'X';
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.fe_idx));
+    dbg[p++] = 'Y';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.fe_idx_b));
     dbg[p] = '\0';
     lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, RGB565(255, 255, 255), grid_bg, 1);
 }
@@ -10068,6 +10070,13 @@ void ui_handle_keys(uint32_t events) {
     if (ui.mode == UI_MODE_SCOPE && (events & KEY_F4)) {
         fpga53_fe_cycle();
         events &= ~(uint32_t)KEY_F4;
+        if (!events) {
+            return;
+        }
+    }
+    if (ui.mode == UI_MODE_SCOPE && (events & KEY_F3)) {
+        fpga53_fe_cycle_b();
+        events &= ~(uint32_t)KEY_F3;
         if (!events) {
             return;
         }
