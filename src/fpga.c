@@ -46,6 +46,10 @@ enum {
     FPGA53_FORCED_READ_POLLS = 200u,
 };
 
+#ifndef FPGA53_SEND_CFG
+#define FPGA53_SEND_CFG 0
+#endif
+
 #ifndef FPGA_SPI_BR
 #define FPGA_SPI_BR 2u
 #endif
@@ -143,10 +147,12 @@ void fpga_init_once(void) {
     REG32(0x40007400u) |= 1u;                   // DAC_CR: EN1
     REG32(0x40007408u) = 2048u;                 // DHR12R1 mid-scale
 
-    /* Re-issue the five scope-mode SPI3 config writes stock sends after
-     * FPGA configuration (issue-#18 capture), each in its own CS frame,
-     * then the 0x03 status read (stock reply: 00 01 42 2E 2E). Idempotent
-     * if stock already sent them before the handoff. */
+    /* Scope-mode SPI3 config writes + 0x03 status read: TESTED 2026-08-12,
+     * result NEGATIVE — sending these to an already-configured live FPGA
+     * killed the handshake (MISO went all-FF, PC0 stuck high), while the
+     * read-only init preserved it (80 00 00 replies, PC0 pulsing). Keep
+     * disabled; the warm handoff must stay strictly read-only on the bus. */
+#if FPGA53_SEND_CFG
     {
         static const uint8_t cfg[5][2] = {
             {0x01u, 0x08u}, {0x02u, 0x03u}, {0x06u, 0x00u},
@@ -167,6 +173,7 @@ void fpga_init_once(void) {
         fpga53_diag.cst[4] = fpga53_xfer(0xFFu);
         gpio_set(GPIOB_BASE, 1u << 6);
     }
+#endif
 
     fpga53_notready_polls = 0;
     fpga53_force_read = 0;
@@ -300,6 +307,10 @@ enum {
     SPI_STS_TXE = 1u << 1,
     SPI_STS_BSY = 1u << 7,
 };
+
+#ifndef FPGA53_SEND_CFG
+#define FPGA53_SEND_CFG 0
+#endif
 
 #ifndef FPGA_SPI_BR
 #define FPGA_SPI_BR 2u
