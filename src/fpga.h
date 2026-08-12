@@ -27,6 +27,8 @@ typedef struct {
     uint8_t dup;          /* 1 = CH2 window byte-identical to CH1 window */
     uint8_t fe_idx;       /* frontend experiment pattern A (PC12/PE4/PE5/PE6), 0xFF = untouched */
     uint8_t fe_idx_b;     /* frontend experiment pattern B (PA15/PA10/PB9/PA6), 0xFF = untouched */
+    uint8_t sweep_val;    /* auto-sweep: current pre-cmd byte */
+    uint8_t sweep_hit;    /* auto-sweep: 1 = CH2 spread detected, sweep frozen */
 } fpga53_diag_t;
 void fpga53_get_diag(fpga53_diag_t *d);
 void fpga53_note_configure(void);

@@ -46,6 +46,10 @@ enum {
     FPGA53_FORCED_READ_POLLS = 200u,
 };
 
+#ifndef FPGA53_SWEEP_PRECMD
+#define FPGA53_SWEEP_PRECMD 0
+#endif
+
 #ifndef FPGA53_SWAP_ORDER
 #define FPGA53_SWAP_ORDER 0
 #endif
@@ -168,6 +172,8 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->dup = fpga53_diag.dup;
     d->fe_idx = fpga53_diag.fe_idx;
     d->fe_idx_b = fpga53_diag.fe_idx_b;
+    d->sweep_val = fpga53_diag.sweep_val;
+    d->sweep_hit = fpga53_diag.sweep_hit;
 }
 
 static uint8_t fpga53_xfer(uint8_t tx) {
@@ -363,6 +369,33 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
     gpio_set(GPIOB_BASE, 1u << 6);
 #endif
 
+#if FPGA53_SWEEP_PRECMD
+    /* Auto-sweep the pre-command byte 0x80..0xFF, dwelling several frames
+     * on each value. If the CH2 window's spread exceeds the threshold, the
+     * sweep freezes so the winning value stays on screen (sweep_hit=1). */
+    {
+        enum { SWEEP_DWELL_FRAMES = 6, SWEEP_SPREAD_THRESHOLD = 12 };
+        static uint8_t sweep_frame;
+
+        if (!fpga53_diag.sweep_hit) {
+            if (fpga53_diag.sweep_val < 0x80u) {
+                fpga53_diag.sweep_val = 0x80u;
+            }
+            if ((uint8_t)(fpga53_diag.smax2 - fpga53_diag.smin2) >= SWEEP_SPREAD_THRESHOLD) {
+                fpga53_diag.sweep_hit = 1u;
+            } else if (++sweep_frame >= SWEEP_DWELL_FRAMES) {
+                sweep_frame = 0;
+                fpga53_diag.sweep_val = (uint8_t)(fpga53_diag.sweep_val == 0xFFu
+                                                      ? 0x80u
+                                                      : fpga53_diag.sweep_val + 1u);
+            }
+        }
+        gpio_clear(GPIOB_BASE, 1u << 6);
+        (void)fpga53_xfer(fpga53_diag.sweep_val);
+        gpio_set(GPIOB_BASE, 1u << 6);
+    }
+#endif
+
     /* 1023 samples per channel, UI expects FPGA_SAMPLE_COUNT (2048)
      * interleaved pairs — stretch 2x (nearest neighbour). */
 #if FPGA53_SWAP_ORDER
@@ -414,6 +447,10 @@ enum {
     SPI_STS_TXE = 1u << 1,
     SPI_STS_BSY = 1u << 7,
 };
+
+#ifndef FPGA53_SWEEP_PRECMD
+#define FPGA53_SWEEP_PRECMD 0
+#endif
 
 #ifndef FPGA53_SWAP_ORDER
 #define FPGA53_SWAP_ORDER 0
