@@ -6123,10 +6123,10 @@ static void draw_scope_trace(uint16_t color,
 
 #if HW_TARGET_2C53T
 static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
-    /* Warm-handoff transport telemetry:
-     * I<init> P<pc0> R<reads> C<forced> S<st> F<frm> W<wait> | r0 r1 r2 min-max */
+    /* Line 1: I<init> P<pc0> R<reads> C<forced> S<st> F<frm> W<wait>
+     * Line 2: r0r1r2 min-max Q<status-read 5B> N<init> G<cfg> T<poll> */
     fpga53_diag_t dg;
-    char dbg[64];
+    char dbg[56];
     uint8_t p = 0;
     fpga53_get_diag(&dg);
     dbg[p++] = 'I';
@@ -6149,7 +6149,10 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     dbg[p++] = ' ';
     dbg[p++] = 'W';
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_wait_count()));
-    dbg[p++] = ' ';
+    dbg[p] = '\0';
+    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, C_MUTED, grid_bg, 1);
+
+    p = 0;
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r0));
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r1));
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r2));
@@ -6158,6 +6161,11 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     dbg[p++] = '-';
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax));
     dbg[p++] = ' ';
+    dbg[p++] = 'Q';
+    for (uint8_t i = 0; i < 5u; ++i) {
+        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.cst[i]));
+    }
+    dbg[p++] = ' ';
     dbg[p++] = 'N';
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.init_calls));
     dbg[p++] = 'G';
@@ -6165,7 +6173,7 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     dbg[p++] = 'T';
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.poll_calls));
     dbg[p] = '\0';
-    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, C_MUTED, grid_bg, 1);
+    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, C_MUTED, grid_bg, 1);
 }
 #endif
 

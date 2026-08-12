@@ -83,6 +83,9 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->init_calls = fpga53_diag.init_calls;
     d->cfg_calls = fpga53_diag.cfg_calls;
     d->poll_calls = fpga53_diag.poll_calls;
+    for (uint8_t i = 0; i < 5u; ++i) {
+        d->cst[i] = fpga53_diag.cst[i];
+    }
 }
 
 static uint8_t fpga53_xfer(uint8_t tx) {
@@ -130,6 +133,40 @@ void fpga_init_once(void) {
                            (((uint32_t)FPGA_SPI_BR & 7u) << 3) |
                            (1u << 1) | (1u << 0);
     SPI_CTRL1(SPI3_BASE) |= 1u << 6; // SPE
+
+    /* Scope trigger comparator reference: stock programs DAC1 (PA4,
+     * DHR12R1 @ 0x40007408). The MCU reset during the warm handoff zeroed
+     * it, which would leave the FPGA trigger with a 0V reference. Restore
+     * a mid-scale level. */
+    RCC_APB1ENR |= 1u << 29; // DAC
+    gpio_config_mask(GPIOA_BASE, 1u << 4, 0x0); // PA4 analog
+    REG32(0x40007400u) |= 1u;                   // DAC_CR: EN1
+    REG32(0x40007408u) = 2048u;                 // DHR12R1 mid-scale
+
+    /* Re-issue the five scope-mode SPI3 config writes stock sends after
+     * FPGA configuration (issue-#18 capture), each in its own CS frame,
+     * then the 0x03 status read (stock reply: 00 01 42 2E 2E). Idempotent
+     * if stock already sent them before the handoff. */
+    {
+        static const uint8_t cfg[5][2] = {
+            {0x01u, 0x08u}, {0x02u, 0x03u}, {0x06u, 0x00u},
+            {0x07u, 0x00u}, {0x08u, 0xADu},
+        };
+        for (uint8_t i = 0; i < 5u; ++i) {
+            gpio_clear(GPIOB_BASE, 1u << 6);
+            (void)fpga53_xfer(cfg[i][0]);
+            (void)fpga53_xfer(cfg[i][1]);
+            gpio_set(GPIOB_BASE, 1u << 6);
+            delay_ms(1);
+        }
+        gpio_clear(GPIOB_BASE, 1u << 6);
+        fpga53_diag.cst[0] = fpga53_xfer(0x03u);
+        fpga53_diag.cst[1] = fpga53_xfer(0xFFu);
+        fpga53_diag.cst[2] = fpga53_xfer(0xFFu);
+        fpga53_diag.cst[3] = fpga53_xfer(0xFFu);
+        fpga53_diag.cst[4] = fpga53_xfer(0xFFu);
+        gpio_set(GPIOB_BASE, 1u << 6);
+    }
 
     fpga53_notready_polls = 0;
     fpga53_force_read = 0;

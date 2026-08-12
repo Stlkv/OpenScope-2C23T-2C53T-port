@@ -22,6 +22,7 @@ typedef struct {
     uint16_t init_calls;  /* fpga_init_once entries */
     uint16_t cfg_calls;   /* scope_hw_configure_channels entries */
     uint16_t poll_calls;  /* scope_poll_frame entries (ui) */
+    uint8_t cst[5];       /* SPI3 status-read 0x03 reply (stock: 00 01 42 2E 2E) */
 } fpga53_diag_t;
 void fpga53_get_diag(fpga53_diag_t *d);
 void fpga53_note_configure(void);
