@@ -147,11 +147,13 @@ void fpga_init_once(void) {
     REG32(0x40007400u) |= 1u;                   // DAC_CR: EN1
     REG32(0x40007408u) = 2048u;                 // DHR12R1 mid-scale
 
-    /* Scope-mode SPI3 config writes + 0x03 status read: TESTED 2026-08-12,
-     * result NEGATIVE — sending these to an already-configured live FPGA
-     * killed the handshake (MISO went all-FF, PC0 stuck high), while the
-     * read-only init preserved it (80 00 00 replies, PC0 pulsing). Keep
-     * disabled; the warm handoff must stay strictly read-only on the bus. */
+    /* Scope-mode SPI3 config writes + 0x03 status read (stock sends these
+     * after configuration; reply 00 01 42 2E 2E). The 2026-08-12 run with
+     * these enabled saw a dead bus (all-FF), but that run was confounded by
+     * a USB replug power cycle that wiped the FPGA SRAM config — so this
+     * path is UNTESTED on a live FPGA, not disproven. Default off: keep the
+     * baseline warm handoff strictly read-only; enable with
+     * FPGA53_SEND_CFG=1 for an A/B experiment. */
 #if FPGA53_SEND_CFG
     {
         static const uint8_t cfg[5][2] = {
