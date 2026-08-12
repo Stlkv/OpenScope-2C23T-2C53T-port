@@ -59,7 +59,7 @@ static uint8_t fpga53_frame[FPGA_SCOPE_BUFFER_BYTES];
 static uint8_t fpga53_ch_buf[FPGA53_CH_SAMPLES];
 static uint16_t fpga53_notready_polls;
 static uint8_t fpga53_force_read;
-static fpga53_diag_t fpga53_diag;
+static fpga53_diag_t fpga53_diag = { .fe_idx = 0xFFu };
 
 void fpga53_note_configure(void) {
     ++fpga53_diag.cfg_calls;
@@ -67,6 +67,40 @@ void fpga53_note_configure(void) {
 
 void fpga53_note_poll(void) {
     ++fpga53_diag.poll_calls;
+}
+
+/* Analog-frontend experiment: PRM (F4) in scope mode cycles 16 patterns of
+ * {PC12, PE4, PE5, PE6} — input-routing and attenuation controls per the
+ * OpenScope-2C53T pinout. After the warm-handoff MCU reset these pins float
+ * (stock drove them); CH1 happens to conduct in the floating state, CH2 is
+ * open. Pattern bits: idx3=PC12, idx2=PE4, idx1=PE5, idx0=PE6. */
+void fpga53_fe_cycle(void) {
+    uint8_t idx = fpga53_diag.fe_idx;
+    idx = (uint8_t)((idx == 0xFFu) ? 0u : ((idx + 1u) & 0x0Fu));
+    fpga53_diag.fe_idx = idx;
+
+    if (idx & 0x08u) {
+        gpio_set(GPIOC_BASE, 1u << 12);
+    } else {
+        gpio_clear(GPIOC_BASE, 1u << 12);
+    }
+    if (idx & 0x04u) {
+        gpio_set(GPIOE_BASE, 1u << 4);
+    } else {
+        gpio_clear(GPIOE_BASE, 1u << 4);
+    }
+    if (idx & 0x02u) {
+        gpio_set(GPIOE_BASE, 1u << 5);
+    } else {
+        gpio_clear(GPIOE_BASE, 1u << 5);
+    }
+    if (idx & 0x01u) {
+        gpio_set(GPIOE_BASE, 1u << 6);
+    } else {
+        gpio_clear(GPIOE_BASE, 1u << 6);
+    }
+    gpio_config_mask(GPIOC_BASE, 1u << 12, 0x1u);
+    gpio_config_mask(GPIOE_BASE, (1u << 4) | (1u << 5) | (1u << 6), 0x1u);
 }
 
 void fpga53_get_diag(fpga53_diag_t *d) {
@@ -93,6 +127,7 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->smin2 = fpga53_diag.smin2;
     d->smax2 = fpga53_diag.smax2;
     d->dup = fpga53_diag.dup;
+    d->fe_idx = fpga53_diag.fe_idx;
 }
 
 static uint8_t fpga53_xfer(uint8_t tx) {

@@ -6150,7 +6150,7 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     dbg[p++] = 'W';
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_wait_count()));
     dbg[p] = '\0';
-    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, C_MUTED, grid_bg, 1);
+    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, RGB565(255, 255, 255), grid_bg, 1);
 
     p = 0;
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r0));
@@ -6175,8 +6175,11 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.cfg_calls));
     dbg[p++] = 'T';
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.poll_calls));
+    dbg[p++] = ' ';
+    dbg[p++] = 'X';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.fe_idx));
     dbg[p] = '\0';
-    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, C_MUTED, grid_bg, 1);
+    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, RGB565(255, 255, 255), grid_bg, 1);
 }
 #endif
 
@@ -10061,6 +10064,15 @@ static uint8_t ui_handle_keys_math_menu(uint32_t events) {
 }
 
 void ui_handle_keys(uint32_t events) {
+#if HW_TARGET_2C53T
+    if (ui.mode == UI_MODE_SCOPE && (events & KEY_F4)) {
+        fpga53_fe_cycle();
+        events &= ~(uint32_t)KEY_F4;
+        if (!events) {
+            return;
+        }
+    }
+#endif
     ui.idle_ms = 0;
     ui.sleep_ms = 0;
     ui.sleep_due = 0;
