@@ -19,8 +19,13 @@ typedef struct {
     uint16_t forced;
     uint8_t r0, r1, r2;   /* CH1 frame status bytes */
     uint8_t smin, smax;   /* raw CH1 sample range, last read */
+    uint16_t init_calls;  /* fpga_init_once entries */
+    uint16_t cfg_calls;   /* scope_hw_configure_channels entries */
+    uint16_t poll_calls;  /* scope_poll_frame entries (ui) */
 } fpga53_diag_t;
 void fpga53_get_diag(fpga53_diag_t *d);
+void fpga53_note_configure(void);
+void fpga53_note_poll(void);
 #endif
 
 void fpga_init_once(void);

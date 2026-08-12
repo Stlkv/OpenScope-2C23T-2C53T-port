@@ -57,6 +57,14 @@ static uint16_t fpga53_notready_polls;
 static uint8_t fpga53_force_read;
 static fpga53_diag_t fpga53_diag;
 
+void fpga53_note_configure(void) {
+    ++fpga53_diag.cfg_calls;
+}
+
+void fpga53_note_poll(void) {
+    ++fpga53_diag.poll_calls;
+}
+
 void fpga53_get_diag(fpga53_diag_t *d) {
     if (!d) {
         return;
@@ -72,6 +80,9 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->r2 = fpga53_diag.r2;
     d->smin = fpga53_diag.smin;
     d->smax = fpga53_diag.smax;
+    d->init_calls = fpga53_diag.init_calls;
+    d->cfg_calls = fpga53_diag.cfg_calls;
+    d->poll_calls = fpga53_diag.poll_calls;
 }
 
 static uint8_t fpga53_xfer(uint8_t tx) {
@@ -92,6 +103,7 @@ static uint8_t fpga53_xfer(uint8_t tx) {
 }
 
 void fpga_init_once(void) {
+    ++fpga53_diag.init_calls;
     if (fpga_loaded) {
         return;
     }

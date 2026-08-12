@@ -4590,6 +4590,9 @@ static uint8_t scope_trigger_accepts_capture(uint8_t found) {
 }
 
 static uint8_t scope_poll_frame(void) {
+#if HW_TARGET_2C53T
+    fpga53_note_poll();
+#endif
     if (!scope_hw_enabled()) {
         scope_frame_valid = 0;
         ++scope_frame_id;
@@ -6154,6 +6157,13 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smin));
     dbg[p++] = '-';
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax));
+    dbg[p++] = ' ';
+    dbg[p++] = 'N';
+    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.init_calls));
+    dbg[p++] = 'G';
+    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.cfg_calls));
+    dbg[p++] = 'T';
+    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.poll_calls));
     dbg[p] = '\0';
     lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, C_MUTED, grid_bg, 1);
 }

@@ -288,6 +288,9 @@ void scope_hw_configure_channels(uint8_t timebase,
     (void)ch2_dac;
 #endif
 #if SCOPE_HW_CAPTURE
+#if HW_TARGET_2C53T
+    fpga53_note_configure();
+#endif
     fpga_init_once();
     if (!fpga_ready()) {
         scope_last_status = SCOPE_STATUS_NO_FPGA;
