@@ -46,6 +46,14 @@ enum {
     FPGA53_FORCED_READ_POLLS = 200u,
 };
 
+#ifndef FPGA53_SWAP_ORDER
+#define FPGA53_SWAP_ORDER 0
+#endif
+
+#ifndef FPGA53_PRE_CMD
+#define FPGA53_PRE_CMD 0
+#endif
+
 #ifndef FPGA53_SEND_CFG
 #define FPGA53_SEND_CFG 0
 #endif
@@ -346,9 +354,22 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
     fpga53_force_read = 0;
     ++fpga53_diag.reads;
 
+#if FPGA53_PRE_CMD
+    /* Stock sends a one-byte pre-acquisition command 0x80|voltage_range in
+     * its own CS window before reading (per the stock-firmware RE). Try a
+     * mid-range value. */
+    gpio_clear(GPIOB_BASE, 1u << 6);
+    (void)fpga53_xfer(0x83u);
+    gpio_set(GPIOB_BASE, 1u << 6);
+#endif
+
     /* 1023 samples per channel, UI expects FPGA_SAMPLE_COUNT (2048)
      * interleaved pairs — stretch 2x (nearest neighbour). */
+#if FPGA53_SWAP_ORDER
+    fpga53_read_channel(0x05u);
+#else
     fpga53_read_channel(0x04u);
+#endif
     for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
         uint16_t src = (uint16_t)(i >> 1);
         if (src >= FPGA53_CH_SAMPLES) {
@@ -356,7 +377,11 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
         }
         fpga53_frame[(uint16_t)(i * 2u)] = fpga53_ch_buf[src];
     }
+#if FPGA53_SWAP_ORDER
+    fpga53_read_channel(0x04u);
+#else
     fpga53_read_channel(0x05u);
+#endif
     for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
         uint16_t src = (uint16_t)(i >> 1);
         if (src >= FPGA53_CH_SAMPLES) {
@@ -389,6 +414,14 @@ enum {
     SPI_STS_TXE = 1u << 1,
     SPI_STS_BSY = 1u << 7,
 };
+
+#ifndef FPGA53_SWAP_ORDER
+#define FPGA53_SWAP_ORDER 0
+#endif
+
+#ifndef FPGA53_PRE_CMD
+#define FPGA53_PRE_CMD 0
+#endif
 
 #ifndef FPGA53_SEND_CFG
 #define FPGA53_SEND_CFG 0
