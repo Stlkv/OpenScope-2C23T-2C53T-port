@@ -66,6 +66,10 @@ enum {
 #define FPGA53_SEND_CFG 0
 #endif
 
+#ifndef FPGA53_CFG02_VAL
+#define FPGA53_CFG02_VAL 0x03u
+#endif
+
 #ifndef FPGA_SPI_BR
 #define FPGA_SPI_BR 2u
 #endif
@@ -245,7 +249,7 @@ void fpga_init_once(void) {
 #if FPGA53_SEND_CFG
     {
         static const uint8_t cfg[5][2] = {
-            {0x01u, 0x08u}, {0x02u, 0x03u}, {0x06u, 0x00u},
+            {0x01u, 0x08u}, {0x02u, FPGA53_CFG02_VAL}, {0x06u, 0x00u},
             {0x07u, 0x00u}, {0x08u, 0xADu},
         };
         for (uint8_t i = 0; i < 5u; ++i) {
@@ -497,6 +501,10 @@ enum {
 
 #ifndef FPGA53_SEND_CFG
 #define FPGA53_SEND_CFG 0
+#endif
+
+#ifndef FPGA53_CFG02_VAL
+#define FPGA53_CFG02_VAL 0x03u
 #endif
 
 #ifndef FPGA_SPI_BR
