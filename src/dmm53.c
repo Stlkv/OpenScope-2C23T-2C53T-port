@@ -256,6 +256,9 @@ static void dmm53_restart_wake(void) {
     dmm53_wake_step = 0;
     dmm53_wake_timer_ms = 0;
     dmm53_poll_timer_ms = 0;
+    /* Per-mode f6 capture: each mode's band bytes shouldn't be diluted
+     * by the previous mode's rotation. */
+    meter_f6_history_count = 0;
 }
 
 static void dmm53_format_status(void) {
@@ -497,7 +500,7 @@ const char *dmm53_debug_line(uint8_t idx) {
         p = line[3];
         /* Build tag: bump when proving a USB self-update took effect. */
         *p++ = '#';
-        *p++ = '4';
+        *p++ = '5';
         *p++ = ' ';
         *p++ = 'U';
         *p++ = (char)('0' + (st.state % 10u));
@@ -565,44 +568,30 @@ const char *dmm53_debug_line(uint8_t idx) {
         }
         *p = '\0';
         return line[1];
-    case 2: /* last echoed cmd, BRR in force, candidate PCLK */
+    case 2: /* decoder state: submode, raw BCD, dp, class + f6 rotation.
+             * Replaces the retired BRR/flash-ID line — band RE needs to
+             * see every distinct frame[6] the SoC rotates through, not
+             * just the one frame the F-line happens to catch. */
         p = line[2];
-        *p++ = 'E';
-        *p++ = 'C';
-        {
-            uint8_t ec = rx_echo_cmd;
-            *p++ = hex_digits[ec >> 4];
-            *p++ = hex_digits[ec & 0xFu];
-        }
+        *p++ = 'S';
+        *p++ = (char)('0' + dmm53_submode());
         *p++ = ' ';
-        *p++ = 'B';
         *p++ = 'R';
-        *p++ = 'R';
-        {
-            uint32_t brr = dmm53_brr();
-            for (int8_t sh = 12; sh >= 0; sh = (int8_t)(sh - 4)) {
-                *p++ = hex_digits[(brr >> sh) & 0xFu];
-            }
-        }
+        p += u16_to_dec(p, (uint16_t)meter_reading.raw_bcd);
         *p++ = ' ';
         *p++ = 'P';
-        p += u16_to_dec(p, (uint16_t)(dmm53_pclk[dmm53_baud_index] / 1000000u));
-        *p++ = 'M';
-        /* SPI-flash health: JEDEC-90 id + detected capacity (screenshot /
-         * MSC path debugging). */
-        *p++ = ' ';
-        *p++ = 'I';
-        *p++ = 'D';
-        {
-            uint16_t id = w25q_device_id();
-            for (int8_t sh = 12; sh >= 0; sh = (int8_t)(sh - 4)) {
-                *p++ = hex_digits[(id >> sh) & 0xFu];
-            }
-        }
+        *p++ = (char)('0' + meter_reading.decimal_pos);
         *p++ = ' ';
         *p++ = 'C';
-        p += u16_to_dec(p, (uint16_t)(w25q_capacity_bytes() >> 20));
-        *p++ = 'M';
+        *p++ = (char)('0' + (meter_reading.result_class % 10u));
+        *p++ = ' ';
+        *p++ = 'H';
+        for (uint8_t i = 0; i < meter_f6_history_count && i < 6u; ++i) {
+            uint8_t b = meter_f6_history[i];
+            *p++ = ' ';
+            *p++ = hex_digits[b >> 4];
+            *p++ = hex_digits[b & 0xFu];
+        }
         *p = '\0';
         return line[2];
     default:
