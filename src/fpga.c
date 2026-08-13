@@ -85,6 +85,12 @@ enum {
 #define FPGA53_RUN_PINS 0
 #endif
 
+/* CH2 trigger reference via TMR13 CH1 PWM on PA6 (upstream static-analysis
+ * lead, issue #18 2026-08-12): mid-scale duty at boot. */
+#ifndef FPGA53_TMR13_REF
+#define FPGA53_TMR13_REF 0
+#endif
+
 #ifndef FPGA53_SWAP_ORDER
 #define FPGA53_SWAP_ORDER 0
 #endif
@@ -307,6 +313,13 @@ static void fpga53_v04_configure(void) {
 
     fpga53_diag.v04_sta = v04_read_reg32(0x41000000u);
     v04_cmd16(0x3A00u); /* CONFIG_DISABLE */
+
+    /* Stock fidelity (issue-#18 Saleae decode): after the 3A close, stock
+     * sends exactly one single-byte 0x00 flush frame in its own CS window,
+     * then leaves the bus idle for ~607ms before the config writes. */
+    gpio_clear(GPIOB_BASE, 1u << 6);
+    (void)v04_xfer(0);
+    gpio_set(GPIOB_BASE, 1u << 6);
     delay_ms(100);
 }
 #endif /* FPGA53_V04_CONFIG */
@@ -389,6 +402,25 @@ void fpga_init_once(void) {
     gpio_config_mask(GPIOA_BASE, 1u << 4, 0x0); // PA4 analog
     REG32(0x40007400u) |= 1u;                   // DAC_CR: EN1
     REG32(0x40007408u) = 2048u;                 // DHR12R1 mid-scale
+
+#if FPGA53_TMR13_REF
+    /* CH2 trigger comparator reference: per upstream's static analysis of
+     * stock V1.2.0, CH2's reference is NOT the DAC but a TMR13 CH1 PWM
+     * (C1DT @ 0x40001C34), per-range duty via the same cal formula as DAC1.
+     * TMR13_CH1 = PA6 (default mapping) — the "undocumented frontend" pin.
+     * Mid-scale 50% duty; an RC filter on the board turns it into a DC
+     * reference. Nobody programs TMR13 after an MCU reset, so CH2's
+     * comparator reference is dead without this. */
+    RCC_APB1ENR |= 1u << 7; // TMR13
+    gpio_config_mask(GPIOA_BASE, 1u << 6, 0xBu); // PA6 AF push-pull
+    REG32(0x40001C28u) = 0u;      // PSC
+    REG32(0x40001C2Cu) = 4095u;   // ARR: 12-bit scale like the DAC
+    REG32(0x40001C34u) = 2048u;   // CCR1 (C1DT): mid-scale
+    REG32(0x40001C18u) = 0x68u;   // CCMR1: OC1M=PWM1, OC1PE
+    REG32(0x40001C20u) = 0x1u;    // CCER: CC1E
+    REG32(0x40001C14u) = 0x1u;    // EGR: UG (latch PSC/ARR/CCR)
+    REG32(0x40001C00u) = 0x81u;   // CR1: ARPE | CEN
+#endif
 
     /* Scope-mode SPI3 config writes + 0x03 status read (stock sends these
      * after configuration; reply 00 01 42 2E 2E). The 2026-08-12 run with
@@ -749,6 +781,12 @@ enum {
  * live self-configured FPGA existed (unmapped_mcu_fpga_pin_candidates.md). */
 #ifndef FPGA53_RUN_PINS
 #define FPGA53_RUN_PINS 0
+#endif
+
+/* CH2 trigger reference via TMR13 CH1 PWM on PA6 (upstream static-analysis
+ * lead, issue #18 2026-08-12): mid-scale duty at boot. */
+#ifndef FPGA53_TMR13_REF
+#define FPGA53_TMR13_REF 0
 #endif
 
 #ifndef FPGA53_SWAP_ORDER
