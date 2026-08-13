@@ -103,6 +103,37 @@ enum {
 #define FPGA53_SEND_CFG 0
 #endif
 
+/* PC0 data-ready polarity. Upstream's working cold rig (guest-coldtrace,
+ * issue #18 2026-08-13) treats PC0 as ACTIVE LOW with an input pull-up
+ * (undriven = HIGH = not ready); our warm-handoff builds historically used
+ * active HIGH. 1 = ready when LOW + pull-up (cold-config rig), 0 = legacy
+ * ready-when-HIGH + floating (bench-proven warm handoff). */
+#ifndef FPGA53_PC0_READY_LOW
+#define FPGA53_PC0_READY_LOW 0
+#endif
+
+/* Drive the analog-frontend relay/gain bank to upstream's scope posture at
+ * boot (their fpga_set_scope_frontend_range case 7: PC12 HIGH = DC coupling,
+ * bench-measured 2026-08-12). On a cold boot nothing pre-arms the bank: the
+ * coils float, CH1 conducts only by accident and CH2 is OPEN — upstream's
+ * live-both-channels coldtrace always drives this bank (incl. PB10, absent
+ * from all our earlier 16-pattern sweeps). Also swaps PA6 out of the manual
+ * Y-bank cycle for PB10 (PA6 carries the TMR13 PWM reference now). */
+#ifndef FPGA53_FE_SCOPE_POSE
+#define FPGA53_FE_SCOPE_POSE 0
+#endif
+
+/* Stock-style paced readout: never gate on PC0 — stock reads the 0x04/0x05
+ * window pair every ~29 ms unconditionally, and each read hands back the
+ * latest (re-armed) capture. Bench 2026-08-13: PC0-gating breaks one way or
+ * the other depending on engine state — free-run pulses LOW (no signal),
+ * triggered captures leave it un-asserted (signal present) → frames only via
+ * rare forced reads. With pacing, reads happen at the UI loop rate and PC0
+ * stays a diagnostic. Overrides FPGA53_PC0_READY_LOW gating. */
+#ifndef FPGA53_READ_PACED
+#define FPGA53_READ_PACED 0
+#endif
+
 #ifndef FPGA53_CFG02_VAL
 #define FPGA53_CFG02_VAL 0x03u
 #endif
@@ -188,12 +219,25 @@ void fpga53_fe_cycle_b(void) {
         gpio_clear(GPIOB_BASE, 1u << 9);
     }
     if (idx & 0x01u) {
+#if FPGA53_FE_SCOPE_POSE
+        gpio_set(GPIOB_BASE, 1u << 10);   /* PA6 = TMR13 PWM now; sweep PB10 */
+#else
         gpio_set(GPIOA_BASE, 1u << 6);
+#endif
     } else {
+#if FPGA53_FE_SCOPE_POSE
+        gpio_clear(GPIOB_BASE, 1u << 10);
+#else
         gpio_clear(GPIOA_BASE, 1u << 6);
+#endif
     }
+#if FPGA53_FE_SCOPE_POSE
+    gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10), 0x1u);
+    gpio_config_mask(GPIOB_BASE, (1u << 9) | (1u << 10), 0x1u);
+#else
     gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10) | (1u << 6), 0x1u);
     gpio_config_mask(GPIOB_BASE, 1u << 9, 0x1u);
+#endif
 }
 
 void fpga53_get_diag(fpga53_diag_t *d) {
@@ -384,7 +428,15 @@ void fpga_init_once(void) {
     gpio_config_mask(GPIOB_BASE, 1u << 4, 0x4u);               // MISO floating input
     gpio_config_mask(GPIOB_BASE, (1u << 6) | (1u << 11), 0x1u); // CS, active-mode
     gpio_config_mask(GPIOC_BASE, 1u << 6, 0x1u);               // SPI enable
+#if FPGA53_PC0_READY_LOW
+    /* PC0 input with PULL-UP (upstream cold rig): undriven reads HIGH = "not
+     * ready", so a floating line cannot fake readiness; a configured FPGA
+     * actively driving it LOW wins over the weak pull. */
+    gpio_set(GPIOC_BASE, 1u << 0);                             // ODR=1 selects pull-UP
+    gpio_config_mask(GPIOC_BASE, 1u << 0, 0x8u);               // PC0 input pull-up/down
+#else
     gpio_config_mask(GPIOC_BASE, 1u << 0, 0x4u);               // PC0 data-ready input
+#endif
 
     /* SPI mode 3, master, software NSS, 8-bit */
     SPI_CTRL1(SPI3_BASE) = 0;
@@ -434,6 +486,16 @@ void fpga_init_once(void) {
 #if FPGA53_SEND_CFG_DELAY_MS
         delay_ms(FPGA53_SEND_CFG_DELAY_MS);
 #endif
+        /* Upstream arm mechanics (issue #18 / guest-coldtrace, 2026-08-13):
+         * the five writes take only when clocked SLOW — their working rig
+         * switches SPI3 to /256 (~470 kHz) for the writes AND the 0x03 read,
+         * with 2 ms CS-framed gaps, then restores the fast divider. All our
+         * earlier attempts clocked them at /8 = 12 MHz and never armed. */
+        uint32_t ctrl1_saved = SPI_CTRL1(SPI3_BASE);
+        SPI_CTRL1(SPI3_BASE) &= ~(1u << 6); /* SPE=0 */
+        SPI_CTRL1(SPI3_BASE) =
+            (SPI_CTRL1(SPI3_BASE) & ~(7u << 3)) | (7u << 3); /* BR=/256 */
+        SPI_CTRL1(SPI3_BASE) |= 1u << 6; /* SPE=1 */
         static const uint8_t cfg[5][2] = {
             {0x01u, 0x08u}, {0x02u, FPGA53_CFG02_VAL}, {0x06u, 0x00u},
             {0x07u, 0x00u}, {0x08u, 0xADu},
@@ -449,7 +511,7 @@ void fpga_init_once(void) {
                 (void)fpga53_xfer(cfg[i][0]);
                 (void)fpga53_xfer(cfg[i][1]);
                 gpio_set(GPIOB_BASE, 1u << 6);
-                delay_ms(1);
+                delay_ms(2);
             }
             gpio_clear(GPIOB_BASE, 1u << 6);
             fpga53_diag.cst[0] = fpga53_xfer(0x03u);
@@ -469,7 +531,33 @@ void fpga_init_once(void) {
                 break;
             }
         }
+        SPI_CTRL1(SPI3_BASE) &= ~(1u << 6); /* SPE=0 */
+        SPI_CTRL1(SPI3_BASE) = ctrl1_saved & ~(1u << 6);
+        SPI_CTRL1(SPI3_BASE) = ctrl1_saved; /* restore fast BR + SPE */
     }
+#endif
+
+#if FPGA53_FE_SCOPE_POSE
+    /* Analog frontend: upstream's scope posture, case 7 of their
+     * fpga_set_scope_frontend_range + PC12 HIGH = DC coupling. Cold boots
+     * own the relay bank — floating coils leave CH2's input path open. */
+    gpio_set(GPIOC_BASE, 1u << 12);                    /* PC12 HIGH — DC */
+    gpio_clear(GPIOE_BASE, 1u << 4);
+    gpio_set(GPIOE_BASE, (1u << 5) | (1u << 6));
+    gpio_clear(GPIOA_BASE, (1u << 15) | (1u << 10));
+    gpio_clear(GPIOB_BASE, 1u << 10);
+    gpio_config_mask(GPIOC_BASE, 1u << 12, 0x1u);
+    gpio_config_mask(GPIOE_BASE, (1u << 4) | (1u << 5) | (1u << 6), 0x1u);
+    gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10), 0x1u);
+    gpio_config_mask(GPIOB_BASE, 1u << 10, 0x1u);
+    /* Stock's scope-mode selector/mux posture (upstream Exp R decode of the
+     * 4-way PC2:PC1 selector — stock takes the ==3 arm: PC2 HIGH, PC1 LOW —
+     * and PC11 = meter MUX enable, HIGH only in meter mode). All three float
+     * in our builds (IDR shows PC1/PC2 pulled high); a wrong selector pose
+     * is a live candidate for the dead CH2 input path. */
+    gpio_set(GPIOC_BASE, 1u << 2);                     /* PC2 HIGH */
+    gpio_clear(GPIOC_BASE, (1u << 1) | (1u << 11));    /* PC1 LOW, PC11 LOW */
+    gpio_config_mask(GPIOC_BASE, (1u << 1) | (1u << 2) | (1u << 11), 0x1u);
 #endif
 
     fpga53_notready_polls = 0;
@@ -502,7 +590,16 @@ void fpga_capture_latch(void) {
 }
 
 uint8_t fpga_capture_ready(void) {
+#if FPGA53_READ_PACED
+    /* Stock cadence: read unconditionally at the caller's loop rate. */
+    fpga53_notready_polls = 0;
+    return 1u;
+#endif
+#if FPGA53_PC0_READY_LOW
+    if (!(GPIO_IDR(GPIOC_BASE) & 1u)) { // PC0 data-ready, active LOW (upstream cold rig)
+#else
     if (GPIO_IDR(GPIOC_BASE) & 1u) { // PC0 data-ready
+#endif
 #if FPGA53_SWEEP_CFG01
         /* PC0 rose after a 01-register sweep write: freeze the sweep so the
          * winning value stays in the A field (shown as A<val>!). */

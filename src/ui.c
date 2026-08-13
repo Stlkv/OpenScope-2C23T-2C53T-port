@@ -6203,6 +6203,18 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     dbg[p] = '\0';
     lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, RGB565(255, 255, 255), grid_bg, 1);
 
+    if (!dg.v04_id) {
+        /* Warm boot: the FPGA is already configured, so the config port is
+         * silent (Exp L) and every V0.4 read returns zeros. Say so instead
+         * of hiding the lines, and keep the engine verdict visible. */
+        uint8_t eng_ok = (dg.pc0 || dg.reads > dg.forced);
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u),
+                 "V:SILENT (FPGA configured - warm boot)",
+                 RGB565(160, 160, 160), grid_bg, 1);
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 33u),
+                 eng_ok ? "ENG:RUN" : "ENG:DEAD",
+                 eng_ok ? RGB565(0, 255, 0) : RGB565(255, 80, 80), grid_bg, 1);
+    }
     if (dg.v04_id) {
         p = 0;
         dbg[p++] = 'V';

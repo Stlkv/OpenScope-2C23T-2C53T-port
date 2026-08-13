@@ -1,6 +1,7 @@
 #include "usb_msc.h"
 
 #include "board.h"
+#include "dbgdump.h"
 #include "fw_update.h"
 #include "hw.h"
 #include "screenshot.h"
@@ -1184,11 +1185,173 @@ static void raw_fat_delete_update_file(uint32_t byte_addr) {
     raw_write_dirty = 0;
 }
 
+/* ─── Host-triggered debug dump: DBGREQ → DBG.TXT ─────────────────────
+ * The host drops an EMPTY file named DBGREQ (no extension) in the root;
+ * the idle scan spots it, deletes it and (re)writes DBG.TXT with the
+ * dbgdump_render() text. DBG.TXT is overwritten in place when it already
+ * exists (no cluster churn); a single cluster bounds the size. */
+
+static uint8_t root_entry_is_dbgreq(const uint8_t *entry) {
+    static const uint8_t name[11] = {'D', 'B', 'G', 'R', 'E', 'Q',
+                                     ' ', ' ', ' ', ' ', ' '};
+    if (entry[0] == 0x00u || entry[0] == 0xE5u || (entry[11] & 0x18u)) {
+        return 0;
+    }
+    for (uint8_t i = 0; i < 11u; ++i) {
+        if (entry[i] != name[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint8_t root_entry_is_dbgtxt(const uint8_t *entry) {
+    static const uint8_t name[11] = {'D', 'B', 'G', ' ', ' ', ' ',
+                                     ' ', ' ', 'T', 'X', 'T'};
+    if (entry[0] == 0x00u || entry[0] == 0xE5u || (entry[11] & 0x18u)) {
+        return 0;
+    }
+    for (uint8_t i = 0; i < 11u; ++i) {
+        if (entry[i] != name[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint8_t raw_fat_find_named(const raw_fat_volume_t *fat,
+                                  uint8_t (*pred)(const uint8_t *),
+                                  uint32_t *dir_byte_addr) {
+    uint8_t *sector = msc_root_shadow;
+    uint32_t sectors = fat->root_dir_sectors;
+    uint32_t base_lba = fat->root_lba;
+
+    if (fat->type == FAT_TYPE_32) {
+        /* Bench volume is FAT12; FAT32 root-chain walk not needed here. */
+        return 0;
+    }
+    for (uint32_t i = 0; i < sectors; ++i) {
+        if (!raw_fat_read_sector(fat, base_lba + i, sector)) {
+            return 0;
+        }
+        for (uint16_t off = 0; off + 32u <= fat->bytes_per_sector;
+             off = (uint16_t)(off + 32u)) {
+            uint8_t *entry = &sector[off];
+            if (entry[0] == 0x00u) {
+                return 0;
+            }
+            if (pred(entry)) {
+                *dir_byte_addr =
+                    (base_lba + i) * (uint32_t)fat->bytes_per_sector + off;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static uint8_t raw_fat_write_dbg_entry(uint32_t dir_byte_addr,
+                                       uint32_t first_cluster,
+                                       uint32_t size) {
+    uint8_t entry[32];
+
+    buf_zero(entry, sizeof(entry));
+    buf_copy(entry, (const uint8_t *)"DBG     TXT", 11);
+    entry[11] = 0x20;
+    entry[12] = 0x18;
+    put_le16(&entry[20], (uint16_t)(first_cluster >> 16));
+    put_le16(&entry[26], (uint16_t)first_cluster);
+    put_le32(&entry[28], size);
+    return raw_storage_write_bytes(dir_byte_addr, entry, sizeof(entry));
+}
+
+static uint8_t raw_fat_write_dbg_cluster(const raw_fat_volume_t *fat,
+                                         uint32_t cluster,
+                                         const char *text,
+                                         uint16_t len) {
+    uint8_t *sector = msc_root_shadow;
+    uint32_t lba = raw_fat_cluster_lba(fat, cluster);
+    uint16_t done = 0;
+
+    for (uint8_t s = 0; s < fat->sectors_per_cluster; ++s) {
+        uint16_t chunk = 0;
+
+        buf_zero(sector, fat->bytes_per_sector);
+        if (done < len) {
+            chunk = (uint16_t)(len - done) > fat->bytes_per_sector
+                        ? fat->bytes_per_sector
+                        : (uint16_t)(len - done);
+            buf_copy(sector, (const uint8_t *)text + done, chunk);
+            done = (uint16_t)(done + chunk);
+        }
+        if (!raw_storage_write_bytes(
+                (lba + s) * (uint32_t)fat->bytes_per_sector, sector,
+                fat->bytes_per_sector)) {
+            return 0;
+        }
+    }
+    return done == len;
+}
+
+static void raw_fat_service_dbgreq(void) {
+    raw_fat_volume_t fat;
+    uint32_t req_addr = 0;
+    uint32_t txt_addr = 0;
+    uint32_t cluster = 0;
+    static char text[1024];
+    uint16_t len;
+
+    if (!raw_fat_mount(&fat) || fat.bytes_per_sector > MSC_SECTOR_SIZE) {
+        return;
+    }
+    if (!raw_fat_find_named(&fat, root_entry_is_dbgreq, &req_addr)) {
+        return;
+    }
+    raw_fat_delete_update_file(req_addr); /* generic 0xE5 delete */
+
+    len = dbgdump_render(text, sizeof(text));
+    if (!len ||
+        (uint32_t)len > (uint32_t)fat.bytes_per_sector * fat.sectors_per_cluster) {
+        return;
+    }
+
+    if (raw_fat_find_named(&fat, root_entry_is_dbgtxt, &txt_addr)) {
+        /* Overwrite in place: reuse the existing entry's first cluster. */
+        uint8_t entry[32];
+        if (!raw_fat_read_bytes(&fat, txt_addr, entry, sizeof(entry))) {
+            return;
+        }
+        cluster = (uint32_t)entry[26] | ((uint32_t)entry[27] << 8);
+        if (fat.type == FAT_TYPE_32) {
+            cluster |= ((uint32_t)entry[20] | ((uint32_t)entry[21] << 8)) << 16;
+        }
+        if (cluster < 2u ||
+            !raw_fat_write_dbg_cluster(&fat, cluster, text, len) ||
+            !raw_fat_write_dbg_entry(txt_addr, cluster, len)) {
+            return;
+        }
+    } else {
+        uint16_t unused_index = 0;
+        if (!raw_fat_find_screenshot_dir_entry(&fat, &txt_addr, &unused_index) ||
+            !raw_fat_find_free_clusters(&fat, 1u) ||
+            !raw_fat_link_clusters(&fat, 1u)) {
+            return;
+        }
+        cluster = raw_screenshot_clusters[0];
+        if (!raw_fat_write_dbg_cluster(&fat, cluster, text, len) ||
+            !raw_fat_write_dbg_entry(txt_addr, cluster, len)) {
+            return;
+        }
+    }
+    msc_unit_attention = 1;
+}
+
 static void raw_fat_scan_and_stage_update(void) {
     raw_fat_volume_t fat;
     raw_fat_file_t file;
 
     ++msc_dbg_scan_runs;
+    raw_fat_service_dbgreq();
     if (!raw_fat_mount(&fat)) {
         return;
     }
