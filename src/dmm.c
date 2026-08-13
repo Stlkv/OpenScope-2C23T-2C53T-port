@@ -5,6 +5,10 @@
 
 #include <stdint.h>
 
+/* The 2C53T's meter is a different beast (separate SoC on USART2) — its
+ * backend lives in dmm53.c; this file is the 2C23T/HW4 implementation. */
+#if !HW_TARGET_2C53T
+
 enum {
     USART_STS_FE = 1u << 1,
     USART_STS_NE = 1u << 2,
@@ -1130,3 +1134,5 @@ void dmm_uart_irq_handler(void) {
 void USART3_IRQHandler(void) {
     dmm_uart_irq_handler();
 }
+
+#endif /* !HW_TARGET_2C53T */

@@ -17,7 +17,11 @@ void EXTI4_IRQHandler(void);
 void EXTI9_5_IRQHandler(void);
 void USB_LP_CAN1_RX0_IRQHandler(void);
 void TMR1_UP_IRQHandler(void);
+#if HW_TARGET_2C53T
+void USART2_IRQHandler(void);
+#else
 void USART3_IRQHandler(void);
+#endif
 void power_key_irq_handler(void);
 void fpga_capture_ready_irq_handler(void);
 int main(void);
@@ -44,8 +48,14 @@ void (*const vector_table[128])(void) = {
     [39] = EXTI9_5_IRQHandler,
     [40] = Default_Handler,
     [41] = TMR1_UP_IRQHandler,
+#if HW_TARGET_2C53T
+    [42 ... 53] = Default_Handler,
+    [54] = USART2_IRQHandler, /* meter SoC, dmm53.c */
+    [55] = Default_Handler,
+#else
     [42 ... 54] = Default_Handler,
     [55] = USART3_IRQHandler,
+#endif
     [56 ... 127] = Default_Handler,
 };
 

@@ -129,6 +129,21 @@ static uint8_t raw_write_loaded;
 static uint8_t raw_write_dirty;
 static uint8_t raw_write_failed;
 static uint8_t raw_update_scan_pending;
+
+/* Debug counters for the host-write path (see usb_msc_debug_counts). */
+static uint16_t msc_dbg_wr_chunks;
+static uint16_t msc_dbg_fail_events;
+static uint16_t msc_dbg_flush_ok;
+static uint16_t msc_dbg_scan_runs;
+static uint16_t msc_dbg_find_hits;
+static uint8_t msc_dbg_fail_site; /* first failure site 1..4, 0 = none */
+
+static void msc_dbg_fail(uint8_t site) {
+    ++msc_dbg_fail_events;
+    if (!msc_dbg_fail_site) {
+        msc_dbg_fail_site = site;
+    }
+}
 static uint8_t raw_update_streaming;
 static uint32_t raw_update_dir_byte_addr;
 static uint32_t raw_screenshot_clusters[SCREENSHOT_CLUSTER_COUNT];
@@ -1173,6 +1188,7 @@ static void raw_fat_scan_and_stage_update(void) {
     raw_fat_volume_t fat;
     raw_fat_file_t file;
 
+    ++msc_dbg_scan_runs;
     if (!raw_fat_mount(&fat)) {
         return;
     }
@@ -1180,6 +1196,7 @@ static void raw_fat_scan_and_stage_update(void) {
     if (!raw_fat_find_update_file(&fat, &file)) {
         return;
     }
+    ++msc_dbg_find_hits;
 
     raw_update_dir_byte_addr = file.dir_byte_addr;
     msc_update_candidate = 1;
@@ -1198,11 +1215,13 @@ static uint8_t raw_write_prepare(uint32_t lba) {
     }
     if (!raw_write_flush()) {
         raw_write_failed = 1;
+        msc_dbg_fail(1);
         return 0;
     }
     if (!w25q_read(lba * (uint32_t)MSC_SECTOR_SIZE, raw_write_sector, MSC_SECTOR_SIZE)) {
         raw_write_loaded = 0;
         raw_write_failed = 1;
+        msc_dbg_fail(2);
         return 0;
     }
     raw_write_lba = lba;
@@ -1212,7 +1231,11 @@ static uint8_t raw_write_prepare(uint32_t lba) {
 }
 
 static void raw_write_chunk(uint32_t lba, uint16_t offset, const uint8_t *data, uint16_t len) {
+    ++msc_dbg_wr_chunks;
     if (raw_write_failed || lba >= msc_disk_sectors || offset >= MSC_SECTOR_SIZE) {
+        if (!raw_write_failed) {
+            msc_dbg_fail(3);
+        }
         raw_write_failed = 1;
         return;
     }
@@ -1224,9 +1247,23 @@ static void raw_write_chunk(uint32_t lba, uint16_t offset, const uint8_t *data, 
     }
     buf_copy(&raw_write_sector[offset], data, len);
     raw_write_dirty = 1;
-    if ((uint16_t)(offset + len) >= MSC_SECTOR_SIZE && !raw_write_flush()) {
-        raw_write_failed = 1;
+    if ((uint16_t)(offset + len) >= MSC_SECTOR_SIZE) {
+        if (!raw_write_flush()) {
+            raw_write_failed = 1;
+            msc_dbg_fail(4);
+        } else {
+            ++msc_dbg_flush_ok;
+        }
     }
+}
+
+void usb_msc_debug_counts(uint16_t out[6]) {
+    out[0] = msc_dbg_wr_chunks;
+    out[1] = msc_dbg_fail_events;
+    out[2] = msc_dbg_flush_ok;
+    out[3] = msc_dbg_scan_runs;
+    out[4] = msc_dbg_find_hits;
+    out[5] = msc_dbg_fail_site;
 }
 
 static void disk_fill_chunk(uint32_t lba, uint16_t offset, uint8_t *dst, uint16_t len) {

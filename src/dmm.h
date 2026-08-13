@@ -19,3 +19,7 @@ uint8_t dmm_reading_is_real(void);
 uint8_t dmm_live_wire_active(void);
 uint8_t dmm_diode_continuity_active(void);
 void dmm_uart_irq_handler(void);
+
+/* 2C53T only (dmm53.c): small-font debug overlay lines for the meter
+ * screen, scope-telemetry style. idx 0..2. */
+const char *dmm53_debug_line(uint8_t idx);

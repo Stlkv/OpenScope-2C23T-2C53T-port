@@ -177,14 +177,18 @@ void w25q_init(void) {
     SPI_CTRL1(SPI2_BASE) |= 1u << 6;
 
     w25q_id = w25q_read_id90();
-    if (w25q_id == 0xEF15u) {
-        w25q_capacity = 0x00400000u;
-    } else if (w25q_id == 0xEF16u) {
-        w25q_capacity = 0x00800000u;
-    } else if (w25q_id == 0xEF17u) {
-        w25q_capacity = 0x01000000u;
-    } else {
-        w25q_capacity = 0;
+    /* Accept any manufacturer with a sane density code — boards ship with
+     * W25Q clones (2C53T V1.4: Zbit ZB25VQ128, id 0x5E17). Density byte
+     * 0x15/0x16/0x17 = 4/8/16 MB (1 << (code + 1)). */
+    {
+        uint8_t mfr = (uint8_t)(w25q_id >> 8);
+        uint8_t density = (uint8_t)w25q_id;
+        if (mfr != 0x00u && mfr != 0xFFu && density >= 0x15u &&
+            density <= 0x17u) {
+            w25q_capacity = 1u << (density + 1u);
+        } else {
+            w25q_capacity = 0;
+        }
     }
     w25q_ready = 1;
 }

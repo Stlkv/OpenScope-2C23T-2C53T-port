@@ -4130,10 +4130,25 @@ static void draw_dmm_immersive_panel(void) {
     }
 }
 
+#if HW_TARGET_2C53T
+/* Meter stage-1 debug overlay: small telemetry lines in the strip between
+ * the panel (ends at y=160) and the softkeys (Y_SOFT=201) — partial panel
+ * redraws never touch it, and every caller repaints it last so it wins. */
+static void draw_dmm53_debug_overlay(void) {
+    for (uint8_t i = 0; i < 4u; ++i) {
+        lcd_text(14, (uint16_t)(155u + i * 11u), dmm53_debug_line(i),
+                 RGB565(255, 255, 255), C_BG, 1);
+    }
+}
+#endif
+
 static void draw_dmm(void) {
     lcd_rect(0, Y_BODY, LCD_WIDTH, H_BODY, C_BG);
     draw_mode_tabs();
     draw_dmm_panel();
+#if HW_TARGET_2C53T
+    draw_dmm53_debug_overlay();
+#endif
 }
 
 static void draw_dmm_immersive(void) {
@@ -4142,6 +4157,9 @@ static void draw_dmm_immersive(void) {
     draw_battery_status_overlay(C_BG);
     draw_dmm_immersive_panel();
     draw_dmm_softkeys();
+#if HW_TARGET_2C53T
+    draw_dmm53_debug_overlay();
+#endif
 }
 
 static int16_t scope_sine(uint16_t phase) {
@@ -7397,6 +7415,9 @@ static void ui_draw_dmm_reading_scene(void) {
     } else {
         draw_dmm_immersive_panel();
     }
+#if HW_TARGET_2C53T
+    draw_dmm53_debug_overlay();
+#endif
 }
 
 static void ui_draw_battery_status_scene(void) {
@@ -10587,6 +10608,21 @@ void ui_tick(uint32_t elapsed_ms) {
     uint8_t fw_update_changed = 0;
     fw_update_status_t fw_status;
     uint32_t sleep_timeout_ms = settings_sleep_timeout_ms();
+
+#if HW_TARGET_2C53T
+    /* Meter debug overlay heartbeat: counters must advance on screen even
+     * when no frames arrive (silent SoC), so no reading-render fires. */
+    {
+        static uint16_t dmm53_dbg_ms;
+        dmm53_dbg_ms = (uint16_t)(dmm53_dbg_ms + elapsed_ms);
+        if (dmm53_dbg_ms >= 500u) {
+            dmm53_dbg_ms = 0;
+            if (ui.mode == UI_MODE_DMM && ui.overlay == UI_OVERLAY_NONE) {
+                draw_dmm53_debug_overlay();
+            }
+        }
+    }
+#endif
 
     if (sleep_timeout_ms) {
         uint32_t sleep_next = ui.sleep_ms + elapsed_ms;
