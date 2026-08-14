@@ -7617,6 +7617,12 @@ static void ui_switch_mode(ui_mode_t mode) {
     ui.scope_measure_menu_sel = SCOPE_MEASURE_MENU_VALUE;
     ui.scope_cursor_menu_sel = SCOPE_CURSOR_MENU_MODE;
     if (mode == UI_MODE_SCOPE) {
+#if HW_TARGET_2C53T
+        /* The meter (and siggen) leave their own analog posture behind, and the
+         * meter takes PA6 back from the TMR13 CH2 reference. Re-pose before the
+         * first capture so scope mode never runs on another mode's relays. */
+        fpga53_scope_pose_reapply();
+#endif
         ui.scope_param = SCOPE_PARAM_POSITION;
         scope_auto_channel_mask = 0;
         scope_auto_channel_steps_left = 0;
@@ -10175,6 +10181,10 @@ static uint8_t ui_handle_keys_math_menu(uint32_t events) {
     }
 
     return 1;
+}
+
+uint8_t ui_debug_mode_byte(void) {
+    return (uint8_t)(((uint8_t)ui.overlay << 4) | (uint8_t)ui.mode);
 }
 
 void ui_handle_keys(uint32_t events) {

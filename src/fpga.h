@@ -32,12 +32,17 @@ typedef struct {
     uint32_t v04_sta;     /* status after upload */
     uint8_t sweep_val;    /* auto-sweep: current pre-cmd byte */
     uint8_t sweep_hit;    /* auto-sweep: 1 = CH2 spread detected, sweep frozen */
+    uint16_t pose_calls;  /* fpga53_scope_pose_reapply entries (scope-mode entries) */
 } fpga53_diag_t;
 void fpga53_get_diag(fpga53_diag_t *d);
 void fpga53_note_configure(void);
 void fpga53_note_poll(void);
 void fpga53_fe_cycle(void);
 void fpga53_fe_cycle_b(void);
+/* Re-apply the scope analog posture (relays, gain keys, PC1/PC2/PC11 selector)
+ * and the TMR13 CH2 trigger reference. Call on scope-mode entry: the meter
+ * leaves its own posture behind and takes PA6 back as a GPIO. */
+void fpga53_scope_pose_reapply(void);
 #endif
 
 void fpga_init_once(void);

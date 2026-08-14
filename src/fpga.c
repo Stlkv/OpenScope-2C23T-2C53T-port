@@ -271,6 +271,7 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->v04_id = fpga53_diag.v04_id;
     d->v04_stb = fpga53_diag.v04_stb;
     d->v04_sta = fpga53_diag.v04_sta;
+    d->pose_calls = fpga53_diag.pose_calls;
 }
 
 
@@ -385,6 +386,74 @@ static uint8_t fpga53_xfer(uint8_t tx) {
     return (uint8_t)SPI_DT(SPI3_BASE);
 }
 
+/* CH2 trigger comparator reference: per upstream's static analysis of stock
+ * V1.2.0, CH2's reference is NOT the DAC but a TMR13 CH1 PWM (C1DT @
+ * 0x40001C34), per-range duty via the same cal formula as DAC1. TMR13_CH1 =
+ * PA6 (default mapping) — the "undocumented frontend" pin. Mid-scale 50% duty;
+ * an RC filter on the board turns it into a DC reference. Nobody programs
+ * TMR13 after an MCU reset, so CH2's comparator reference is dead without it —
+ * and the meter reclaims PA6 as a plain GPIO gain key, so scope-mode entry has
+ * to take it back (see fpga53_scope_pose_reapply). */
+static void fpga53_tmr13_ref_apply(void) {
+#if FPGA53_TMR13_REF
+    RCC_APB1ENR |= 1u << 7; // TMR13
+    gpio_config_mask(GPIOA_BASE, 1u << 6, 0xBu); // PA6 AF push-pull
+    REG32(0x40001C28u) = 0u;      // PSC
+    REG32(0x40001C2Cu) = 4095u;   // ARR: 12-bit scale like the DAC
+    REG32(0x40001C34u) = 2048u;   // CCR1 (C1DT): mid-scale
+    REG32(0x40001C18u) = 0x68u;   // CCMR1: OC1M=PWM1, OC1PE
+    REG32(0x40001C20u) = 0x1u;    // CCER: CC1E
+    REG32(0x40001C14u) = 0x1u;    // EGR: UG (latch PSC/ARR/CCR)
+    REG32(0x40001C00u) = 0x81u;   // CR1: ARPE | CEN
+#endif
+}
+
+/* Analog frontend: upstream's scope posture, case 7 of their
+ * fpga_set_scope_frontend_range + PC12 HIGH = DC coupling. Cold boots own the
+ * relay bank — floating coils leave CH2's input path open.
+ *
+ * Plus stock's scope-mode selector/mux posture (upstream Exp R decode of the
+ * 4-way PC2:PC1 selector — stock takes the ==3 arm: PC2 HIGH, PC1 LOW — and
+ * PC11 = meter MUX enable, HIGH only in meter mode). All three float in our
+ * builds (IDR shows PC1/PC2 pulled high); a wrong selector pose is a live
+ * candidate for the dead CH2 input path. */
+static void fpga53_fe_scope_pose_apply(void) {
+#if FPGA53_FE_SCOPE_POSE
+    gpio_set(GPIOC_BASE, 1u << 12);                    /* PC12 HIGH — DC */
+    gpio_clear(GPIOE_BASE, 1u << 4);
+    gpio_set(GPIOE_BASE, (1u << 5) | (1u << 6));
+    gpio_clear(GPIOA_BASE, (1u << 15) | (1u << 10));
+    gpio_clear(GPIOB_BASE, 1u << 10);
+    gpio_config_mask(GPIOC_BASE, 1u << 12, 0x1u);
+    gpio_config_mask(GPIOE_BASE, (1u << 4) | (1u << 5) | (1u << 6), 0x1u);
+    gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10), 0x1u);
+    gpio_config_mask(GPIOB_BASE, 1u << 10, 0x1u);
+    gpio_set(GPIOC_BASE, 1u << 2);                     /* PC2 HIGH */
+    gpio_clear(GPIOC_BASE, (1u << 1) | (1u << 11));    /* PC1 LOW, PC11 LOW */
+    gpio_config_mask(GPIOC_BASE, (1u << 1) | (1u << 2) | (1u << 11), 0x1u);
+#endif
+}
+
+/* Re-apply everything the analog frontend needs for scope mode.
+ *
+ * Both blocks above used to live inline in the FPGA config path, i.e. they ran
+ * once at boot. The meter applies its own posture on entry
+ * (dmm53_frontend_baseline) and dmm_pause() clears only PC11, so a meter
+ * round-trip left the relay bank (PE4/PE5) and the gain keys (PA15/PA10/PB9)
+ * in meter positions, and PA6 a plain GPIO instead of the TMR13 PWM. Measured
+ * on the bench 2026-08-14 with a DBGREQ dump taken after a meter visit:
+ * PE4=1/PE5=0 where scope wants 0/1, PA15=1 and PA10=1 where scope wants 0/0,
+ * while PC1/PC2/PC11/PC12 were already correct because dmm_pause() happens to
+ * fix PC11.
+ *
+ * Called on scope-mode entry so the posture is the same no matter which mode
+ * ran before. Both halves are idempotent absolute writes. */
+void fpga53_scope_pose_reapply(void) {
+    ++fpga53_diag.pose_calls;
+    fpga53_tmr13_ref_apply();
+    fpga53_fe_scope_pose_apply();
+}
+
 void fpga_init_once(void) {
     ++fpga53_diag.init_calls;
     if (fpga_loaded) {
@@ -455,24 +524,7 @@ void fpga_init_once(void) {
     REG32(0x40007400u) |= 1u;                   // DAC_CR: EN1
     REG32(0x40007408u) = 2048u;                 // DHR12R1 mid-scale
 
-#if FPGA53_TMR13_REF
-    /* CH2 trigger comparator reference: per upstream's static analysis of
-     * stock V1.2.0, CH2's reference is NOT the DAC but a TMR13 CH1 PWM
-     * (C1DT @ 0x40001C34), per-range duty via the same cal formula as DAC1.
-     * TMR13_CH1 = PA6 (default mapping) — the "undocumented frontend" pin.
-     * Mid-scale 50% duty; an RC filter on the board turns it into a DC
-     * reference. Nobody programs TMR13 after an MCU reset, so CH2's
-     * comparator reference is dead without this. */
-    RCC_APB1ENR |= 1u << 7; // TMR13
-    gpio_config_mask(GPIOA_BASE, 1u << 6, 0xBu); // PA6 AF push-pull
-    REG32(0x40001C28u) = 0u;      // PSC
-    REG32(0x40001C2Cu) = 4095u;   // ARR: 12-bit scale like the DAC
-    REG32(0x40001C34u) = 2048u;   // CCR1 (C1DT): mid-scale
-    REG32(0x40001C18u) = 0x68u;   // CCMR1: OC1M=PWM1, OC1PE
-    REG32(0x40001C20u) = 0x1u;    // CCER: CC1E
-    REG32(0x40001C14u) = 0x1u;    // EGR: UG (latch PSC/ARR/CCR)
-    REG32(0x40001C00u) = 0x81u;   // CR1: ARPE | CEN
-#endif
+    fpga53_tmr13_ref_apply();
 
     /* Scope-mode SPI3 config writes + 0x03 status read (stock sends these
      * after configuration; reply 00 01 42 2E 2E). The 2026-08-12 run with
@@ -537,28 +589,7 @@ void fpga_init_once(void) {
     }
 #endif
 
-#if FPGA53_FE_SCOPE_POSE
-    /* Analog frontend: upstream's scope posture, case 7 of their
-     * fpga_set_scope_frontend_range + PC12 HIGH = DC coupling. Cold boots
-     * own the relay bank — floating coils leave CH2's input path open. */
-    gpio_set(GPIOC_BASE, 1u << 12);                    /* PC12 HIGH — DC */
-    gpio_clear(GPIOE_BASE, 1u << 4);
-    gpio_set(GPIOE_BASE, (1u << 5) | (1u << 6));
-    gpio_clear(GPIOA_BASE, (1u << 15) | (1u << 10));
-    gpio_clear(GPIOB_BASE, 1u << 10);
-    gpio_config_mask(GPIOC_BASE, 1u << 12, 0x1u);
-    gpio_config_mask(GPIOE_BASE, (1u << 4) | (1u << 5) | (1u << 6), 0x1u);
-    gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10), 0x1u);
-    gpio_config_mask(GPIOB_BASE, 1u << 10, 0x1u);
-    /* Stock's scope-mode selector/mux posture (upstream Exp R decode of the
-     * 4-way PC2:PC1 selector — stock takes the ==3 arm: PC2 HIGH, PC1 LOW —
-     * and PC11 = meter MUX enable, HIGH only in meter mode). All three float
-     * in our builds (IDR shows PC1/PC2 pulled high); a wrong selector pose
-     * is a live candidate for the dead CH2 input path. */
-    gpio_set(GPIOC_BASE, 1u << 2);                     /* PC2 HIGH */
-    gpio_clear(GPIOC_BASE, (1u << 1) | (1u << 11));    /* PC1 LOW, PC11 LOW */
-    gpio_config_mask(GPIOC_BASE, (1u << 1) | (1u << 2) | (1u << 11), 0x1u);
-#endif
+    fpga53_fe_scope_pose_apply();
 
     fpga53_notready_polls = 0;
     fpga53_force_read = 0;

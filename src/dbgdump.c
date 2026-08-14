@@ -3,6 +3,7 @@
 #include "fpga.h"
 #include "hw.h"
 #include "scope.h"
+#include "ui.h"
 
 /* Host-triggered telemetry dump: the host drops an empty DBGREQ file on the
  * USB volume, the idle scan spots it, deletes it and (re)writes DBG.TXT with
@@ -123,8 +124,40 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
     p = put_hex(dst, cap, p, GPIO_IDR(GPIOE_BASE) & 0xFFFFu, 4);
     p = put_str(dst, cap, p, "\n");
 
+    /* ODR next to IDR: ODR is what our code wrote, IDR is the level actually
+     * on the pin. A frontend pin that disagrees between the two is either not
+     * configured as an output or is being held by something on the board —
+     * bench 2026-08-14, where the scope pose ran (cfg counted up) yet PE4/PE5
+     * and PA15/PA10 kept reading meter-side levels. */
+    p = put_str(dst, cap, p, "ODR A=");
+    p = put_hex(dst, cap, p, GPIO_ODR(GPIOA_BASE) & 0xFFFFu, 4);
+    p = put_str(dst, cap, p, " B=");
+    p = put_hex(dst, cap, p, GPIO_ODR(GPIOB_BASE) & 0xFFFFu, 4);
+    p = put_str(dst, cap, p, " C=");
+    p = put_hex(dst, cap, p, GPIO_ODR(GPIOC_BASE) & 0xFFFFu, 4);
+    p = put_str(dst, cap, p, " E=");
+    p = put_hex(dst, cap, p, GPIO_ODR(GPIOE_BASE) & 0xFFFFu, 4);
+    p = put_str(dst, cap, p, "\n");
+
+    /* Pin config nibbles for the two frontend ports: 1 = 10 MHz push-pull
+     * output, 4 = floating input, 8 = input with pull-up/down, B = AF
+     * push-pull. PA6 should read B when the TMR13 CH2 reference is live. */
+    p = put_str(dst, cap, p, "CR A=");
+    p = put_hex(dst, cap, p, GPIO_CRH(GPIOA_BASE), 8);
+    p = put_str(dst, cap, p, ":");
+    p = put_hex(dst, cap, p, GPIO_CRL(GPIOA_BASE), 8);
+    p = put_str(dst, cap, p, " E=");
+    p = put_hex(dst, cap, p, GPIO_CRH(GPIOE_BASE), 8);
+    p = put_str(dst, cap, p, ":");
+    p = put_hex(dst, cap, p, GPIO_CRL(GPIOE_BASE), 8);
+    p = put_str(dst, cap, p, "\n");
+
     p = put_str(dst, cap, p, "SPI3 CTRL1=");
     p = put_hex(dst, cap, p, SPI_CTRL1(SPI3_BASE) & 0xFFFFu, 4);
+    p = put_str(dst, cap, p, " MODE=");
+    p = put_hex(dst, cap, p, ui_debug_mode_byte(), 2);
+    p = put_str(dst, cap, p, " POSE=");
+    p = put_dec(dst, cap, p, dg.pose_calls);
     p = put_str(dst, cap, p, "\n");
 
     return p;
