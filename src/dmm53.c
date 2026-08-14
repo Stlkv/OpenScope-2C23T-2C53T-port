@@ -351,7 +351,22 @@ void dmm_reenter(uint8_t mode_index) {
 }
 
 void dmm_set_mode(uint8_t mode_index) {
-    /* Stage 1: record only; mode commands are stage 4. */
+    /* A mode set that isn't a mode *change* must not tear the meter down.
+     * The UI calls this on every AUTO press and on every apply-selected-mode,
+     * including when the selection is already active; each call used to
+     * restart the wake preamble and replay the mode sequence, so the SoC never
+     * got the ~2.5 s it needs to settle and the reading kept jumping — which
+     * is what our auto-range was chasing. Upstream hit the same thing from the
+     * other side and stopped reconfiguring the DMM mode on poll (komzpa,
+     * 801e2dd in PR #13).
+     *
+     * Only skip once the meter is powered and past the wake preamble: an
+     * unpowered or still-waking meter has nothing settled to protect, and
+     * dmm_reenter() stays the unconditional entry point for meter-mode entry. */
+    if (dmm53_powered && dmm53_wake_step >= 5u && mode_index == dmm53_mode) {
+        return;
+    }
+
     dmm53_mode = mode_index;
     dmm53_restart_wake();
 }
@@ -578,6 +593,12 @@ const char *dmm53_debug_line(uint8_t idx) {
         *p++ = ' ';
         *p++ = 'R';
         p += u16_to_dec(p, (uint16_t)meter_reading.raw_bcd);
+        *p++ = ' ';
+        /* E = stock's frame[2].3 raw +10000 extension. Added to the value in
+         * DCV only; on other submodes this tells us whether the bit ever
+         * fires there (stock evidence covers DCV alone). */
+        *p++ = 'E';
+        *p++ = meter_reading.raw_bcd_extended ? '1' : '0';
         *p++ = ' ';
         *p++ = 'P';
         *p++ = (char)('0' + meter_reading.decimal_pos);

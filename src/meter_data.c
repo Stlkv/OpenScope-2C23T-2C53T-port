@@ -331,6 +331,15 @@ static void format_reading(meter_reading_t *r, uint8_t submode)
 
     uint8_t dec = r->decimal_pos;
 
+    /* Stock raw extension: raw_bcd carries a fifth digit that digits[] can't
+     * hold (it only ever has the four glyphs the meter SoC sends). The
+     * extension is always exactly +10000, so the leading digit is a literal
+     * '1' in front of the four, and the decimal point keeps its position
+     * among them: dp=1 with digits 5,0,0,0 renders 15.000 rather than 5.000. */
+    if (r->raw_bcd >= 10000) {
+        s[pos++] = '1';
+    }
+
     for (int i = 0; i < 4; i++) {
         if (i == (int)dec && dec > 0 && dec < 4) {
             s[pos++] = '.';
@@ -423,6 +432,12 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
     r->is_ac = (status & (1 << 2)) != 0;
     r->is_auto_range = (status & (1 << 3)) != 0;
     r->negative = (status & (1 << 0)) != 0;
+
+    /* frame[2].3 = stock's raw +10000 extension flag. Recorded for every
+     * frame (including OL/blank/special ones) so the debug line always shows
+     * the current bit; it is only added to the value in the normal-BCD path
+     * below, and only for DCV. */
+    r->raw_bcd_extended = (b2 & 0x08) != 0;
 
     /* Parse flags from byte [6] */
     uint8_t flags = frame[6];
@@ -569,6 +584,29 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
     r->digits[2] = d2;
     r->digits[3] = d3;
     r->raw_bcd = d0 * 1000 + d1 * 100 + d2 * 10 + d3;
+
+    /* Stock raw extension — the fifth digit the four-glyph display can't
+     * carry. FUN_08036AC0 builds the same four-digit raw, then at 0x08036BFC
+     * loads 10000.0f and keeps raw + 10000 when frame[2].3 is set:
+     *
+     *   vldr s2, [pc, #0x88]   ; 0x08036C88 = 10000.0f
+     *   vadd.f32 s2, s0, s2
+     *   lsls.w r0, r8, #0x1c   ; r8 = frame[2], bit 3 into sign
+     *   it pl
+     *   vmovpl.f32 s2, s0      ; bit clear -> discard the +10000
+     *
+     * Neither our decoder nor upstream's had this, so every DCV reading
+     * above 9999 counts decoded as a wrapped four-digit value — the range
+     * where auto-range keeps hunting. Evidence:
+     * meter_stock_multiplier_tables_2026_06_05.md (komzpa, upstream PR #13).
+     *
+     * DCV only: stock proves the bit in the DCV value/formatter path alone.
+     * Applying it elsewhere would jump the value by 10000/divisor while the
+     * digits stay put, so other submodes keep the plain four-digit raw and
+     * only report the bit on the decoder debug line. */
+    if (submode == 0 && r->raw_bcd_extended) {
+        r->raw_bcd += 10000;
+    }
 
     /* Decimal position and unit: static default per submode, then
      * overridden by the empirical frame[6] decoder below when we

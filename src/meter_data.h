@@ -39,7 +39,11 @@ typedef enum {
 typedef struct {
     /* Parsed measurement value */
     float    value;              /* Scaled measurement value */
-    int      raw_bcd;            /* Raw 4-digit BCD integer (0-9999) */
+    int      raw_bcd;            /* Raw BCD integer (0-9999, or 10000-19999
+                                  * when the stock +10000 extension fires —
+                                  * see raw_bcd_extended) */
+    bool     raw_bcd_extended;   /* frame[2].3 seen: stock adds 10000 to the
+                                  * four-digit raw in the DCV value path */
     uint8_t  digits[4];          /* Individual BCD digits */
     uint8_t  decimal_pos;        /* Decimal point position (0=none, 1-3) */
     bool     negative;           /* Negative polarity */
