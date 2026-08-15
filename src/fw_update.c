@@ -1,9 +1,18 @@
 #include "fw_update.h"
 
 #include "app_config.h"
+#include "fpga_bitstream_store.h"
 #include "hw.h"
 
 #include <stdint.h>
+
+/* Only the image that READS the bitstream store needs to be able to write it.
+ * Keeping the writer out of the provisioning image is what lets that image
+ * still fit beside the 113 KB payload it carries. */
+#ifndef FPGA53_BITSTREAM_EXTERN
+#define FPGA53_BITSTREAM_EXTERN 1
+#endif
+#define FW_STORE_WRITER FPGA53_BITSTREAM_EXTERN
 
 enum {
     FW_APP_BASE = APP_BASE_ADDR,
@@ -38,49 +47,138 @@ static uint8_t fw_apply_delay_loops;
 static volatile uint32_t fw_expected_size;
 static uint32_t fw_stage_base_lba;
 static uint8_t fw_stage_started;
+/* 1 = the file being staged is an FPGA bitstream, not a firmware image: it
+ * goes straight to its own flash region and there is nothing to install
+ * afterwards. Everything else about the transfer — page erase, halfword
+ * programming, resume-safe bookkeeping — is identical, so the destination is
+ * a variable rather than a second copy of the writer. */
+#if FW_STORE_WRITER
+static uint8_t fw_blob_mode;
+#else
+/* The provisioning image carries the payload itself and has no room to spare:
+ * with fw_blob_mode a constant, the destination logic and the whole bank-1
+ * register path fold away. */
+#define fw_blob_mode 0u
+#endif
 static uint8_t fw_stage_pages[FW_STAGE_PAGE_BYTES];
 static uint8_t fw_stage_halfwords[FW_STAGE_HALFWORD_BYTES];
 static uint8_t fw_page_buffer[FW_PAGE_SIZE];
 
-static void flash_wait(void) {
-    while (FLASH_STS & FLASH_STS_BSY) {
+/*
+ * The 1 MB AT32F403A splits its flash into two banks with two independent
+ * register sets: bank 0 below 0x08080000, bank 1 ("extended flash") from
+ * 0x08080000 up. A program or erase aimed at bank 1 through the bank-0
+ * registers is simply dropped — no error, no data. The factory IAP
+ * bootloader's HAL routes by address for exactly this reason
+ * (53t/reverse_engineering/analysis_v120/stock_iap_bootloader.md § extended
+ * flash), and the bitstream store lives at 0x08080000, so the writer has to
+ * do the same.
+ */
+#define FLASH_BANK1_BASE 0x08080000u
+#define FLASH_STS1       REG32(FLASH_R_BASE + 0x4Cu)
+#define FLASH_CTRL1      REG32(FLASH_R_BASE + 0x50u)
+#define FLASH_ADDR1      REG32(FLASH_R_BASE + 0x54u)
+#define FLASH_KEYR2      REG32(FLASH_R_BASE + 0x44u)
+
+static uint8_t flash_bank1(uint32_t addr) {
+#if FW_STORE_WRITER
+    return addr >= FLASH_BANK1_BASE ? 1u : 0u;
+#else
+    (void)addr;
+    return 0u; /* nothing this image writes lives above 0x08080000 */
+#endif
+}
+
+/* Bounded on purpose. A page erase takes tens of milliseconds, so any real
+ * operation finishes long before this; what the bound buys is that a wrong
+ * guess about the bank-1 registers degrades into "the write did not happen"
+ * (caught later by the store's fingerprint) instead of a spin that would need
+ * a power cycle to escape — and would re-hang on the next boot, because the
+ * file that triggered it is still on the volume. */
+static void flash_wait(uint32_t addr) {
+    uint32_t guard = 0x00400000u;
+
+    if (flash_bank1(addr)) {
+        while ((FLASH_STS1 & FLASH_STS_BSY) && --guard) {
+        }
+        return;
+    }
+    while ((FLASH_STS & FLASH_STS_BSY) && --guard) {
     }
 }
 
-static void flash_unlock(void) {
+static void flash_unlock(uint32_t addr) {
+    if (flash_bank1(addr)) {
+        if (FLASH_CTRL1 & FLASH_CTRL_LOCK) {
+            FLASH_KEYR2 = 0x45670123u;
+            FLASH_KEYR2 = 0xCDEF89ABu;
+        }
+        return;
+    }
     if (FLASH_CTRL & FLASH_CTRL_LOCK) {
         FLASH_KEYR = 0x45670123u;
         FLASH_KEYR = 0xCDEF89ABu;
     }
 }
 
-static void flash_lock(void) {
+static void flash_lock(uint32_t addr) {
+    if (flash_bank1(addr)) {
+        FLASH_CTRL1 |= FLASH_CTRL_LOCK;
+        return;
+    }
     FLASH_CTRL |= FLASH_CTRL_LOCK;
 }
 
-static void flash_clear_status(void) {
+static void flash_clear_status(uint32_t addr) {
+    if (flash_bank1(addr)) {
+        FLASH_STS1 = FLASH_STS_EOP | FLASH_STS_PGERR | FLASH_STS_WRPRTERR;
+        return;
+    }
     FLASH_STS = FLASH_STS_EOP | FLASH_STS_PGERR | FLASH_STS_WRPRTERR;
 }
 
 static void flash_erase_page(uint32_t addr) {
-    flash_wait();
-    flash_clear_status();
-    FLASH_CTRL |= FLASH_CTRL_PER;
-    FLASH_ADDR = addr;
-    FLASH_CTRL |= FLASH_CTRL_STRT;
-    flash_wait();
-    FLASH_CTRL &= ~FLASH_CTRL_PER;
-    flash_clear_status();
+    flash_wait(addr);
+    flash_clear_status(addr);
+    if (flash_bank1(addr)) {
+        FLASH_CTRL1 |= FLASH_CTRL_PER;
+        FLASH_ADDR1 = addr;
+        FLASH_CTRL1 |= FLASH_CTRL_STRT;
+        flash_wait(addr);
+        FLASH_CTRL1 &= ~FLASH_CTRL_PER;
+    } else {
+        FLASH_CTRL |= FLASH_CTRL_PER;
+        FLASH_ADDR = addr;
+        FLASH_CTRL |= FLASH_CTRL_STRT;
+        flash_wait(addr);
+        FLASH_CTRL &= ~FLASH_CTRL_PER;
+    }
+    flash_clear_status(addr);
 }
 
 static void flash_program_halfword(uint32_t addr, uint16_t value) {
-    flash_wait();
-    flash_clear_status();
-    FLASH_CTRL |= FLASH_CTRL_PG;
-    REG16(addr) = value;
-    flash_wait();
-    FLASH_CTRL &= ~FLASH_CTRL_PG;
-    flash_clear_status();
+    flash_wait(addr);
+    flash_clear_status(addr);
+    if (flash_bank1(addr)) {
+        FLASH_CTRL1 |= FLASH_CTRL_PG;
+        REG16(addr) = value;
+        flash_wait(addr);
+        FLASH_CTRL1 &= ~FLASH_CTRL_PG;
+    } else {
+        FLASH_CTRL |= FLASH_CTRL_PG;
+        REG16(addr) = value;
+        flash_wait(addr);
+        FLASH_CTRL &= ~FLASH_CTRL_PG;
+    }
+    flash_clear_status(addr);
+}
+
+static uint32_t fw_dest_base(void) {
+    return fw_blob_mode ? FPGA_BS_STORE_BASE : (uint32_t)FW_STAGE_BASE;
+}
+
+static uint32_t fw_dest_max(void) {
+    return fw_blob_mode ? FPGA_BS_STORE_MAX : (uint32_t)FW_MAX_SIZE;
 }
 
 static uint8_t bit_get(uint8_t *bits, uint32_t bit) {
@@ -126,7 +224,7 @@ static void fw_set_error(uint8_t error) {
 static uint8_t fw_stage_expected_complete(void) {
     uint32_t halfwords;
 
-    if (fw_expected_size < 8192u || fw_expected_size > FW_MAX_SIZE) {
+    if (fw_expected_size < 8192u || fw_expected_size > fw_dest_max()) {
         return 0;
     }
     halfwords = (fw_expected_size + 1u) / 2u;
@@ -141,7 +239,7 @@ static uint8_t fw_stage_expected_complete(void) {
 static void fw_maybe_ready(void) {
     if (fw_status.state == FW_UPDATE_STATE_STAGING &&
         fw_expected_size >= 8192u &&
-        fw_expected_size <= FW_MAX_SIZE &&
+        fw_expected_size <= fw_dest_max() &&
         fw_status.bytes >= fw_expected_size &&
         fw_stage_expected_complete()) {
         fw_status.state = FW_UPDATE_STATE_READY;
@@ -176,7 +274,7 @@ static uint8_t fw_stage_rewrite_page(uint32_t page_offset,
     for (uint32_t i = 0; i < FW_PAGE_SIZE; i += 2u) {
         uint32_t bit = first_halfword + i / 2u;
         uint16_t value = bit_get(fw_stage_halfwords, bit) ?
-                         REG16(FW_STAGE_BASE + page_offset + i) : 0xFFFFu;
+                         REG16(fw_dest_base() + page_offset + i) : 0xFFFFu;
         fw_page_buffer[i] = (uint8_t)value;
         fw_page_buffer[i + 1u] = (uint8_t)(value >> 8);
     }
@@ -188,14 +286,14 @@ static uint8_t fw_stage_rewrite_page(uint32_t page_offset,
         bit_set(fw_stage_halfwords, first_halfword + i / 2u);
     }
 
-    flash_erase_page(FW_STAGE_BASE + page_offset);
+    flash_erase_page(fw_dest_base() + page_offset);
     bit_set(fw_stage_pages, page);
     for (uint32_t i = 0; i < FW_PAGE_SIZE; i += 2u) {
         uint32_t bit = first_halfword + i / 2u;
         if (bit_get(fw_stage_halfwords, bit)) {
             uint16_t value = (uint16_t)fw_page_buffer[i] |
                              ((uint16_t)fw_page_buffer[i + 1u] << 8);
-            flash_program_halfword(FW_STAGE_BASE + page_offset + i, value);
+            flash_program_halfword(fw_dest_base() + page_offset + i, value);
         }
     }
     return 1;
@@ -204,7 +302,7 @@ static uint8_t fw_stage_rewrite_page(uint32_t page_offset,
 static uint8_t fw_stage_write_page(uint32_t offset, const uint8_t *data, uint16_t len) {
     uint32_t page_offset = offset & ~(FW_PAGE_SIZE - 1u);
     uint16_t page_inner = (uint16_t)(offset - page_offset);
-    uint32_t addr = FW_STAGE_BASE + offset;
+    uint32_t addr = fw_dest_base() + offset;
     uint32_t page = offset / FW_PAGE_SIZE;
     uint8_t rewrite = (uint8_t)(offset & 1u);
 
@@ -227,15 +325,15 @@ static uint8_t fw_stage_write_page(uint32_t offset, const uint8_t *data, uint16_
         }
     }
 
-    flash_unlock();
+    flash_unlock(addr);
     if (rewrite) {
         uint8_t ok = fw_stage_rewrite_page(page_offset, page_inner, data, len);
-        flash_lock();
+        flash_lock(addr);
         return ok;
     }
 
     if (!bit_get(fw_stage_pages, page)) {
-        flash_erase_page(FW_STAGE_BASE + page * FW_PAGE_SIZE);
+        flash_erase_page(fw_dest_base() + page * FW_PAGE_SIZE);
         bit_set(fw_stage_pages, page);
     }
 
@@ -252,20 +350,20 @@ static uint8_t fw_stage_write_page(uint32_t offset, const uint8_t *data, uint16_
             if (REG16(addr + i) == value) {
                 continue;
             }
-            flash_lock();
+            flash_lock(addr);
             return fw_stage_write_page(offset, data, len);
         }
         flash_program_halfword(addr + i, value);
         bit_set(fw_stage_halfwords, word_bit);
     }
-    flash_lock();
+    flash_lock(addr);
     return 1;
 }
 
 static uint8_t fw_stage_write(uint32_t offset, const uint8_t *data, uint16_t len) {
     uint32_t end_offset = offset + len;
 
-    if (offset >= FW_MAX_SIZE || (uint32_t)len > FW_MAX_SIZE - offset) {
+    if (offset >= fw_dest_max() || (uint32_t)len > fw_dest_max() - offset) {
         fw_set_error(FW_UPDATE_ERR_RANGE);
         return 0;
     }
@@ -274,7 +372,7 @@ static uint8_t fw_stage_write(uint32_t offset, const uint8_t *data, uint16_t len
         uint16_t page_inner = (uint16_t)(offset & (FW_PAGE_SIZE - 1u));
         uint16_t chunk = (uint16_t)min_u32(len, FW_PAGE_SIZE - page_inner);
         if (!fw_stage_write_page(offset, data, chunk)) {
-            flash_lock();
+            flash_lock(fw_dest_base() + offset);
             return 0;
         }
         offset += chunk;
@@ -325,8 +423,16 @@ void fw_update_usb_data(uint32_t lba, uint16_t sector_offset, const uint8_t *dat
 uint8_t fw_update_request_apply(void) {
     if (fw_status.state == FW_UPDATE_STATE_READY &&
         fw_expected_size >= 8192u &&
-        fw_expected_size <= FW_MAX_SIZE &&
+        fw_expected_size <= fw_dest_max() &&
         fw_status.bytes >= fw_expected_size) {
+        if (fw_blob_mode) {
+            /* Blob transfers land in their final place as they stream, so
+             * "apply" is only an acknowledgement: report success so the
+             * caller deletes the file, and go idle. */
+            fw_status.state = FW_UPDATE_STATE_IDLE;
+            ++fw_status.sequence;
+            return 1;
+        }
         fw_apply_requested = 1;
         fw_apply_delay_loops = FW_APPLY_DELAY_LOOPS;
         fw_status.state = FW_UPDATE_STATE_APPLYING;
@@ -337,7 +443,7 @@ uint8_t fw_update_request_apply(void) {
 }
 
 static void fw_update_note_file_size(uint32_t size) {
-    if (size >= 8192u && size <= FW_MAX_SIZE) {
+    if (size >= 8192u && size <= fw_dest_max()) {
         if (size > fw_expected_size) {
             fw_expected_size = size;
             fw_status.expected_size = size;
@@ -352,8 +458,22 @@ static void fw_update_note_file_size(uint32_t size) {
     }
 }
 
+/* Pick the destination for the next staged file. Must be called after
+ * fw_update_clear() (which resets it) and before the first byte arrives —
+ * the destination is baked into fw_stage_reset()'s bookkeeping. */
+void fw_update_set_blob_mode(uint8_t blob) {
+#if FW_STORE_WRITER
+    if (fw_status.state == FW_UPDATE_STATE_APPLYING || fw_stage_started) {
+        return;
+    }
+    fw_blob_mode = blob ? 1u : 0u;
+#else
+    (void)blob;
+#endif
+}
+
 void fw_update_note_file(uint32_t base_lba, uint32_t size) {
-    if (size < 8192u || size > FW_MAX_SIZE) {
+    if (size < 8192u || size > fw_dest_max()) {
         if (size) {
             fw_set_error(FW_UPDATE_ERR_RANGE);
         }
@@ -377,6 +497,9 @@ void fw_update_clear(void) {
     fw_expected_size = 0;
     fw_stage_started = 0;
     fw_stage_base_lba = 0;
+#if FW_STORE_WRITER
+    fw_blob_mode = 0;
+#endif
     fw_status.state = FW_UPDATE_STATE_IDLE;
     fw_status.error = FW_UPDATE_ERR_NONE;
     fw_status.bytes = 0;

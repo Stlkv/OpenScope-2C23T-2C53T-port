@@ -2,6 +2,7 @@
 
 #include "board.h"
 #include "dbgdump.h"
+#include "fpga_bitstream_store.h"
 #include "fw_update.h"
 #include "hw.h"
 #include "screenshot.h"
@@ -9,6 +10,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#ifndef FPGA53_BITSTREAM_EXTERN
+#define FPGA53_BITSTREAM_EXTERN 1
+#endif
+#define FW_STORE_WRITER FPGA53_BITSTREAM_EXTERN
 
 enum {
     USB_EP0_SIZE = 64,
@@ -737,6 +743,16 @@ static uint8_t raw_fat_stage_update_file(const raw_fat_volume_t *fat, const raw_
     fw_update_status_t status;
 
     fw_update_clear();
+#if FW_STORE_WRITER
+    /* Route by content, not by name: a bitstream file opens with the store's
+     * GWBS header, a firmware image opens with a vector table. Both arrive as
+     * F2C23T*.BIN through the same finder, and the host should not have to
+     * encode the destination in a filename macOS is free to mangle. */
+    if (raw_fat_read_sector(fat, raw_fat_cluster_lba(fat, cluster), sector) &&
+        le32_at(sector) == FPGA_BS_MAGIC) {
+        fw_update_set_blob_mode(1);
+    }
+#endif
     fw_update_note_file(RAW_UPDATE_STAGE_BASE_LBA, file->size);
     while (remaining && cluster >= 2u && !raw_fat_cluster_is_eoc(fat, cluster) && guard++ < 4096u) {
         uint32_t lba = raw_fat_cluster_lba(fat, cluster);

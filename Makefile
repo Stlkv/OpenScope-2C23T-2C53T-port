@@ -146,6 +146,24 @@ release-2c53t-scope:
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-SCOPE-08007000.bin
 	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-SCOPE-08007000.bin
 
+# The bitstream store file. Drop it on the device's USB volume once (same
+# gesture as a firmware update — the device routes it by its GWBS header, not
+# by name) and every later scope image can leave the 113 KB payload out.
+BITSTREAM_BIN := $(DIST)/F2C23T-FPGA-BITSTREAM.BIN
+bitstream-bin:
+	@mkdir -p $(DIST)
+	python3 tools/mkbitstream.py src/fpga_bitstream_2c53t.h $(BITSTREAM_BIN)
+
+# Provisioning / recovery image: the old arrangement with the bitstream inside
+# the image. Needed on a unit whose store has never been written — and as the
+# way back if a store ever turns out to be bad.
+release-2c53t-embed:
+	rm -rf $(BUILD_ROOT)/2c53t
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_BITSTREAM_EXTERN=0 $(SCOPE53_EXTRA)"
+	@mkdir -p $(DIST)
+	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-EMBED-08007000.bin
+	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-EMBED-08007000.bin
+
 # Same, plus the timing-register falsification sweep (0x0F/0x10/0x11 ladder,
 # results in DBG.TXT under TSW). Feed it a periodic signal before reading.
 release-2c53t-tsweep:

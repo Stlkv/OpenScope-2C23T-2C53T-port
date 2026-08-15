@@ -31,6 +31,7 @@ typedef struct {
     uint32_t v04_stb;     /* status before upload */
     uint32_t v04_sta;     /* status after upload */
     uint8_t warm;         /* 1 = warm boot: config skipped, FPGA kept as-is */
+    uint8_t bs_ok;        /* 1 = bitstream store holds a whole, matching payload */
     uint8_t sweep_val;    /* auto-sweep: current pre-cmd byte */
     uint8_t sweep_hit;    /* auto-sweep: 1 = CH2 spread detected, sweep frozen */
     uint16_t pose_calls;  /* fpga53_scope_pose_reapply entries (scope-mode entries) */

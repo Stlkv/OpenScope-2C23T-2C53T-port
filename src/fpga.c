@@ -355,6 +355,7 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->v04_stb = fpga53_diag.v04_stb;
     d->v04_sta = fpga53_diag.v04_sta;
     d->warm = fpga53_diag.warm;
+    d->bs_ok = fpga53_diag.bs_ok;
     d->pose_calls = fpga53_diag.pose_calls;
     d->win_edges = fpga53_diag.win_edges;
     d->win_period = fpga53_diag.win_period;
@@ -384,11 +385,61 @@ void fpga53_get_diag(fpga53_diag_t *d) {
  * 2C53T stock boot capture shows none; the V0.4 reset pin maps to the
  * 2C53T POWER button, so it must not be driven).
  */
+/*
+ * Where the payload comes from.
+ *
+ * EXTERN (default): the bitstream lives in its own flash region, written once
+ * by dropping the store file on the USB volume — see fpga_bitstream_store.h.
+ * That keeps 113 KB of constant data out of a 224 KB app slot, which is the
+ * difference between "12 bytes free" and "half the slot free".
+ *
+ * Embedded (FPGA53_BITSTREAM_EXTERN=0): the old arrangement, kept as the
+ * provisioning and recovery build — it is the image that can configure an
+ * FPGA on a unit whose store has never been written.
+ */
+#ifndef FPGA53_BITSTREAM_EXTERN
+#define FPGA53_BITSTREAM_EXTERN 1
+#endif
+
+#if FPGA53_BITSTREAM_EXTERN
+#include "fpga_bitstream_store.h"
+#else
 #include "fpga_bitstream_2c53t.h"
+#endif
 
 /* 1 = the last upload reached DONE_FINAL, i.e. the part now carries our
  * design and the warm token may be written. */
 static uint8_t fpga53_cfg_ok;
+
+#if FPGA53_BITSTREAM_EXTERN
+static const uint8_t *fpga53_bs_data(void) {
+    return (const uint8_t *)FPGA_BS_DATA_BASE;
+}
+
+static uint32_t fpga53_bs_length(void) {
+    const fpga_bs_header_t *h = (const fpga_bs_header_t *)FPGA_BS_STORE_BASE;
+
+    if (h->magic != FPGA_BS_MAGIC ||
+        h->check != (uint32_t)~(h->magic + h->length + h->fingerprint) ||
+        h->length < 1024u ||
+        h->length > FPGA_BS_STORE_MAX - FPGA_BS_HDR_BYTES) {
+        return 0;
+    }
+    return h->length;
+}
+
+static uint32_t fpga53_bs_stored_fingerprint(void) {
+    return ((const fpga_bs_header_t *)FPGA_BS_STORE_BASE)->fingerprint;
+}
+#else
+static const uint8_t *fpga53_bs_data(void) {
+    return fpga_h2_cal_table;
+}
+
+static uint32_t fpga53_bs_length(void) {
+    return FPGA_H2_CAL_TABLE_SIZE;
+}
+#endif
 
 static uint8_t v04_xfer(uint8_t value) {
     uint8_t result = 0;
@@ -451,8 +502,12 @@ static void fpga53_v04_configure(void) {
     (void)v04_xfer(0);
     gpio_clear(GPIOB_BASE, 1u << 6);
     (void)v04_xfer(0x3Bu);
-    for (uint32_t i = 0; i < FPGA_H2_CAL_TABLE_SIZE; ++i) {
-        (void)v04_xfer(fpga_h2_cal_table[i]);
+    {
+        const uint8_t *bs = fpga53_bs_data();
+        uint32_t len = fpga53_bs_length();
+        for (uint32_t i = 0; i < len; ++i) {
+            (void)v04_xfer(bs[i]);
+        }
     }
     gpio_set(GPIOB_BASE, 1u << 6);
 
@@ -514,10 +569,16 @@ typedef struct {
 __attribute__((section(".warm_token"), used))
 static volatile warm_token_t warm_token;
 
+/* Rolling sum over the payload. Doubles as the store's integrity check (the
+ * header carries the value the host computed with the same algorithm) and as
+ * the warm token's identity of "which bitstream is the FPGA running". */
 static uint32_t fpga53_bitstream_fingerprint(void) {
-    uint32_t f = FPGA_H2_CAL_TABLE_SIZE;
-    for (uint32_t i = 0; i < FPGA_H2_CAL_TABLE_SIZE; ++i) {
-        f = ((f << 1) | (f >> 31)) + fpga_h2_cal_table[i];
+    const uint8_t *p = fpga53_bs_data();
+    uint32_t len = fpga53_bs_length();
+    uint32_t f = len;
+
+    for (uint32_t i = 0; i < len; ++i) {
+        f = ((f << 1) | (f >> 31)) + p[i];
     }
     return f;
 }
@@ -663,6 +724,17 @@ void fpga_init_once(void) {
     delay_ms(2); // PB11/PC6 settle (stock raises PB11 ~1ms before traffic)
     {
         uint32_t fingerprint = fpga53_bitstream_fingerprint();
+#if FPGA53_BITSTREAM_EXTERN
+        /* An unwritten or half-written store must never be clocked into the
+         * FPGA — a garbage upload takes the config port down until the next
+         * power cycle, and the part would lose a design it may already be
+         * running happily. The header's fingerprint is what makes "the file
+         * arrived whole" checkable at all. */
+        fpga53_diag.bs_ok = (fpga53_bs_length() &&
+                             fingerprint == fpga53_bs_stored_fingerprint()) ? 1u : 0u;
+#else
+        fpga53_diag.bs_ok = 1u;
+#endif
 #if FPGA53_WARM_SEED
         /* Bench seed build: flashed onto a device whose FPGA is known (from
          * its own telemetry) to be carrying this bitstream right now, so the
@@ -676,7 +748,7 @@ void fpga_init_once(void) {
 #elif FPGA53_WARM_SKIP
         fpga53_diag.warm = fpga53_warm_boot(fingerprint);
 #endif
-        if (!fpga53_diag.warm) {
+        if (!fpga53_diag.warm && fpga53_diag.bs_ok) {
             fpga53_v04_configure();
             fpga53_warm_token_write(fpga53_cfg_ok, fingerprint);
         }

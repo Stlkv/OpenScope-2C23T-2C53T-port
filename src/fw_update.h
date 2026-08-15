@@ -27,6 +27,10 @@ typedef struct {
 
 void fw_update_usb_data(uint32_t lba, uint16_t sector_offset, const uint8_t *data, uint16_t len);
 void fw_update_note_file(uint32_t base_lba, uint32_t size);
+/* Route the next staged file: 0 = firmware image (staged, then installed over
+ * the app slot), 1 = FPGA bitstream written straight to its own flash region.
+ * Reset to 0 by fw_update_clear(). */
+void fw_update_set_blob_mode(uint8_t blob);
 uint8_t fw_update_request_apply(void);
 void fw_update_clear(void);
 void fw_update_service(void);

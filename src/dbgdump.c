@@ -5,6 +5,10 @@
 #include "scope.h"
 #include "ui.h"
 
+#ifndef FPGA53_BITSTREAM_EXTERN
+#define FPGA53_BITSTREAM_EXTERN 1
+#endif
+
 /* Host-triggered telemetry dump: the host drops an empty DBGREQ file on the
  * USB volume, the idle scan spots it, deletes it and (re)writes DBG.TXT with
  * this text. Everything the LCD debug overlay shows, plus raw GPIO/SPI state,
@@ -202,6 +206,13 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
      * because nothing was read, not because the port went silent. */
     p = put_str(dst, cap, p, " WARM=");
     p = put_hex(dst, cap, p, dg.warm, 1);
+#if FPGA53_BITSTREAM_EXTERN
+    /* BS=0 means the bitstream store is empty or corrupt: nothing was
+     * uploaded, on purpose. Drop the store file on the volume to fix it.
+     * Meaningless in the provisioning image, which carries its own payload. */
+    p = put_str(dst, cap, p, " BS=");
+    p = put_hex(dst, cap, p, dg.bs_ok, 1);
+#endif
     p = put_str(dst, cap, p, "\n");
 
     p = put_str(dst, cap, p, "calls init=");
