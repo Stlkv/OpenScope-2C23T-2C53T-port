@@ -893,10 +893,10 @@ uint8_t fpga_ready(void) {
  * or fewer and were written off as possibly dead. That was aliasing, not a
  * dead capture: 40 us per sample against a 20 us period is far below Nyquist.
  *
- * 10 and 20 ms/div still clamp — they want 120 and 240 ms of window against
- * the 67 ms index 0x10 gives. Indices 0x11-0x13 are slower again but measured
- * two and a half samples per period even at 2 kHz, which is another alias.
- * Those want a ~20 Hz input. */
+ * 10 and 20 ms/div are covered by 0x11 and 0x12, measured against 20 Hz at
+ * 5000 and 2490 Sa/s. The whole ladder, 0x07 to 0x13: 12.5 MSa/s, 5, 2.5,
+ * 1.25, 0.5, 0.25, 0.125, 0.05, 0.025, 0.0124, then 5000, 2490 and 1194 Sa/s
+ * — ten thousandfold, and 1-2-5 throughout. */
 static const uint8_t fpga53_tb_index[] = {
     /* 50NS 100NS 200NS 500NS 1US 2US */
     0x07u, 0x07u, 0x07u, 0x07u, 0x07u, 0x07u,
@@ -904,14 +904,14 @@ static const uint8_t fpga53_tb_index[] = {
     0x07u, 0x08u, 0x09u, 0x0Au, 0x0Bu, 0x0Cu,
     /* 500US 1MS  2MS   5MS */
     0x0Du, 0x0Eu, 0x0Fu, 0x10u,
-    /* 10MS 20MS — clamped: they want 120 and 240 ms of window and index 10
-     * gives 67 ms. Indices 11-13 are slower still, but at 2 kHz they measured
-     * two and a half samples per period, which is an alias, not a rate.
-     * Pinning them down wants a ~20 Hz input. */
-    0x10u, 0x10u,
+    /* 10MS 20MS */
+    0x11u, 0x12u,
     /* 50MS onward belongs to the roll sampler; these entries only keep the
-     * table the same length as the UI's step list. */
-    0x10u, 0x10u, 0x10u, 0x10u, 0x10u, 0x10u, 0x10u, 0x10u,
+     * table as long as the UI's step list. Index 13's window is 696 ms and
+     * would cover 50 ms/div, but it refreshes 1.4 times a second where roll
+     * scrolls continuously — which is better there is a UI question, not a
+     * measurement, so the floor stays put. */
+    0x13u, 0x13u, 0x13u, 0x13u, 0x13u, 0x13u, 0x13u, 0x13u,
 };
 
 /* Nanoseconds per frame-buffer entry, indexed the same way — half a sample
@@ -919,18 +919,44 @@ static const uint8_t fpga53_tb_index[] = {
  * against a 50 kHz input, where it gets five samples per period, and an exact
  * 0.2500 MSa/s against a 2 kHz one, where it gets 125. The second measurement
  * is the one worth keeping. */
-static const uint16_t fpga53_tb_entry_ns[] = {
+static const uint32_t fpga53_tb_entry_ns[] = {
     40u, 40u, 40u, 40u, 40u, 40u,
     40u, 100u, 200u, 400u, 1000u, 2000u,
     4000u, 10000u, 20000u, 40404u,
-    40404u, 40404u,
-    40404u, 40404u, 40404u, 40404u, 40404u, 40404u, 40404u, 40404u,
+    /* 10MS 20MS. Index 0x11 is 105000 and not the 100000 a 1-2-5 ladder would
+     * want: measured against 50 Hz with eight intervals in the window it comes
+     * out at 210 us per sample, and the ratio to index 0x12 — which needs no
+     * assumption about the generator — is 1.905 where a clean halving would be
+     * 2.008. The 20 Hz sweep had said 200 us, but that reading had three
+     * intervals to work with. Index 0x12 anchors the pair: 400.0 us from 50 Hz
+     * over sixteen intervals, against 401.6 us from the independent 2 kHz run,
+     * which is also what says the generator is honest. */
+    105000u, 200803u,
+    /* 50MS onward: roll territory, index 13's interval. */
+    418848u, 418848u, 418848u, 418848u, 418848u, 418848u, 418848u, 418848u,
 };
 
 enum { FPGA53_TB_STEPS = sizeof(fpga53_tb_index) / sizeof(fpga53_tb_index[0]) };
 
 static uint8_t fpga53_tb_now = 0xFFu;
 static uint32_t fpga53_tb_entry_now = 100u;
+/* What the setter has actually done. Two builds in a row disagreed with the
+ * bench about where the engine was, and there was no way to tell a setter that
+ * never ran from one whose command did not take. */
+static uint16_t fpga53_tb_calls;   /* entries to fpga53_set_timebase */
+static uint16_t fpga53_tb_skips;   /* entries that returned before writing */
+static uint16_t fpga53_tb_sent;    /* `01 <idx>` commands written */
+static uint8_t fpga53_tb_want = 0xFFu; /* index last asked for */
+
+void fpga53_tb_debug(uint8_t *now, uint8_t *want, uint32_t *entry_ns,
+                     uint16_t *calls, uint16_t *skips, uint16_t *sent) {
+    if (now) { *now = fpga53_tb_now; }
+    if (want) { *want = fpga53_tb_want; }
+    if (entry_ns) { *entry_ns = fpga53_tb_entry_now; }
+    if (calls) { *calls = fpga53_tb_calls; }
+    if (skips) { *skips = fpga53_tb_skips; }
+    if (sent) { *sent = fpga53_tb_sent; }
+}
 
 uint32_t fpga53_frame_entry_ns(void) {
     return fpga53_tb_entry_now;
@@ -939,7 +965,9 @@ uint32_t fpga53_frame_entry_ns(void) {
 void fpga53_set_timebase(uint8_t ui_timebase) {
     uint8_t idx;
 
+    ++fpga53_tb_calls;
     if (!fpga_loaded) {
+        ++fpga53_tb_skips;
         return;
     }
 #if FPGA53_SWEEP_TB01
@@ -954,12 +982,25 @@ void fpga53_set_timebase(uint8_t ui_timebase) {
     }
     idx = fpga53_tb_index[ui_timebase];
     fpga53_tb_entry_now = fpga53_tb_entry_ns[ui_timebase];
+    fpga53_tb_want = idx;
     if (idx == fpga53_tb_now) {
+        ++fpga53_tb_skips;
         return;
     }
-    fpga53_tb_now = idx;
 
-    /* Same bus etiquette as a capture read: a roll transfer may be in flight,
+    /* One write, then let the engine fill a whole window at the new rate.
+     *
+     * A walk with a per-step dwell, and a descending homing pass to give the
+     * walk a known start, lived here for an hour. Both were built on index
+     * 0x11 reading 250 samples per period when reached one way and 205 the
+     * other — which was not the rate changing but the estimate collapsing:
+     * against a 20 Hz input that index fits three intervals in a window, and
+     * one spurious crossing among four moves the answer by a fifth. Measured
+     * again at 50 Hz, where the same window holds eight intervals, every path
+     * gives the same 4.79 kSa/s. There is no path dependence, so there is no
+     * reason to walk.
+     *
+     * Same bus etiquette as a capture read: a roll transfer may be in flight,
      * and clocking a command into someone else's CS frame is how a bus gets
      * wedged. */
     fpga53_bus_busy = 1u;
@@ -968,6 +1009,8 @@ void fpga53_set_timebase(uint8_t ui_timebase) {
     (void)fpga53_xfer(0x01u);
     (void)fpga53_xfer(idx);
     gpio_set(GPIOB_BASE, 1u << 6);
+    fpga53_tb_now = idx;
+    ++fpga53_tb_sent;
     fpga53_bus_busy = 0;
 
     /* Let the engine fill one whole window at the new rate before anyone reads
@@ -1465,10 +1508,20 @@ static void fpga53_tsweep_accumulate(fpga53_tsweep_row_t *row) {
     if (spread > row->spread) {
         row->spread = spread;
     }
-    if (edges > row->edges) {
-        row->edges = edges;
-        row->period = fpga53_diag.win_period;
-    }
+    /* Last frame of the dwell, not the one with the most edges.
+     *
+     * Max-edges was right for the question it was written for — does anything
+     * at all change here. It is wrong for measuring a rate: the winning frame
+     * is whichever caught the most crossings, which is the frame that
+     * straddled the switch between two indices, or one that caught a slow edge
+     * wobbling through the hysteresis band. The 20 Hz run showed exactly that
+     * — index 0E, independently measured at 50 kSa/s, came back with 17 edges
+     * in a window that can only hold a third of a period.
+     *
+     * The caller only calls this past the dwell's halfway point, so the engine
+     * has been at this index for a while by the time anything is recorded. */
+    row->edges = edges;
+    row->period = fpga53_diag.win_period;
 }
 #endif
 
@@ -1482,7 +1535,9 @@ static void fpga53_tsweep_step(void) {
         return;
     }
     if (!fpga53_tsweep_started) {
-        fpga53_tsweep_accumulate(&fpga53_tsweep_base);
+        if (fpga53_tsweep_dwell >= (uint8_t)(FPGA53_SWEEP_TIMING_DWELL / 2u)) {
+            fpga53_tsweep_accumulate(&fpga53_tsweep_base);
+        }
         if (++fpga53_tsweep_dwell < (uint8_t)FPGA53_SWEEP_TIMING_DWELL) {
             return; /* baseline gets a full dwell of its own, same as a row */
         }
@@ -1491,7 +1546,12 @@ static void fpga53_tsweep_step(void) {
         fpga53_tsweep_write(0);
         return;
     }
-    fpga53_tsweep_accumulate(&fpga53_tsweep_rows[fpga53_diag.tsweep_row]);
+    /* First half of the dwell is settling: the engine may still be filling a
+     * window at the previous rate, and at the slow indices one window is half
+     * a second. */
+    if (fpga53_tsweep_dwell >= (uint8_t)(FPGA53_SWEEP_TIMING_DWELL / 2u)) {
+        fpga53_tsweep_accumulate(&fpga53_tsweep_rows[fpga53_diag.tsweep_row]);
+    }
     if (++fpga53_tsweep_dwell < (uint8_t)FPGA53_SWEEP_TIMING_DWELL) {
         return;
     }

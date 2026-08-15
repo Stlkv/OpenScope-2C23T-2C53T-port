@@ -212,6 +212,29 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
     p = put_dec(dst, cap, p, dg.dup);
     p = put_str(dst, cap, p, "\n");
 
+#if HW_TARGET_2C53T
+    {
+        uint8_t now = 0, want = 0;
+        uint32_t ns = 0;
+        uint16_t calls = 0, skips = 0, sent = 0;
+
+        fpga53_tb_debug(&now, &want, &ns, &calls, &skips, &sent);
+        p = put_str(dst, cap, p, "TB now=");
+        p = put_hex(dst, cap, p, now, 2);
+        p = put_str(dst, cap, p, " want=");
+        p = put_hex(dst, cap, p, want, 2);
+        p = put_str(dst, cap, p, " ns=");
+        p = put_dec(dst, cap, p, ns);
+        p = put_str(dst, cap, p, " calls=");
+        p = put_dec(dst, cap, p, calls);
+        p = put_str(dst, cap, p, " skip=");
+        p = put_dec(dst, cap, p, skips);
+        p = put_str(dst, cap, p, " sent=");
+        p = put_dec(dst, cap, p, sent);
+        p = put_str(dst, cap, p, "\n");
+    }
+#endif
+
     p = put_str(dst, cap, p, "Q=");
     for (uint8_t i = 0; i < 5u; ++i) {
         p = put_hex(dst, cap, p, dg.cst[i], 2);

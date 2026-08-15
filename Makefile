@@ -179,9 +179,10 @@ release-2c53t-seam:
 # The 2026-08-15 sweep sent the index as a bare byte with no command in front
 # and measured a no-op. Feed a periodic signal with several periods in the
 # window (50 kHz gives ten) and keep a fast timebase.
+TB01_DWELL ?= 16
 release-2c53t-tb01:
 	rm -rf $(BUILD_ROOT)/2c53t
-	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_SWEEP_TB01=1 -DFPGA53_SWEEP_TIMING_DWELL=16 $(SCOPE53_EXTRA)"
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_SWEEP_TB01=1 -DFPGA53_SWEEP_TIMING_DWELL=$(TB01_DWELL) $(SCOPE53_EXTRA)"
 	@mkdir -p $(DIST)
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-TB01-08007000.bin
 	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-TB01-08007000.bin

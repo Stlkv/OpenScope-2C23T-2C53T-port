@@ -237,6 +237,10 @@ void fpga53_slow_point_set_full(uint8_t full);
  * window, and it was a hardcoded 100 while there was only one rate. */
 void fpga53_set_timebase(uint8_t ui_timebase);
 uint32_t fpga53_frame_entry_ns(void);
+/* What the setter has actually done: where it thinks the engine is, what was
+ * last asked for, and how many times it ran, bailed out and wrote. */
+void fpga53_tb_debug(uint8_t *now, uint8_t *want, uint32_t *entry_ns,
+                     uint16_t *calls, uint16_t *skips, uint16_t *sent);
 #endif
 
 void fpga_init_once(void);
