@@ -77,8 +77,14 @@ typedef struct {
  * A head skip of 160 took the glitch rate from 124/168 to 3/171, and those
  * three sat at sample 999 — the other end. Hence the tail trim.
  *
- * Why the engine needs this long is still open; stock's trace is clean, so
- * stock almost certainly drops a head of its own.
+ * Why the engine needs this long is still open, and the obvious guess is
+ * wrong: stock does NOT drop a head. Its normal-timebase renderer transforms
+ * adc_buf_ch1[0..300] — the first 301 samples of its 1024-sample buffer, head
+ * included (stock RE, scope_render_monsters_annotated.c). What stock does and
+ * we do not is bracket the read: a precursor that sends the timebase index and
+ * refuses to read until the engine has accumulated enough samples, then the
+ * bulk read, then a re-arm. So this skip may be standing in for a handshake we
+ * never perform, rather than for a settling time that has to exist.
  *
  * These live in the header because the renderer has to agree with them: the
  * window is no longer 1023 samples, and a UI that still asks for the whole
