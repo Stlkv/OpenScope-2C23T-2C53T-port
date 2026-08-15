@@ -10,6 +10,18 @@
  * this text. Everything the LCD debug overlay shows, plus raw GPIO/SPI state,
  * readable without buttons or screenshots. */
 
+/* Sweep builds trade the roll and pin-state lines for the sweep table: the app
+ * is at the 224 KB self-update ceiling and cannot carry both.
+ * NB: this default must mirror fpga.c's — when it did not, a sweep build ran
+ * the sweep and printed nothing, which reads exactly like a negative result
+ * (bench 2026-08-15). */
+#ifndef FPGA53_SWEEP_TBIDX
+#define FPGA53_SWEEP_TBIDX 0
+#endif
+#ifndef FPGA53_SWEEP_TIMING
+#define FPGA53_SWEEP_TIMING FPGA53_SWEEP_TBIDX
+#endif
+
 static uint16_t put_str(char *dst, uint16_t cap, uint16_t p, const char *s) {
     while (*s && p < cap) {
         dst[p++] = *s++;
@@ -89,14 +101,95 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
             p = put_str(dst, cap, p, " ");
         }
     }
-    p = put_str(dst, cap, p, " A=");
-    p = put_hex(dst, cap, p, dg.sweep_val, 2);
-    p = put_str(dst, cap, p, dg.sweep_hit ? "!" : ".");
-    p = put_str(dst, cap, p, " X=");
-    p = put_hex(dst, cap, p, dg.fe_idx, 2);
-    p = put_str(dst, cap, p, " Y=");
-    p = put_hex(dst, cap, p, dg.fe_idx_b, 2);
+    /* A= (pre-command sweep) and X=/Y= (frontend pattern indices) dropped
+     * 2026-08-15 for flash room: both belong to hunts that finished — the
+     * preamble sweep and the CH2 GPIO search — and the flash bought the
+     * PC0-gated read instead. */
     p = put_str(dst, cap, p, "\n");
+
+    /* Window shape + the MCU-paced slow timebase. edges/period are measured
+     * in window samples (period x16), so they answer "did the sample rate
+     * change?" without a photograph. psc/pr are what TMR1 actually got.
+     * Not in sweep builds — those run on a fast timebase where roll is idle,
+     * and the flash they free is what the sweep table costs. */
+#if !FPGA53_SWEEP_TIMING
+    {
+        uint16_t psc = 0;
+        uint16_t pr = 0;
+        uint16_t cost = 0;
+        uint16_t over = 0;
+
+        scope_hw_slow_timer_debug(&psc, &pr, &cost, &over);
+        p = put_str(dst, cap, p, "WIN e=");
+        p = put_dec(dst, cap, p, dg.win_edges);
+        p = put_str(dst, cap, p, " T16=");
+        p = put_dec(dst, cap, p, dg.win_period);
+        p = put_str(dst, cap, p, " ROLL n=");
+        p = put_dec(dst, cap, p, dg.slow_points);
+        p = put_str(dst, cap, p, " p=");
+        p = put_hex(dst, cap, p, dg.slow_min, 2);
+        p = put_str(dst, cap, p, "-");
+        p = put_hex(dst, cap, p, dg.slow_max, 2);
+        p = put_str(dst, cap, p, dg.slow_full ? " FULL" : " short");
+        p = put_str(dst, cap, p, dg.dma_fail ? " POLLED" : " dma");
+        p = put_str(dst, cap, p, " psc=");
+        p = put_dec(dst, cap, p, psc);
+        p = put_str(dst, cap, p, " pr=");
+        p = put_dec(dst, cap, p, pr);
+        p = put_str(dst, cap, p, " cost=");
+        p = put_dec(dst, cap, p, cost);
+        p = put_str(dst, cap, p, " over=");
+        p = put_dec(dst, cap, p, over);
+        p = put_str(dst, cap, p, "\n");
+    }
+#endif
+
+    /* Timing-register sweep table: one line per register, one field per value
+     * as <spread><edges><period16> in hex. A register that divides the sample
+     * rate shows edges climbing and period falling along its line. Compiled
+     * only into sweep builds — the app is within a few hundred bytes of the
+     * 224 KB self-update ceiling. */
+#if FPGA53_SWEEP_TIMING
+    {
+        uint8_t row_count = 0;
+        const fpga53_tsweep_row_t *rows = fpga53_tsweep_table(&row_count);
+        const fpga53_tsweep_row_t *base = fpga53_tsweep_baseline();
+        const uint8_t *regs = 0;
+        const uint8_t *vals = 0;
+        uint8_t reg_count = 0;
+        uint8_t val_count = 0;
+
+        fpga53_tsweep_axes(&regs, &reg_count, &vals, &val_count);
+        if (rows && row_count && base) {
+            p = put_str(dst, cap, p, "TSW row=");
+            p = put_dec(dst, cap, p, dg.tsweep_row);
+            p = put_str(dst, cap, p, dg.tsweep_done ? "! now=" : ". now=");
+            p = put_hex(dst, cap, p, dg.tsweep_reg, 2);
+            p = put_str(dst, cap, p, ":");
+            p = put_hex(dst, cap, p, dg.tsweep_val, 2);
+            p = put_str(dst, cap, p, " base=");
+            p = put_hex(dst, cap, p, base->spread, 2);
+            p = put_hex(dst, cap, p, base->edges, 2);
+            p = put_hex(dst, cap, p, base->period, 4);
+            p = put_str(dst, cap, p, "\n");
+            for (uint8_t r = 0; r < reg_count; ++r) {
+                p = put_hex(dst, cap, p, regs[r], 2);
+                for (uint8_t v = 0; v < val_count; ++v) {
+                    uint8_t idx = (uint8_t)(r * val_count + v);
+                    p = put_str(dst, cap, p, " ");
+                    if (idx < dg.tsweep_row) {
+                        p = put_hex(dst, cap, p, rows[idx].spread, 2);
+                        p = put_hex(dst, cap, p, rows[idx].edges, 2);
+                        p = put_hex(dst, cap, p, rows[idx].period, 4);
+                    } else {
+                        p = put_str(dst, cap, p, "--------");
+                    }
+                }
+                p = put_str(dst, cap, p, "\n");
+            }
+        }
+    }
+#endif
 
     p = put_str(dst, cap, p, "V=");
     p = put_hex(dst, cap, p, dg.v04_id, 8);
@@ -104,6 +197,11 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
     p = put_hex(dst, cap, p, dg.v04_stb, 8);
     p = put_str(dst, cap, p, " A=");
     p = put_hex(dst, cap, p, dg.v04_sta, 8);
+    /* WARM=1: this boot skipped configuration on purpose (the RAM token said
+     * the FPGA already carries this build's bitstream), so V/B/A are zero
+     * because nothing was read, not because the port went silent. */
+    p = put_str(dst, cap, p, " WARM=");
+    p = put_hex(dst, cap, p, dg.warm, 1);
     p = put_str(dst, cap, p, "\n");
 
     p = put_str(dst, cap, p, "calls init=");
@@ -114,6 +212,7 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
     p = put_dec(dst, cap, p, dg.poll_calls);
     p = put_str(dst, cap, p, "\n");
 
+#if !FPGA53_SWEEP_TIMING
     p = put_str(dst, cap, p, "IDR A=");
     p = put_hex(dst, cap, p, GPIO_IDR(GPIOA_BASE) & 0xFFFFu, 4);
     p = put_str(dst, cap, p, " B=");
@@ -124,33 +223,17 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
     p = put_hex(dst, cap, p, GPIO_IDR(GPIOE_BASE) & 0xFFFFu, 4);
     p = put_str(dst, cap, p, "\n");
 
-    /* ODR next to IDR: ODR is what our code wrote, IDR is the level actually
-     * on the pin. A frontend pin that disagrees between the two is either not
-     * configured as an output or is being held by something on the board —
-     * bench 2026-08-14, where the scope pose ran (cfg counted up) yet PE4/PE5
-     * and PA15/PA10 kept reading meter-side levels. */
-    p = put_str(dst, cap, p, "ODR A=");
-    p = put_hex(dst, cap, p, GPIO_ODR(GPIOA_BASE) & 0xFFFFu, 4);
-    p = put_str(dst, cap, p, " B=");
-    p = put_hex(dst, cap, p, GPIO_ODR(GPIOB_BASE) & 0xFFFFu, 4);
-    p = put_str(dst, cap, p, " C=");
-    p = put_hex(dst, cap, p, GPIO_ODR(GPIOC_BASE) & 0xFFFFu, 4);
-    p = put_str(dst, cap, p, " E=");
-    p = put_hex(dst, cap, p, GPIO_ODR(GPIOE_BASE) & 0xFFFFu, 4);
-    p = put_str(dst, cap, p, "\n");
+    /* The ODR line (what our code wrote, against IDR's actual pin levels) was
+     * dropped 2026-08-15 for flash room. It existed for the frontend-pose
+     * defect of 2026-08-14, which is fixed; IDR still shows the levels, and
+     * POSE= counts the re-applications. Bring it back with pose work. */
 
-    /* Pin config nibbles for the two frontend ports: 1 = 10 MHz push-pull
-     * output, 4 = floating input, 8 = input with pull-up/down, B = AF
-     * push-pull. PA6 should read B when the TMR13 CH2 reference is live. */
-    p = put_str(dst, cap, p, "CR A=");
-    p = put_hex(dst, cap, p, GPIO_CRH(GPIOA_BASE), 8);
-    p = put_str(dst, cap, p, ":");
-    p = put_hex(dst, cap, p, GPIO_CRL(GPIOA_BASE), 8);
-    p = put_str(dst, cap, p, " E=");
-    p = put_hex(dst, cap, p, GPIO_CRH(GPIOE_BASE), 8);
-    p = put_str(dst, cap, p, ":");
-    p = put_hex(dst, cap, p, GPIO_CRL(GPIOE_BASE), 8);
-    p = put_str(dst, cap, p, "\n");
+    /* The CR (pin mode) line lived here until 2026-08-15. It did its job —
+     * the frontend pose defect it was added for is fixed and IDR/ODR still
+     * show the levels — and the app has under 500 bytes of flash left, so it
+     * is gone rather than the roll telemetry. Bring it back with the pose
+     * work, not before. */
+#endif
 
     p = put_str(dst, cap, p, "SPI3 CTRL1=");
     p = put_hex(dst, cap, p, SPI_CTRL1(SPI3_BASE) & 0xFFFFu, 4);

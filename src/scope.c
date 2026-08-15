@@ -16,10 +16,37 @@
 #define SCOPE_ATTENUATOR_CONFIG 0
 #endif
 
+/* Fastest timebase step the MCU-paced sampler is allowed to own, as an index
+ * into the UI's timebase table (18 = 50 ms/div = 2 ms per point). A build
+ * parameter because it tracks what the hardware will actually sustain, and
+ * that number moved twice in one bench session — reverting an over-ambitious
+ * floor is then one flag, not a code change. 17 was tried and reverted: see
+ * the note on SCOPE_HW_SLOW_TIMEBASE_START below. */
+#ifndef SCOPE53_ROLL_FLOOR
+#define SCOPE53_ROLL_FLOOR 18
+#endif
+
 enum {
     SCOPE_TIMING_SETTLE_MS = 2,
     SCOPE_ANALOG_RANGE_SETTLE_MS = 2,
-#if HW_TARGET_HW40
+#if HW_TARGET_2C53T
+    /* The 2C53T has no working FPGA timing register (fpga_write_timing is a
+     * stub), so every "fast" timebase renders the same free-running 33 us
+     * window, and the slow end belongs to the MCU-paced sampler. Where the
+     * two meet is set by the ENGINE, and that was measured the hard way.
+     * Neither the CPU nor the bus is the limit any more: with DMA the pacer
+     * tick costs ~10 us and a 1023-byte window moves in 0.34 ms at 24 MHz.
+     * What does not keep up is the FPGA refilling the window it just handed
+     * over. At index 18 (a drain every 2 ms) the points carry signal —
+     * p=00-94; at index 17 (every 1.2 ms) they freeze to p=92-93 with over=0,
+     * i.e. we are simply re-reading a window the engine has not refreshed.
+     * So the refill takes somewhere between 1.2 and 2 ms, and ~500 points/s
+     * is the hardware ceiling of this timebase. Reading faster buys nothing;
+     * only a different acquisition scheme (equivalent-time sampling of the
+     * fast window) can show a waveform above ~25 Hz. */
+    SCOPE_FAST_ALIGN_TIMEBASE_MAX = 5,
+    SCOPE_HW_SLOW_TIMEBASE_START = SCOPE53_ROLL_FLOOR,
+#elif HW_TARGET_HW40
     SCOPE_FAST_ALIGN_TIMEBASE_MAX = 5,
     SCOPE_HW_SLOW_TIMEBASE_START = 21,
 #else
@@ -27,8 +54,27 @@ enum {
     SCOPE_HW_SLOW_TIMEBASE_START = 18,
 #endif
     SCOPE_SLOW_POINT_COUNT = 300,
+    SCOPE_SLOW_OVERRUN_SKIP = 4,
+#if HW_TARGET_2C53T
+    /* 100 kHz tick: 10 us of interval resolution, and 1 s/div still fits the
+     * 16-bit period register (40 ms per point = 4000 ticks). */
+    SCOPE_SLOW_TIMER_TICK_HZ = 100000u,
+#else
     SCOPE_SLOW_TIMER_TICK_HZ = 10000u,
+#endif
 };
+
+/* Timer clock feeding TMR1's prescaler. The port never reprograms the PLL, so
+ * this is whatever the factory bootloader left behind — MEASURED on the bench
+ * 2026-08-15, not assumed: with psc=719/pr=19 (a nominal 200 us at the old
+ * 72 MHz guess) the sampler produced 17008 points/s = 58.8 us apiece over an
+ * 87 s window, a factor of 3.40 fast. 240/72 = 3.33, and 240 MHz is this
+ * part's ceiling, so the bootloader leaves the timer clock at 240 MHz.
+ * Method, if it ever needs redoing: two DBG dumps a known wall-clock apart,
+ * divide the point counter (32-bit for exactly this reason). */
+#ifndef SCOPE_SLOW_TIMER_CLK_HZ
+#define SCOPE_SLOW_TIMER_CLK_HZ 240000000u
+#endif
 
 enum {
     SCOPE_STATUS_IDLE,
@@ -47,6 +93,11 @@ static volatile uint8_t scope_slow_samples[SCOPE_SLOW_POINT_COUNT * 2u];
 static volatile uint16_t scope_slow_write_index;
 static volatile uint16_t scope_slow_count;
 static volatile uint16_t scope_slow_seq;
+static uint16_t scope_slow_psc;
+static uint16_t scope_slow_pr;
+static uint16_t scope_slow_cost;         /* longest point read, timer ticks */
+static uint16_t scope_slow_over;         /* point reads that outlasted their interval */
+static volatile uint8_t scope_slow_skip; /* intervals to sit out after an overrun */
 
 #if SCOPE_HW_CAPTURE && SCOPE_ANALOG_CONFIG
 static uint8_t scope_analog_ready;
@@ -206,14 +257,21 @@ static void scope_analog_begin(void) {
 }
 #endif
 
+/* Timebase step -> nanoseconds per TENTH of a horizontal division: index 18
+ * holds 5000000 and the UI labels that step 50MS. Everything reading this
+ * table has to multiply by ten to get a division, which is exactly the trap
+ * the roll interval fell into first time round.
+ * One copy: the app sits a few hundred bytes under the 224 KB self-update
+ * ceiling, and three private copies of this cost more than they read. */
+static const uint32_t timebase_unit_ns[] = {
+    5u, 10u, 20u, 50u, 100u, 200u, 500u,
+    1000u, 2000u, 5000u, 10000u, 20000u, 50000u,
+    100000u, 200000u, 500000u, 1000000u, 2000000u, 5000000u,
+    10000000u, 20000000u, 50000000u, 100000000u, 200000000u,
+    500000000u, 1000000000u,
+};
+
 static uint32_t scope_span_for_timebase(uint8_t timebase) {
-    static const uint32_t timebase_unit_ns[] = {
-        5u, 10u, 20u, 50u, 100u, 200u, 500u,
-        1000u, 2000u, 5000u, 10000u, 20000u, 50000u,
-        100000u, 200000u, 500000u, 1000000u, 2000000u, 5000000u,
-        10000000u, 20000000u, 50000000u, 100000000u, 200000000u,
-        500000000u, 1000000000u,
-    };
     uint32_t ns;
     uint32_t span;
 
@@ -231,14 +289,40 @@ static uint32_t scope_span_for_timebase(uint8_t timebase) {
     return span;
 }
 
+/* Interval between roll points, in timer ticks. The ms-granular sibling below
+ * bottoms out at 1 ms per point — 3.3 ms/div — which is far slower than the
+ * bus can sample and would leave the whole interesting range (mains hum,
+ * audio, anything in the hundreds of Hz) unreachable. Ticks give 10 us. */
+static uint16_t scope_slow_interval_ticks_for_timebase(uint8_t timebase) {
+    /* 12 divisions across the screen, SCOPE_SLOW_POINT_COUNT points in it —
+     * so one point is a 25th of a division. Careful with the table's unit:
+     * timebase_unit_ns is a TENTH of a division (index 18 holds 5000000 and
+     * the UI labels it 50MS), so the division is worth ten of those. Divide
+     * before multiplying — ten seconds per division in nanoseconds would not
+     * fit in 32 bits. */
+    enum { POINTS_PER_DIV = SCOPE_SLOW_POINT_COUNT / 12u };
+    const uint32_t tick_ns = 1000000000u / SCOPE_SLOW_TIMER_TICK_HZ;
+    uint32_t unit_ns;
+    uint32_t point_ns;
+    uint32_t ticks;
+
+    if (timebase >= (uint8_t)(sizeof(timebase_unit_ns) / sizeof(timebase_unit_ns[0]))) {
+        timebase = 19u;
+    }
+    unit_ns = timebase_unit_ns[timebase];
+    point_ns = (unit_ns / POINTS_PER_DIV) * 10u +
+               ((unit_ns % POINTS_PER_DIV) * 10u) / POINTS_PER_DIV;
+    ticks = (point_ns + tick_ns / 2u) / tick_ns;
+    if (!ticks) {
+        ticks = 1u;
+    }
+    if (ticks > 0xFFFFu) {
+        ticks = 0xFFFFu;
+    }
+    return (uint16_t)ticks;
+}
+
 static uint16_t scope_slow_interval_ms_for_timebase(uint8_t timebase) {
-    static const uint32_t timebase_unit_ns[] = {
-        5u, 10u, 20u, 50u, 100u, 200u, 500u,
-        1000u, 2000u, 5000u, 10000u, 20000u, 50000u,
-        100000u, 200000u, 500000u, 1000000u, 2000000u, 5000000u,
-        10000000u, 20000000u, 50000000u, 100000000u, 200000000u,
-        500000000u, 1000000000u,
-    };
     uint32_t div_ms;
     uint32_t interval;
 
@@ -366,8 +450,15 @@ void scope_hw_slow_stop(void) {
 
 void scope_hw_slow_start(uint8_t timebase) {
 #if SCOPE_HW_CAPTURE
+#if HW_TARGET_2C53T
+    /* Halved on purpose: the DMA sampler needs two ticks per point (one to
+     * start a channel's transfer, one to collect it), so the pacer runs at
+     * twice the point rate. See the sampler comment in fpga.c. */
+    uint32_t ticks = (uint32_t)scope_slow_interval_ticks_for_timebase(timebase) / 2u;
+#else
     uint16_t interval_ms = scope_slow_interval_ms_for_timebase(timebase);
     uint32_t ticks = ((uint32_t)interval_ms * SCOPE_SLOW_TIMER_TICK_HZ) / 1000u;
+#endif
 
     if (!ticks) {
         ticks = 1u;
@@ -380,6 +471,9 @@ void scope_hw_slow_start(uint8_t timebase) {
     __asm__ volatile("cpsid i" ::: "memory");
     scope_slow_write_index = 0;
     scope_slow_count = 0;
+    scope_slow_cost = 0;
+    scope_slow_over = 0;
+    scope_slow_skip = 0;
     ++scope_slow_seq;
     __asm__ volatile("cpsie i" ::: "memory");
 
@@ -394,11 +488,21 @@ void scope_hw_slow_start(uint8_t timebase) {
     delay_ms(SCOPE_TIMING_SETTLE_MS);
     fpga_capture_latch();
 
+#if HW_TARGET_2C53T
+    /* Always full: a short read hands back a window the engine has not
+     * refreshed (bench 2026-08-15 — the point span collapsed to a single
+     * value), so a "cheap" point is not a point at all. The price is 1.6 ms
+     * of SPI per point, which is what sets SCOPE_HW_SLOW_TIMEBASE_START. */
+    fpga53_slow_point_set_full(1u);
+#endif
+
     RCC_APB2ENR |= 1u << 11; // TMR1
     TMR_CTRL1(TMR1_BASE) = 0;
     TMR_IDEN(TMR1_BASE) = 0;
-    TMR_PSC(TMR1_BASE) = 7199u; // 72 MHz / 7200 = 10 kHz
-    TMR_PR(TMR1_BASE) = ticks - 1u;
+    scope_slow_psc = (uint16_t)((SCOPE_SLOW_TIMER_CLK_HZ / SCOPE_SLOW_TIMER_TICK_HZ) - 1u);
+    scope_slow_pr = (uint16_t)(ticks - 1u);
+    TMR_PSC(TMR1_BASE) = scope_slow_psc;
+    TMR_PR(TMR1_BASE) = scope_slow_pr;
     TMR_EG(TMR1_BASE) = 1u;
     TMR_STS(TMR1_BASE) = ~1u;
     scope_slow_irq_enabled = 1;
@@ -408,6 +512,21 @@ void scope_hw_slow_start(uint8_t timebase) {
 #else
     (void)timebase;
 #endif
+}
+
+void scope_hw_slow_timer_debug(uint16_t *psc, uint16_t *pr, uint16_t *cost, uint16_t *over) {
+    if (psc) {
+        *psc = scope_slow_psc;
+    }
+    if (pr) {
+        *pr = scope_slow_pr;
+    }
+    if (cost) {
+        *cost = scope_slow_cost;
+    }
+    if (over) {
+        *over = scope_slow_over;
+    }
 }
 
 uint8_t scope_hw_slow_snapshot(uint8_t *ch1,
@@ -460,6 +579,7 @@ void scope_hw_slow_irq_handler(void) {
 #if SCOPE_HW_CAPTURE
     uint8_t sample[2];
     uint16_t dst;
+    uint16_t t0;
 
     if (!(TMR_STS(TMR1_BASE) & 1u)) {
         return;
@@ -468,10 +588,43 @@ void scope_hw_slow_irq_handler(void) {
     if (!scope_slow_irq_enabled) {
         return;
     }
-    if (!fpga_ready() || !fpga_capture_read_slow_point(sample)) {
+    /* Overrun brake. A point read that outlasts its interval leaves the update
+     * flag already set on the way out, so the handler is re-entered forever and
+     * the main loop never runs — the UI simply freezes (bench 2026-08-15, the
+     * 50 ms/div step with full-window reads). Skipping a few intervals after an
+     * overrun costs sample points and keeps the instrument answering. */
+    if (scope_slow_skip) {
+        --scope_slow_skip;
+        return;
+    }
+    t0 = (uint16_t)TMR_CVAL(TMR1_BASE);
+    if (!fpga_ready()) {
         scope_last_status = SCOPE_STATUS_READ_ERROR;
         ++scope_error_count;
         return;
+    }
+    /* No point this tick is routine, not an error: the DMA sampler answers on
+     * every second tick, and backs off entirely while the main loop holds the
+     * bus. */
+    if (!fpga_capture_read_slow_point(sample)) {
+        return;
+    }
+    if (TMR_STS(TMR1_BASE) & 1u) {
+        /* The pacer wrapped while we held the bus: the read costs more than the
+         * interval, so its true cost is unknown here — only that it is over. */
+        ++scope_slow_over;
+        scope_slow_skip = SCOPE_SLOW_OVERRUN_SKIP;
+    } else {
+        /* The counter wraps at pr, and it can wrap between the flag check
+         * above and this read — take the modular difference rather than
+         * trusting t1 >= t0, or a 6-tick read reports as 65522 (bench
+         * 2026-08-15, where exactly that happened). */
+        uint16_t t1 = (uint16_t)TMR_CVAL(TMR1_BASE);
+        uint16_t span = (uint16_t)(scope_slow_pr + 1u);
+        uint16_t cost = (uint16_t)(t1 >= t0 ? (t1 - t0) : (span - t0 + t1));
+        if (cost > scope_slow_cost) {
+            scope_slow_cost = cost;
+        }
     }
 
     dst = scope_slow_write_index;

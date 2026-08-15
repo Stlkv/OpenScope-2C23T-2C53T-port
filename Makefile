@@ -115,7 +115,42 @@ release-hw4:
 
 # Experimental 2C53T port: 2C53T button matrix / power / backlight,
 # FPGA stubbed (no scope trace), linked for the stock 2C53T IAP bootloader.
+# NOTE: this target carries NO FPGA flags, so it builds a meter-only image of
+# ~106-110 KB. For anything involving a trace use release-2c53t-scope below;
+# an image under ~220 KB has no bitstream in it and the scope is dead.
 release-2c53t:
-	$(MAKE) BUILD=$(BUILD_ROOT)/2c53t APP_BASE=0x08007000 HW_TARGET=2c53t HW_TARGET_HW40=1 HW_TARGET_2C53T=1 SCOPE_HW_CAPTURE=1 SCOPE_ANALOG_CONFIG=0 SCOPE_ATTENUATOR_CONFIG=0 EXTRA_CFLAGS="-Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-unused-but-set-variable" all
+	$(MAKE) BUILD=$(BUILD_ROOT)/2c53t APP_BASE=0x08007000 HW_TARGET=2c53t HW_TARGET_HW40=1 HW_TARGET_2C53T=1 SCOPE_HW_CAPTURE=1 SCOPE_ANALOG_CONFIG=0 SCOPE_ATTENUATOR_CONFIG=0 EXTRA_CFLAGS="-Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-unused-but-set-variable $(SCOPE53_EXTRA)" all
 	@mkdir -p $(DIST)
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-08007000.bin
+
+# The bench-proven scope configuration (cold boot -> live dual-channel trace,
+# 2026-08-13/14): V0.4 bit-banged config entry, the five arm writes at /256
+# after a 600 ms settle, PC0 treated as active-low, stock-paced readout, the
+# analog scope pose and the TMR13 CH2 trigger reference. Expect 223-227 KB.
+SCOPE53_FLAGS := \
+	-DFPGA53_V04_CONFIG=1 \
+	-DFPGA53_SEND_CFG=1 \
+	-DFPGA53_SEND_CFG_DELAY_MS=600 \
+	-DFPGA53_PC0_READY_LOW=1 \
+	-DFPGA53_READ_PACED=1 \
+	-DFPGA53_FE_SCOPE_POSE=1 \
+	-DFPGA53_TMR13_REF=1
+
+# Variant targets wipe build/2c53t first: object files carry no record of the
+# -D flags they were built with, so switching variants without a clean silently
+# links a mix of two firmwares.
+release-2c53t-scope:
+	rm -rf $(BUILD_ROOT)/2c53t
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) $(SCOPE53_EXTRA)"
+	@mkdir -p $(DIST)
+	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-SCOPE-08007000.bin
+	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-SCOPE-08007000.bin
+
+# Same, plus the timing-register falsification sweep (0x0F/0x10/0x11 ladder,
+# results in DBG.TXT under TSW). Feed it a periodic signal before reading.
+release-2c53t-tsweep:
+	rm -rf $(BUILD_ROOT)/2c53t
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_SWEEP_TIMING=1"
+	@mkdir -p $(DIST)
+	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-TSWEEP-08007000.bin
+	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-TSWEEP-08007000.bin

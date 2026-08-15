@@ -192,6 +192,12 @@ typedef struct {
     char unit[6];
 } dmm_stats_t;
 
+/* Must match scope.c's copy — see SCOPE53_ROLL_FLOOR there for why it is a
+ * build parameter. */
+#ifndef SCOPE53_ROLL_FLOOR
+#define SCOPE53_ROLL_FLOOR 18
+#endif
+
 enum {
     SCOPE_TRACE_STEP = 3,
     SCOPE_TRACE_MAX_POINTS = 101,
@@ -200,7 +206,17 @@ enum {
     SCOPE_SAMPLES_PER_DIV = 25,
     SCOPE_VISIBLE_SAMPLE_COUNT = SCOPE_X_DIVS * SCOPE_SAMPLES_PER_DIV,
     SCOPE_FAST_HW_SAMPLE_NS = 20,
-#if HW_TARGET_HW40
+#if HW_TARGET_2C53T
+    /* No FPGA timing register on this board yet, so the hardware window is a
+     * fixed ~33 us no matter what the UI says; from 100 ms/div on, the timer-
+     * paced sampler (fpga_capture_read_slow_point) owns the timebase and the
+     * displayed div actually means something. The floor is the point cost —
+     * see SCOPE_HW_SLOW_TIMEBASE_START in scope.c. */
+    SCOPE_FAST_HW_TIMEBASE_MAX = 5,
+    SCOPE_SOFT_ROLL_TIMEBASE = 255,
+    SCOPE_IRQ_ROLL_TIMEBASE_START = SCOPE53_ROLL_FLOOR,
+    SCOPE_SLOW_ROLL_TIMEBASE_START = SCOPE53_ROLL_FLOOR,
+#elif HW_TARGET_HW40
     SCOPE_FAST_HW_TIMEBASE_MAX = 5,
     SCOPE_SOFT_ROLL_TIMEBASE = 255,
     SCOPE_IRQ_ROLL_TIMEBASE_START = 21,
@@ -775,6 +791,15 @@ static uint8_t ui_dbg_hex(char *dst, uint8_t v) {
     dst[0] = h[(v >> 4) & 0xFu];
     dst[1] = h[v & 0xFu];
     return 2;
+}
+
+static uint8_t ui_dbg_str(char *dst, const char *s) {
+    uint8_t n = 0;
+    while (s[n]) {
+        dst[n] = s[n];
+        ++n;
+    }
+    return n;
 }
 #endif
 
@@ -2839,6 +2864,30 @@ static void draw_scope_measure_param_row(uint16_t x, uint16_t y) {
 static uint16_t scope_visible_sample_count(void) {
     uint8_t timebase = scope_safe_timebase();
 
+#if HW_TARGET_2C53T
+    /* Every non-roll step draws from the same 1023-sample capture, which the
+     * read stretches 2x into the frame buffer — so one buffer sample is 100 ns
+     * (5.00 MSa/s, measured 2026-08-15 against a 50 kHz square: 100 samples
+     * per 20 us period). Show as many of them as the requested division spans,
+     * capped by what the window actually holds.
+     *
+     * This used to cap at 300 samples, i.e. 30 us of a 205 us capture: 85% of
+     * what the instrument had already digitised was thrown away before it
+     * reached the screen — and it is what made the window look like 33 us for
+     * a day and a half. */
+    if (timebase < SCOPE53_ROLL_FLOOR) {
+        uint32_t screen_ns = scope_timebase_unit_ns[timebase] * SCOPE_X_DIVS * 10u;
+        uint32_t count = (screen_ns + 50u) / 100u;
+        if (count < 2u) {
+            count = 2u;
+        }
+        if (count > SCOPE_SAMPLE_COUNT - 2u) {
+            count = SCOPE_SAMPLE_COUNT - 2u;
+        }
+        return (uint16_t)count;
+    }
+    return SCOPE_VISIBLE_SAMPLE_COUNT;
+#else
     if (timebase <= SCOPE_FAST_HW_TIMEBASE_MAX) {
         uint32_t screen_ns = scope_timebase_unit_ns[timebase] * SCOPE_X_DIVS * 10u;
         uint32_t count = (screen_ns + SCOPE_FAST_HW_SAMPLE_NS / 2u) / SCOPE_FAST_HW_SAMPLE_NS;
@@ -2851,6 +2900,7 @@ static uint16_t scope_visible_sample_count(void) {
         return (uint16_t)count;
     }
     return SCOPE_VISIBLE_SAMPLE_COUNT;
+#endif
 }
 
 static int32_t scope_h_pos_sample_offset(void) {
@@ -4852,8 +4902,27 @@ static int16_t scope_sample_y(uint16_t x,
         idx = (uint16_t)(((uint32_t)((int32_t)idx + (int32_t)scope_roll_offset + h_offset)) &
                          (SCOPE_SAMPLE_COUNT - 1u));
     } else {
+#if HW_TARGET_2C53T
+        /* Clamp, do not wrap. The frame holds ONE 1023-sample capture stretched
+         * 2x into 2046 of the buffer's 2048 slots; its end and its beginning
+         * are separated by an unknown amount of time, so joining them draws a
+         * seam that is not in the signal. On a square wave it read as a plateau
+         * stretched half again with a sharp dip in the middle — the artefact
+         * that survived PC0 gating, ping-pong, DMA and 48 MHz, because none of
+         * those were where it came from. Past the end of the capture there is
+         * simply nothing to draw. */
+        int32_t pos = (int32_t)idx + (int32_t)scope_trigger_offset + h_offset;
+        if (pos < 0) {
+            pos = 0;
+        }
+        if (pos > (int32_t)(SCOPE_SAMPLE_COUNT - 2u)) {
+            pos = (int32_t)(SCOPE_SAMPLE_COUNT - 2u);
+        }
+        idx = (uint16_t)pos;
+#else
         idx = (uint16_t)(((uint32_t)((int32_t)idx + (int32_t)scope_trigger_offset + h_offset)) &
                          (SCOPE_SAMPLE_COUNT - 1u));
+#endif
     }
     return scope_scaled_sample_y(ch2 ? 1u : 0u,
                                  scope_samples[(uint16_t)(idx * 2u + (ch2 ? 1u : 0u))],
@@ -6140,103 +6209,63 @@ static void draw_scope_trace(uint16_t color,
 }
 
 #if HW_TARGET_2C53T
+/* On-screen telemetry, trimmed 2026-08-15 to the two questions it is actually
+ * read for: is the FPGA configured the way it should be, and are the numbers
+ * coming back real rather than a frozen buffer or an idle bus?
+ *
+ *   line 1  ID:OK COLD CFG:OK Q:BAD ENG:RUN   <- config verdicts
+ *   line 2  ch1=4B-5A ch2=44-48 p=00-94 N123  <- signs of life in the data
+ *
+ * Everything else (raw V/B/A, the expected-value crib, frame and poll
+ * counters, the frontend pattern indices) appears only when a verdict is not
+ * OK — that is exactly when the raw numbers are worth screen space, and the
+ * full set is always one DBGREQ away in DBG.TXT. */
 static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
-    /* Line 1: I<init> P<pc0> R<reads> C<forced> S<st> F<frm> W<wait>
-     * Line 2: r0r1r2 min-max Q<status-read 5B> N<init> G<cfg> T<poll> */
     fpga53_diag_t dg;
     char dbg[56];
     uint8_t p = 0;
     fpga53_get_diag(&dg);
-    dbg[p++] = 'I';
-    dbg[p++] = (char)('0' + (dg.inited ? 1 : 0));
-    dbg[p++] = ' ';
-    dbg[p++] = 'P';
-    dbg[p++] = (char)('0' + (dg.pc0 ? 1 : 0));
-    dbg[p++] = ' ';
-    dbg[p++] = 'R';
-    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.reads));
-    dbg[p++] = ' ';
-    dbg[p++] = 'C';
-    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], dg.forced));
-    dbg[p++] = ' ';
-    dbg[p++] = 'S';
-    dbg[p++] = (char)('0' + (scope_hw_last_status() % 10u));
-    dbg[p++] = ' ';
-    dbg[p++] = 'F';
-    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_frame_count()));
-    dbg[p++] = ' ';
-    dbg[p++] = 'W';
-    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], scope_hw_wait_count()));
-    dbg[p] = '\0';
-    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u), dbg, RGB565(255, 255, 255), grid_bg, 1);
 
-    p = 0;
-    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r0));
-    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r1));
-    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.r2));
-    dbg[p++] = ' ';
+    /* Window spreads say the capture path carries signal; the roll point span
+     * (p=) says the same for the paced sampler — a single repeated value there
+     * means the engine is handing back a window it never refreshed. N counts
+     * points, so a frozen sampler is visible even when the span looks sane. */
+    p = (uint8_t)(p + ui_dbg_str(&dbg[p], "ch1="));
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smin));
     dbg[p++] = '-';
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax));
-    dbg[p++] = ' ';
-    dbg[p++] = 'b';
+    p = (uint8_t)(p + ui_dbg_str(&dbg[p], " ch2="));
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smin2));
     dbg[p++] = '-';
     p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.smax2));
-    dbg[p++] = ' ';
-    dbg[p++] = 'D';
-    dbg[p++] = (char)('0' + (dg.dup ? 1 : 0));
-    dbg[p++] = ' ';
-    dbg[p++] = 'A';
-    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.sweep_val));
-    dbg[p++] = (char)(dg.sweep_hit ? '!' : '.');
-    dbg[p++] = ' ';
-    dbg[p++] = 'Q';
-    for (uint8_t i = 0; i < 5u; ++i) {
-        p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.cst[i]));
-    }
-    dbg[p++] = ' ';
-    dbg[p++] = 'X';
-    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.fe_idx));
-    dbg[p++] = 'Y';
-    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.fe_idx_b));
+    p = (uint8_t)(p + ui_dbg_str(&dbg[p], " p="));
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.slow_min));
+    dbg[p++] = '-';
+    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], dg.slow_max));
+    p = (uint8_t)(p + ui_dbg_str(&dbg[p], " N"));
+    p = (uint8_t)(p + ui_dbg_dec(&dbg[p], (uint16_t)dg.slow_points));
     dbg[p] = '\0';
     lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, RGB565(255, 255, 255), grid_bg, 1);
 
     if (!dg.v04_id) {
-        /* Warm boot: the FPGA is already configured, so the config port is
-         * silent (Exp L) and every V0.4 read returns zeros. Say so instead
-         * of hiding the lines, and keep the engine verdict visible. */
-        uint8_t eng_ok = (dg.pc0 || dg.reads > dg.forced);
-        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u),
-                 "V:SILENT (FPGA configured - warm boot)",
+        /* Two ways to get here. dg.warm = the warm-boot token was intact, so
+         * we deliberately never touched the config port and the FPGA still
+         * runs the design a previous boot uploaded. Otherwise we did try to
+         * configure and the port answered zeros — which is what a configured
+         * part does (Exp L), i.e. a warm boot we failed to recognise. */
+        uint8_t eng_ok = (dg.pc0 || dg.reads > dg.forced || dg.slow_points);
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u),
+                 dg.warm ? "V:KEPT (warm boot, port not touched)"
+                         : "V:SILENT (FPGA configured - warm boot)",
                  RGB565(160, 160, 160), grid_bg, 1);
-        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 33u),
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u),
                  eng_ok ? "ENG:RUN" : "ENG:DEAD",
                  eng_ok ? RGB565(0, 255, 0) : RGB565(255, 80, 80), grid_bg, 1);
     }
     if (dg.v04_id) {
-        p = 0;
-        dbg[p++] = 'V';
-        for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
-            p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_id >> sh)));
-        }
-        dbg[p++] = ' ';
-        dbg[p++] = 'B';
-        for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
-            p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_stb >> sh)));
-        }
-        dbg[p++] = ' ';
-        dbg[p++] = 'A';
-        for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
-            p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_sta >> sh)));
-        }
-        dbg[p] = '\0';
-        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u), dbg, RGB565(255, 255, 0), grid_bg, 1);
-
-        /* Line 4: automatic verdicts. The 0x80 first-window marker can land
-         * on the top byte of any of the 32-bit reads (and on cst[0]), so all
-         * comparisons strip bit 31 / bit 7. */
+        /* The 0x80 first-window marker can land on the top byte of any of the
+         * 32-bit reads (and on cst[0]), so all comparisons strip bit 31 /
+         * bit 7. */
         {
             static const uint8_t cst_ok[5] = {0x00u, 0x01u, 0x42u, 0x2Eu, 0x2Eu};
             const uint16_t ok_c = RGB565(0, 255, 0);
@@ -6261,7 +6290,10 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
             uint8_t id_ok = (id_m == 0x0120681Bu);
             uint8_t cold = (stb_m == 0x00039020u);
             uint8_t cfg_ok = (sta_m == 0x0003F460u);
-            uint8_t eng_ok = (dg.pc0 || dg.reads > dg.forced);
+            /* Roll mode never does a full window read, so reads/forced both
+             * stay 0 there — count the paced sampler as engine activity or
+             * the verdict reads DEAD on a perfectly live engine. */
+            uint8_t eng_ok = (dg.pc0 || dg.reads > dg.forced || dg.slow_points);
             tok[0] = id_ok ? "ID:OK" : "ID:BAD";
             col[0] = id_ok ? ok_c : bad_c;
             tok[1] = cold ? "COLD" : "WARM";
@@ -6282,13 +6314,35 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
             col[4] = eng_ok ? ok_c : bad_c;
             uint16_t vx = (uint16_t)(gx + 4u);
             for (uint8_t i = 0; i < 5u; ++i) {
-                lcd_text(vx, (uint16_t)(gy + 33u), tok[i], col[i], grid_bg, 1);
+                lcd_text(vx, (uint16_t)(gy + 3u), tok[i], col[i], grid_bg, 1);
                 vx = (uint16_t)(vx + lcd_text_width(tok[i], 1) + 6u);
             }
-            /* Line 5: expected reference values, for on-screen comparison. */
-            lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 43u),
-                     "exp B=00039020 A=0003F460 Q=0001422E2E",
-                     RGB565(160, 160, 160), grid_bg, 1);
+
+            /* Raw status words and the crib to compare them against, shown
+             * only when a verdict is off — Q:BAD alone does not count, it has
+             * been the known-normal state since 2026-08-13 (r1=00 vs stock's
+             * 01) and never blocked capture. */
+            if (!id_ok || !cold || !cfg_ok) {
+                p = 0;
+                dbg[p++] = 'V';
+                for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
+                    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_id >> sh)));
+                }
+                p = (uint8_t)(p + ui_dbg_str(&dbg[p], " B"));
+                for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
+                    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_stb >> sh)));
+                }
+                p = (uint8_t)(p + ui_dbg_str(&dbg[p], " A"));
+                for (int8_t sh = 24; sh >= 0; sh = (int8_t)(sh - 8)) {
+                    p = (uint8_t)(p + ui_dbg_hex(&dbg[p], (uint8_t)(dg.v04_sta >> sh)));
+                }
+                dbg[p] = '\0';
+                lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u), dbg,
+                         RGB565(255, 255, 0), grid_bg, 1);
+                lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 33u),
+                         "exp B=00039020 A=0003F460",
+                         RGB565(160, 160, 160), grid_bg, 1);
+            }
         }
     }
 }

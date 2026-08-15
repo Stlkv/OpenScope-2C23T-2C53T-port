@@ -50,6 +50,18 @@ enum {
 #define FPGA53_V04_CONFIG 0
 #endif
 
+/* Skip configuration when the FPGA already carries this build's bitstream
+ * (warm boot). Set to 0 for an A/B run against the old unconditional
+ * behaviour. */
+#ifndef FPGA53_WARM_SKIP
+#define FPGA53_WARM_SKIP 1
+#endif
+
+/* STATUS(0x41) after a configuration that took (DONE_FINAL set) — the value
+ * the overlay calls CFG:OK. Bit 31 is masked off before comparing: the 0x80
+ * first-window marker can land on it. */
+#define FPGA53_STATUS_CFG_OK 0x0003F460u
+
 /* Delay before the post-config SPI3 writes. Stock waits ~600ms between the
  * 0x3A config close and the five config writes (issue-#18 capture); a fresh
  * Gowin design needs PLL lock + internal reset release before its control
@@ -93,6 +105,11 @@ enum {
 
 #ifndef FPGA53_SWAP_ORDER
 #define FPGA53_SWAP_ORDER 0
+#endif
+
+/* Read each window twice, keep the second — stock's anti-tearing scheme. */
+#ifndef FPGA53_PINGPONG
+#define FPGA53_PINGPONG 1
 #endif
 
 #ifndef FPGA53_PRE_CMD
@@ -142,6 +159,60 @@ enum {
 #define FPGA53_DUAL_READ 0
 #endif
 
+/* MCU-side decimation ("slow point"): the capture engine free-runs at its own
+ * ~31 MSa/s and every read hands back the freshest 1023-sample window, so a
+ * single window is one instantaneous level for anything slower than ~30 kHz.
+ * Sampling that level on a timer gives a slow timebase whose rate the MCU
+ * owns outright — no FPGA timing register involved (they are still a stub,
+ * see fpga_write_timing). Averaging a few samples trades nothing away: the
+ * whole window spans 33 us. */
+#ifndef FPGA53_SLOW_POINT_SAMPLES
+#define FPGA53_SLOW_POINT_SAMPLES 8u
+#endif
+
+/* Whether a slow point drains the whole 1023-sample window before releasing
+ * CS. ANSWERED ON THE BENCH 2026-08-15, and the answer is yes, always: the
+ * engine refreshes its window only once one has been fully clocked out. With
+ * short reads the point span over a 256-point block was p=92-92 — one frozen
+ * value, no matter that the sampler was running at 17 kHz; with full reads it
+ * was p=00-94, the real signal. Short reads are kept only as a build knob for
+ * re-testing that claim, never as the operating mode. Cost of a full point:
+ * 531 timer ticks = 1.6 ms for both channels at ~12 MHz SPI. */
+#ifndef FPGA53_SLOW_POINT_FULL
+#define FPGA53_SLOW_POINT_FULL 1
+#endif
+
+/* Timing-register falsification sweep (upstream Step 0: it is NOT proven that
+ * 0x0F/0x10/0x11 change the sample rate). Walks each register through a value
+ * ladder, dwelling a few frames per value, and records the window's shape
+ * metric for every step into a table the DBG dump prints. One bench run with
+ * a periodic input answers it: if any register divides the rate, its rows show
+ * the edge count rising and the period shrinking. */
+/* Sweep stock's one-byte "fast timebase config" instead of the register
+ * ladder. Implies the sweep machinery below. */
+#ifndef FPGA53_SWEEP_TBIDX
+#define FPGA53_SWEEP_TBIDX 0
+#endif
+
+#ifndef FPGA53_SWEEP_TIMING
+#define FPGA53_SWEEP_TIMING FPGA53_SWEEP_TBIDX
+#endif
+
+/* Frames spent on each value. The window catches a random phase of the input
+ * every frame, so a value needs several before its maximum spread means
+ * anything; at ~34 fps a dozen frames is a third of a second, and the whole
+ * 20-value sweep still finishes in under ten seconds. */
+#ifndef FPGA53_SWEEP_TIMING_DWELL
+#define FPGA53_SWEEP_TIMING_DWELL 12u
+#endif
+
+/* Minimum peak-to-peak spread (raw counts) before the window metric is
+ * believed — below this the trace is baseline noise and any "period" would be
+ * noise crossings. */
+#ifndef FPGA53_METRIC_MIN_SPREAD
+#define FPGA53_METRIC_MIN_SPREAD 8u
+#endif
+
 #ifndef FPGA_SPI_BR
 #define FPGA_SPI_BR 2u
 #endif
@@ -152,6 +223,18 @@ static uint8_t fpga53_ch_buf[FPGA53_CH_SAMPLES];
 static uint16_t fpga53_notready_polls;
 static uint8_t fpga53_force_read;
 static uint8_t fpga53_cfg01_started;
+/* SPI3 is shared between the main-loop window read and the timer-paced slow
+ * point sampler, which runs from the TMR1 IRQ. The sampler backs off whenever
+ * the main loop owns the bus rather than interleaving bytes into someone
+ * else's CS window. */
+static volatile uint8_t fpga53_bus_busy;
+/* Defined with the DMA sampler further down; the window read needs these to
+ * move a window without a byte loop, and to reclaim the bus from an in-flight
+ * roll transfer. */
+static void fpga53_dma_cancel(void);
+static void fpga53_dma_arm(uint16_t count);
+static uint8_t fpga53_dma_complete(void);
+static void fpga53_dma_stop(void);
 static fpga53_diag_t fpga53_diag = { .fe_idx = 0xFFu, .fe_idx_b = 0xFFu };
 
 void fpga53_note_configure(void) {
@@ -271,7 +354,20 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->v04_id = fpga53_diag.v04_id;
     d->v04_stb = fpga53_diag.v04_stb;
     d->v04_sta = fpga53_diag.v04_sta;
+    d->warm = fpga53_diag.warm;
     d->pose_calls = fpga53_diag.pose_calls;
+    d->win_edges = fpga53_diag.win_edges;
+    d->win_period = fpga53_diag.win_period;
+    d->slow_points = fpga53_diag.slow_points;
+    d->slow_busy = fpga53_diag.slow_busy;
+    d->slow_min = fpga53_diag.slow_min;
+    d->slow_max = fpga53_diag.slow_max;
+    d->slow_full = fpga53_diag.slow_full;
+    d->dma_fail = fpga53_diag.dma_fail;
+    d->tsweep_reg = fpga53_diag.tsweep_reg;
+    d->tsweep_val = fpga53_diag.tsweep_val;
+    d->tsweep_row = fpga53_diag.tsweep_row;
+    d->tsweep_done = fpga53_diag.tsweep_done;
 }
 
 
@@ -289,6 +385,10 @@ void fpga53_get_diag(fpga53_diag_t *d) {
  * 2C53T POWER button, so it must not be driven).
  */
 #include "fpga_bitstream_2c53t.h"
+
+/* 1 = the last upload reached DONE_FINAL, i.e. the part now carries our
+ * design and the warm token may be written. */
+static uint8_t fpga53_cfg_ok;
 
 static uint8_t v04_xfer(uint8_t value) {
     uint8_t result = 0;
@@ -357,6 +457,8 @@ static void fpga53_v04_configure(void) {
     gpio_set(GPIOB_BASE, 1u << 6);
 
     fpga53_diag.v04_sta = v04_read_reg32(0x41000000u);
+    fpga53_cfg_ok =
+        ((fpga53_diag.v04_sta & 0x7FFFFFFFu) == FPGA53_STATUS_CFG_OK) ? 1u : 0u;
     v04_cmd16(0x3A00u); /* CONFIG_DISABLE */
 
     /* Stock fidelity (issue-#18 Saleae decode): after the 3A close, stock
@@ -366,6 +468,80 @@ static void fpga53_v04_configure(void) {
     (void)v04_xfer(0);
     gpio_set(GPIOB_BASE, 1u << 6);
     delay_ms(100);
+}
+
+/* ── Warm boot: keep a configuration we already own ───────────────────────
+ *
+ * The self-update path never resets the FPGA: fw_update.c ends with a direct
+ * `bx` into the freshly written image, and MENU+pinhole is only an MCU reset
+ * — in both cases the FPGA rail stays up and the design we uploaded is still
+ * running. Re-running the V0.4 sequence there cannot help (a configured part
+ * answers the config port with zeros) and can hurt: per upstream Exps L/M,
+ * touching the config port of a configured part desynchronises acquisition.
+ * That is the most likely reason a warm reboot has been showing V/B/A zeros
+ * and no trace, while the same binary works from a cold start.
+ *
+ * So: after a successful configuration, leave a token in RAM saying "this
+ * part carries THIS bitstream"; on the next boot, if the token is intact,
+ * skip config entirely and go straight to the arm writes. The token lives at
+ * the fixed address ORIGIN(RAM) (section .warm_token, see linker.ld) because
+ * the image that writes it and the image that reads it are different builds.
+ *
+ * Two independent invalidators, so a genuine power cycle can never be
+ * mistaken for a warm boot: SRAM loses the token when the rail drops, and the
+ * reset-cause register reports POR (we clear the flags on every boot, so the
+ * flag can only come from the power-on that just happened). The fingerprint
+ * covers the third case — a build whose bitstream differs from the one the
+ * FPGA is actually running.
+ *
+ * The case neither invalidator covers: a brownout deep enough to wipe the
+ * FPGA's SRAM config but not the MCU's. Then the token lies, and the symptom
+ * — WARM=1 with a dead engine — looks exactly like a firmware regression.
+ * Power-cycle first, bisect the code second; that is also why the bench rule
+ * is to keep the battery in place. */
+#define RCC_CSR_REG   REG32(RCC_BASE + 0x24u)
+#define RCC_CSR_RMVF  (1u << 24) /* write 1: clear the reset-cause flags */
+#define RCC_CSR_PORRSTF (1u << 27)
+
+#define WARM_TOKEN_MAGIC 0x53433533u /* "SC53" */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t fingerprint;
+    uint32_t check; /* ~(magic + fingerprint): catches a half-written token */
+} warm_token_t;
+
+__attribute__((section(".warm_token"), used))
+static volatile warm_token_t warm_token;
+
+static uint32_t fpga53_bitstream_fingerprint(void) {
+    uint32_t f = FPGA_H2_CAL_TABLE_SIZE;
+    for (uint32_t i = 0; i < FPGA_H2_CAL_TABLE_SIZE; ++i) {
+        f = ((f << 1) | (f >> 31)) + fpga_h2_cal_table[i];
+    }
+    return f;
+}
+
+static void fpga53_warm_token_write(uint8_t valid, uint32_t fingerprint) {
+    warm_token.magic = valid ? WARM_TOKEN_MAGIC : 0u;
+    warm_token.fingerprint = valid ? fingerprint : 0u;
+    warm_token.check = valid ? ~(WARM_TOKEN_MAGIC + fingerprint) : 0u;
+}
+
+/* 1 = the FPGA is already running this build's bitstream; do not configure. */
+static uint8_t fpga53_warm_boot(uint32_t fingerprint) {
+    uint32_t csr = RCC_CSR_REG;
+    RCC_CSR_REG = csr | RCC_CSR_RMVF; /* arm the flag for the next boot */
+    if (csr & RCC_CSR_PORRSTF) {
+        return 0u;
+    }
+    if (warm_token.magic != WARM_TOKEN_MAGIC) {
+        return 0u;
+    }
+    if (warm_token.check != (uint32_t)~(WARM_TOKEN_MAGIC + warm_token.fingerprint)) {
+        return 0u;
+    }
+    return (warm_token.fingerprint == fingerprint) ? 1u : 0u;
 }
 #endif /* FPGA53_V04_CONFIG */
 
@@ -459,6 +635,9 @@ void fpga_init_once(void) {
     if (fpga_loaded) {
         return;
     }
+    /* Configuration owns the bus outright — the slow-point sampler must not
+     * clock a byte into the middle of the bitstream upload. */
+    fpga53_bus_busy = 1u;
 
     RCC_APB1ENR |= 1u << 15; // SPI3
     AFIO_MAPR = (AFIO_MAPR & ~(7u << 24)) | (2u << 24); // release PB3/PB4/PB5 from JTAG
@@ -479,9 +658,29 @@ void fpga_init_once(void) {
 
 #if FPGA53_V04_CONFIG
     /* Attempt full FPGA configuration (V0.4 sequence) before bringing up
-     * the SPI3 transport. Works from a cold boot if it works at all. */
+     * the SPI3 transport. Works from a cold boot if it works at all — and on
+     * a warm boot it must not run at all, see the warm-token block above. */
     delay_ms(2); // PB11/PC6 settle (stock raises PB11 ~1ms before traffic)
-    fpga53_v04_configure();
+    {
+        uint32_t fingerprint = fpga53_bitstream_fingerprint();
+#if FPGA53_WARM_SEED
+        /* Bench seed build: flashed onto a device whose FPGA is known (from
+         * its own telemetry) to be carrying this bitstream right now, so the
+         * first boot may assume what it cannot yet prove — there is no token
+         * until some build writes one. Still goes through fpga53_warm_boot()
+         * for its side effect (clearing the reset-cause flags), then leaves a
+         * real token so every later boot decides on evidence. */
+        (void)fpga53_warm_boot(fingerprint);
+        fpga53_diag.warm = 1u;
+        fpga53_warm_token_write(1u, fingerprint);
+#elif FPGA53_WARM_SKIP
+        fpga53_diag.warm = fpga53_warm_boot(fingerprint);
+#endif
+        if (!fpga53_diag.warm) {
+            fpga53_v04_configure();
+            fpga53_warm_token_write(fpga53_cfg_ok, fingerprint);
+        }
+    }
 #endif
 
 #if FPGA53_RUN_PINS
@@ -591,9 +790,24 @@ void fpga_init_once(void) {
 
     fpga53_fe_scope_pose_apply();
 
+#ifdef FPGA53_TBIDX_SET
+    /* Stock's one-byte "fast timebase config": the timebase index in its own
+     * CS window. Bench 2026-08-15 found values 0x01-0x03 (and 0x13) change the
+     * capture in a way nothing else has: with them the window catches signal
+     * edges every dwell (max spread 0xB1), where the untouched engine never
+     * caught one in twelve frames (spread 0x04). Whether that is the sample
+     * rate dropping or a trigger aligning the capture is what a known input
+     * frequency has to settle — the window's edge count says which. */
+    gpio_clear(GPIOB_BASE, 1u << 6);
+    (void)fpga53_xfer((uint8_t)FPGA53_TBIDX_SET);
+    gpio_set(GPIOB_BASE, 1u << 6);
+    delay_ms(2);
+#endif
+
     fpga53_notready_polls = 0;
     fpga53_force_read = 0;
     fpga_loaded = 1u;
+    fpga53_bus_busy = 0;
 }
 
 uint8_t fpga_ready(void) {
@@ -678,17 +892,249 @@ void fpga_capture_ready_irq_handler(void) {
 
 static uint32_t fpga53_win_sum[2];
 
+/* Shape of the CH1 window, in the window's own sample units: how many times
+ * the trace crosses its mid level going up, and the mean distance between
+ * those crossings. Sample-rate experiments need a number, not an eyeball —
+ * halve the rate and the period doubles, whatever the volts are doing.
+ * Hysteresis at +-1/8 of the span keeps noise from manufacturing edges. */
+static void fpga53_window_metrics(void) {
+    uint8_t mn = 0xFFu;
+    uint8_t mx = 0;
+    uint8_t hi;
+    uint8_t lo;
+    uint8_t above;
+    uint16_t edges = 0;
+    uint16_t first = 0;
+    uint16_t last = 0;
+
+    for (uint16_t i = 0; i < FPGA53_CH_SAMPLES; ++i) {
+        uint8_t v = fpga53_ch_buf[i];
+        if (v < mn) {
+            mn = v;
+        }
+        if (v > mx) {
+            mx = v;
+        }
+    }
+    if ((uint8_t)(mx - mn) < FPGA53_METRIC_MIN_SPREAD) {
+        fpga53_diag.win_edges = 0;
+        fpga53_diag.win_period = 0;
+        return;
+    }
+
+    hi = (uint8_t)(mn + (((uint16_t)(mx - mn) * 5u) / 8u));
+    lo = (uint8_t)(mn + (((uint16_t)(mx - mn) * 3u) / 8u));
+    above = fpga53_ch_buf[0] >= hi ? 1u : 0u;
+    for (uint16_t i = 1; i < FPGA53_CH_SAMPLES; ++i) {
+        uint8_t v = fpga53_ch_buf[i];
+        if (!above && v >= hi) {
+            above = 1u;
+            if (!edges) {
+                first = i;
+            } else {
+                last = i;
+            }
+            ++edges;
+        } else if (above && v <= lo) {
+            above = 0;
+        }
+    }
+
+    fpga53_diag.win_edges = edges;
+    fpga53_diag.win_period = (edges >= 2u)
+                                 ? (uint16_t)(((uint32_t)(last - first) * 16u) / (edges - 1u))
+                                 : 0u;
+}
+
+/* What the sweep walks.
+ *
+ * FPGA53_SWEEP_TBIDX: stock's "fast timebase config" as described in its own
+ * decompilation — one byte in its own CS window carrying the timebase index,
+ * range 0x00-0x13. This is the cheap candidate for the sample-rate divider we
+ * have been unable to find anywhere else (the SPI3 register story below did
+ * not survive: the stock image contains no 0x26/0x27/0x28 commands and no
+ * evidence for 0x0F/0x10/0x11, see mydevice/STOCK-TIMEBASE-ANALYSIS.md).
+ *
+ * Otherwise: the old two-byte register ladder, kept because it costs nothing
+ * and the machinery is shared. */
+#if FPGA53_SWEEP_TBIDX
+static const uint8_t fpga53_tsweep_regs[] = { 0x00u }; /* unused: writes are one byte */
+static const uint8_t fpga53_tsweep_vals[] = {
+    0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u, 0x08u, 0x09u,
+    0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu, 0x10u, 0x11u, 0x12u, 0x13u,
+};
+#else
+/* 0x06 and 0x07 — the two registers our own arm sequence sets to ZERO and
+ * never thinks about again (`06 00, 07 00`, from the stock capture). The
+ * upstream decompilation names USART commands 0x26 "timebase: prescaler" and
+ * 0x27 "timebase: period"; the offset of 0x20 between those and these looks
+ * like the same registers addressed from the other bus. If that reading is
+ * right, the sample-rate divider has been sitting in our initialisation the
+ * whole time, zeroed on every boot.
+ *
+ * (0x0F/0x10/0x11 stood here until 2026-08-15. Nothing in the stock image
+ * supports them — see mydevice/STOCK-TIMEBASE-ANALYSIS.md — and the one-byte
+ * timebase-index command measured as no-op, so the ladder moved here.) */
+static const uint8_t fpga53_tsweep_regs[] = { 0x06u, 0x07u };
+static const uint8_t fpga53_tsweep_vals[] = {
+    0x00u, 0x01u, 0x02u, 0x04u, 0x08u, 0x10u, 0x20u, 0x40u, 0x80u, 0xFFu,
+};
+#endif
+
+enum {
+    FPGA53_TSWEEP_REGS = (uint8_t)(sizeof(fpga53_tsweep_regs)),
+    FPGA53_TSWEEP_VALS = (uint8_t)(sizeof(fpga53_tsweep_vals)),
+    FPGA53_TSWEEP_ROWS = FPGA53_TSWEEP_REGS * FPGA53_TSWEEP_VALS,
+};
+
+#if FPGA53_SWEEP_TIMING
+static fpga53_tsweep_row_t fpga53_tsweep_rows[FPGA53_TSWEEP_ROWS];
+static fpga53_tsweep_row_t fpga53_tsweep_base;
+static uint8_t fpga53_tsweep_started;
+static uint8_t fpga53_tsweep_dwell;
+
+static void fpga53_tsweep_write(uint8_t row) {
+    uint8_t reg = fpga53_tsweep_regs[row / FPGA53_TSWEEP_VALS];
+    uint8_t val = fpga53_tsweep_vals[row % FPGA53_TSWEEP_VALS];
+
+    fpga53_diag.tsweep_reg = reg;
+    fpga53_diag.tsweep_val = val;
+    gpio_clear(GPIOB_BASE, 1u << 6);
+#if !FPGA53_SWEEP_TBIDX
+    (void)fpga53_xfer(reg);
+#endif
+    (void)fpga53_xfer(val);
+    gpio_set(GPIOB_BASE, 1u << 6);
+}
+
+/* Accumulate over the whole dwell rather than snapshotting the last frame.
+ * A 33 us window on a 220 Hz square almost always sits on a flat part and
+ * only occasionally catches an edge, so a single frame says little; the
+ * MAXIMUM spread across a dwell rises as soon as the window starts spanning
+ * more of the signal, which is the first sign of the rate being divided —
+ * visible long before whole periods fit and edges can be counted. */
+static void fpga53_tsweep_accumulate(fpga53_tsweep_row_t *row) {
+    uint8_t spread = (uint8_t)(fpga53_diag.smax - fpga53_diag.smin);
+    uint8_t edges = fpga53_diag.win_edges > 255u ? 255u : (uint8_t)fpga53_diag.win_edges;
+
+    if (spread > row->spread) {
+        row->spread = spread;
+    }
+    if (edges > row->edges) {
+        row->edges = edges;
+        row->period = fpga53_diag.win_period;
+    }
+}
+#endif
+
+/* Advance the timing sweep by one frame. Row N holds the window metric
+ * measured while row N's (register, value) was in force; the baseline row is
+ * taken before the first write, so a dead engine after some value is visible
+ * as rows going flat and staying flat. */
+static void fpga53_tsweep_step(void) {
+#if FPGA53_SWEEP_TIMING
+    if (fpga53_diag.tsweep_done) {
+        return;
+    }
+    if (!fpga53_tsweep_started) {
+        fpga53_tsweep_accumulate(&fpga53_tsweep_base);
+        if (++fpga53_tsweep_dwell < (uint8_t)FPGA53_SWEEP_TIMING_DWELL) {
+            return; /* baseline gets a full dwell of its own, same as a row */
+        }
+        fpga53_tsweep_started = 1u;
+        fpga53_tsweep_dwell = 0;
+        fpga53_tsweep_write(0);
+        return;
+    }
+    fpga53_tsweep_accumulate(&fpga53_tsweep_rows[fpga53_diag.tsweep_row]);
+    if (++fpga53_tsweep_dwell < (uint8_t)FPGA53_SWEEP_TIMING_DWELL) {
+        return;
+    }
+    fpga53_tsweep_dwell = 0;
+    ++fpga53_diag.tsweep_row;
+    if (fpga53_diag.tsweep_row >= (uint8_t)FPGA53_TSWEEP_ROWS) {
+        fpga53_diag.tsweep_done = 1u;
+        return;
+    }
+    fpga53_tsweep_write(fpga53_diag.tsweep_row);
+#endif
+}
+
+const fpga53_tsweep_row_t *fpga53_tsweep_table(uint8_t *rows) {
+#if FPGA53_SWEEP_TIMING
+    if (rows) {
+        *rows = (uint8_t)FPGA53_TSWEEP_ROWS;
+    }
+    return fpga53_tsweep_rows;
+#else
+    if (rows) {
+        *rows = 0;
+    }
+    return 0;
+#endif
+}
+
+const fpga53_tsweep_row_t *fpga53_tsweep_baseline(void) {
+#if FPGA53_SWEEP_TIMING
+    return &fpga53_tsweep_base;
+#else
+    return 0;
+#endif
+}
+
+void fpga53_tsweep_axes(const uint8_t **regs,
+                        uint8_t *reg_count,
+                        const uint8_t **vals,
+                        uint8_t *val_count) {
+    if (regs) {
+        *regs = fpga53_tsweep_regs;
+    }
+    if (reg_count) {
+        *reg_count = (uint8_t)FPGA53_TSWEEP_REGS;
+    }
+    if (vals) {
+        *vals = fpga53_tsweep_vals;
+    }
+    if (val_count) {
+        *val_count = (uint8_t)FPGA53_TSWEEP_VALS;
+    }
+}
+
+/*
+ * Window read, DMA'd.
+ *
+ * The byte-polled version could not keep up with the engine. It moved 1023
+ * bytes in 341 us at 24 MHz while the FPGA fills its window in 205 us, so the
+ * writer overtook the reader inside every single read and the frame came back
+ * with a seam — on a square wave, a plateau stretched half again with a sharp
+ * dip where the phase jumps. Neither PC0 gating nor stock's ping-pong helped,
+ * because every read tore the same way (bench 2026-08-15).
+ *
+ * Stock clocks SPI3 at 60 MHz and drains a window in 137 us, comfortably
+ * ahead of the fill — that is why its trace is clean. We cannot reach that by
+ * polling (a byte at 48 MHz is 16 core cycles), so the transfer goes to DMA
+ * and the sample post-processing happens afterwards, off the bus, where its
+ * cost no longer races anything.
+ */
 static void fpga53_read_channel(uint8_t opcode) {
     uint8_t rmin = 0xFFu;
     uint8_t rmax = 0;
     uint32_t sum = 0;
+    uint8_t r0, r1, r2;
+    uint32_t guard = FPGA53_XFER_TIMEOUT;
 
     gpio_clear(GPIOB_BASE, 1u << 6); // CS assert
-    uint8_t r0 = fpga53_xfer(opcode);
-    uint8_t r1 = fpga53_xfer(0xFFu);
-    uint8_t r2 = fpga53_xfer(0xFFu);
+    r0 = fpga53_xfer(opcode);
+    r1 = fpga53_xfer(0xFFu);
+    r2 = fpga53_xfer(0xFFu);
+    fpga53_dma_arm(FPGA53_CH_SAMPLES);
+    while (!fpga53_dma_complete() && --guard) {
+    }
+    fpga53_dma_stop();
+    gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
+
     for (uint16_t i = 0; i < FPGA53_CH_SAMPLES; ++i) {
-        uint8_t raw = fpga53_xfer(0xFFu);
+        uint8_t raw = fpga53_ch_buf[i];
         if (raw < rmin) {
             rmin = raw;
         }
@@ -702,7 +1148,6 @@ static void fpga53_read_channel(uint8_t opcode) {
         sum = sum * 31u + raw;
         fpga53_ch_buf[i] = (uint8_t)cal;
     }
-    gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
 
     if (opcode == 0x04u) {
         fpga53_diag.r0 = r0;
@@ -723,6 +1168,11 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
     if (!dst || !fpga_loaded) {
         return 0;
     }
+    fpga53_bus_busy = 1u;
+    /* A roll transfer may still be in flight if the UI just left a slow
+     * timebase: take the bus back rather than clocking a window read into
+     * someone else's CS frame. */
+    fpga53_dma_cancel();
     fpga53_force_read = 0;
     ++fpga53_diag.reads;
 
@@ -768,6 +1218,7 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
     for (uint16_t i = 0; i < len; ++i) {
         dst[i] = fpga53_frame[(uint16_t)(FPGA_SCOPE_BUFFER_BYTES - len + i)];
     }
+    fpga53_bus_busy = 0;
     return 1u;
 #endif
 
@@ -836,11 +1287,32 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
 
     /* 1023 samples per channel, UI expects FPGA_SAMPLE_COUNT (2048)
      * interleaved pairs — stretch 2x (nearest neighbour). */
+    /* Ping-pong: read each window twice and keep the second.
+     *
+     * A single read lands in the middle of the engine refilling its buffer, so
+     * the frame carries a seam — on a square wave it shows up as a plateau
+     * stretched by half again with a sharp dip where the phase jumps (bench
+     * 2026-08-15). Gating on PC0 does not fix it and costs frame rate, which
+     * matches what the bench found back on 08-13.
+     *
+     * Stock solves this by queueing TWO reads back to back and its own
+     * decompilation names the scheme "ping-pong, prevents display tearing".
+     * The mechanism fits what we measured: the first read drains the window
+     * and re-arms the engine, the refill takes 205 us, and the second read
+     * starts ~350 us later — after the buffer is whole again. */
+#if FPGA53_PINGPONG
 #if FPGA53_SWAP_ORDER
     fpga53_read_channel(0x05u);
 #else
     fpga53_read_channel(0x04u);
 #endif
+#endif
+#if FPGA53_SWAP_ORDER
+    fpga53_read_channel(0x05u);
+#else
+    fpga53_read_channel(0x04u);
+#endif
+    fpga53_window_metrics();
     for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
         uint16_t src = (uint16_t)(i >> 1);
         if (src >= FPGA53_CH_SAMPLES) {
@@ -848,6 +1320,13 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
         }
         fpga53_frame[(uint16_t)(i * 2u)] = fpga53_ch_buf[src];
     }
+#if FPGA53_PINGPONG
+#if FPGA53_SWAP_ORDER
+    fpga53_read_channel(0x04u);
+#else
+    fpga53_read_channel(0x05u);
+#endif
+#endif
 #if FPGA53_SWAP_ORDER
     fpga53_read_channel(0x04u);
 #else
@@ -861,18 +1340,296 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
         fpga53_frame[(uint16_t)(i * 2u + 1u)] = fpga53_ch_buf[src];
     }
 
+    fpga53_tsweep_step();
+
     if (len > FPGA_SCOPE_BUFFER_BYTES) {
         len = FPGA_SCOPE_BUFFER_BYTES;
     }
     for (uint16_t i = 0; i < len; ++i) {
         dst[i] = fpga53_frame[(uint16_t)(FPGA_SCOPE_BUFFER_BYTES - len + i)];
     }
+    fpga53_bus_busy = 0;
     return 1u;
 }
 
+/* One point of the MCU-paced slow timebase: the mean of the first few samples
+ * of the current window, per channel. Called from the TMR1 IRQ, so it stays
+ * short and gives the bus up rather than waiting for it. */
+static uint8_t fpga53_slow_full = FPGA53_SLOW_POINT_FULL;
+
+void fpga53_slow_point_set_full(uint8_t full) {
+    fpga53_slow_full = full ? 1u : 0u;
+    fpga53_diag.slow_full = fpga53_slow_full;
+}
+
+static uint8_t fpga53_read_point_channel(uint8_t opcode) {
+    uint16_t take = (uint16_t)FPGA53_SLOW_POINT_SAMPLES;
+    uint32_t sum = 0;
+    int16_t cal;
+
+    if (take > FPGA53_CH_SAMPLES) {
+        take = FPGA53_CH_SAMPLES;
+    }
+
+    gpio_clear(GPIOB_BASE, 1u << 6); // CS assert
+    (void)fpga53_xfer(opcode);
+    (void)fpga53_xfer(0xFFu);
+    (void)fpga53_xfer(0xFFu);
+    for (uint16_t i = 0; i < take; ++i) {
+        sum += fpga53_xfer(0xFFu);
+    }
+    if (fpga53_slow_full) {
+        /* Drain the rest of the window so the engine sees exactly the byte
+         * count of a normal read — the candidate condition for it to refresh
+         * the window at all. */
+        for (uint16_t i = take; i < FPGA53_CH_SAMPLES; ++i) {
+            (void)fpga53_xfer(0xFFu);
+        }
+    }
+    gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
+
+    cal = (int16_t)(sum / take) - (int16_t)FPGA53_ADC_OFFSET;
+    if (cal < 0) {
+        cal = 0;
+    }
+    return (uint8_t)cal;
+}
+
+/* Span of the CH1 points over a block: if the sampler is handing back a frozen
+ * window, this collapses to a couple of counts no matter what the input does,
+ * which separates "no signal in the points" from "wrong timebase" without
+ * needing a photograph of the screen. */
+static void fpga53_slow_track(uint8_t v) {
+    static uint8_t mn = 0xFFu;
+    static uint8_t mx;
+    static uint16_t n;
+
+    if (v < mn) {
+        mn = v;
+    }
+    if (v > mx) {
+        mx = v;
+    }
+    if (++n >= 256u) {
+        fpga53_diag.slow_min = mn;
+        fpga53_diag.slow_max = mx;
+        mn = 0xFFu;
+        mx = 0;
+        n = 0;
+    }
+}
+
+/*
+ * DMA sampler.
+ *
+ * A polled point costs 0.97 ms of CPU at 24 MHz (measured: cost=97 ticks of
+ * 10 us), and that is CPU the UI and the USB volume do not get — at 40% duty
+ * the host could not even mount the volume. The transfer itself is only going
+ * to get so short; what has to go is the CPU sitting in a byte loop waiting
+ * for it.
+ *
+ * So each window goes out over DMA2 (channel 1 receives into the sample
+ * buffer, channel 2 feeds 0xFF out — the same controller stock drives for
+ * SPI3), and the point is assembled across two pacer ticks: one tick starts a
+ * channel's transfer and returns in microseconds, the next collects it and
+ * starts the other channel. The pacer therefore runs at twice the point rate
+ * (see scope_hw_slow_start), and no DMA interrupt vector is needed — which
+ * matters, because the vector numbering on this AT32 clone is not something
+ * we have documentation for.
+ *
+ * If a transfer never completes (wrong channel mapping being the obvious
+ * risk), the watchdog below gives up after a few ticks and falls back to
+ * polled reads permanently, so a bad guess degrades to yesterday's behaviour
+ * instead of a dead sampler. fpga53_diag.dma_fail says which mode is live.
+ */
+/* How many samples of the window a point clocks out. MEASURED, do not shorten:
+ * the engine refreshes its window only when the WHOLE frame has been drained.
+ * A 512-sample drain (half the window) was tried on the bench 2026-08-15 and
+ * the point span collapsed to p=92-93 — one frozen value — against p=00-94
+ * with the full 1023. So it is the frame that re-arms the engine, not a byte
+ * count, and this transfer cannot be made cheaper by asking for less of it. */
+#ifndef FPGA53_DRAIN_SAMPLES
+#define FPGA53_DRAIN_SAMPLES FPGA53_CH_SAMPLES
+#endif
+
+enum {
+    FPGA53_DMA_RX_CH = 1u, /* SPI3_RX */
+    FPGA53_DMA_TX_CH = 2u, /* SPI3_TX */
+    FPGA53_DMA_TCIF_RX = 1u << 1, /* TCIF1 */
+    FPGA53_DMA_CCR_EN = 1u << 0,
+    FPGA53_DMA_CCR_DIR_M2P = 1u << 4,
+    FPGA53_DMA_CCR_MINC = 1u << 7,
+    FPGA53_DMA_CCR_PL_HIGH = 2u << 12,
+    FPGA53_SPI_RXDMAEN = 1u << 0,
+    FPGA53_SPI_TXDMAEN = 1u << 1,
+    FPGA53_DMA_WATCHDOG_TICKS = 8u,
+
+    FPGA53_PT_IDLE = 0u,
+    FPGA53_PT_CH_A = 1u,
+    FPGA53_PT_CH_B = 2u,
+};
+
+static uint8_t fpga53_dma_tx_pattern = 0xFFu;
+static uint8_t fpga53_pt_state;
+static uint8_t fpga53_pt_wait;
+static uint8_t fpga53_pt_first;
+static uint8_t fpga53_dma_polled; /* 1 = watchdog tripped, stay on polled reads */
+
+static void fpga53_dma_stop(void) {
+    DMA2_CCR(FPGA53_DMA_RX_CH) = 0;
+    DMA2_CCR(FPGA53_DMA_TX_CH) = 0;
+    SPI_CTRL2(SPI3_BASE) &= ~(FPGA53_SPI_RXDMAEN | FPGA53_SPI_TXDMAEN);
+    DMA2_IFCR = 0x0FFu; /* channels 1-2 flags */
+}
+
+/* Program both channels for <count> bytes into fpga53_ch_buf and let them go.
+ * CS and the opcode are the caller's business — the window read frames its own
+ * transfer, and the roll sampler frames a different one. */
+static void fpga53_dma_arm(uint16_t count) {
+    RCC_AHBENR |= 1u << 1; // DMA2
+
+    fpga53_dma_stop();
+    DMA2_CPAR(FPGA53_DMA_RX_CH) = (uint32_t)(uintptr_t)&SPI_DT(SPI3_BASE);
+    DMA2_CMAR(FPGA53_DMA_RX_CH) = (uint32_t)(uintptr_t)fpga53_ch_buf;
+    DMA2_CNDTR(FPGA53_DMA_RX_CH) = count;
+    DMA2_CPAR(FPGA53_DMA_TX_CH) = (uint32_t)(uintptr_t)&SPI_DT(SPI3_BASE);
+    DMA2_CMAR(FPGA53_DMA_TX_CH) = (uint32_t)(uintptr_t)&fpga53_dma_tx_pattern;
+    DMA2_CNDTR(FPGA53_DMA_TX_CH) = count;
+    /* Receive side first: the byte that arrives is the answer to the byte the
+     * transmit side is about to clock out, so it must already be armed. */
+    DMA2_CCR(FPGA53_DMA_RX_CH) = FPGA53_DMA_CCR_MINC | FPGA53_DMA_CCR_PL_HIGH |
+                                 FPGA53_DMA_CCR_EN;
+    DMA2_CCR(FPGA53_DMA_TX_CH) = FPGA53_DMA_CCR_DIR_M2P | FPGA53_DMA_CCR_EN;
+    SPI_CTRL2(SPI3_BASE) |= FPGA53_SPI_RXDMAEN | FPGA53_SPI_TXDMAEN;
+}
+
+static void fpga53_dma_start(uint8_t opcode) {
+    gpio_clear(GPIOB_BASE, 1u << 6); // CS assert, held for the whole window
+    (void)fpga53_xfer(opcode);
+    (void)fpga53_xfer(0xFFu);
+    (void)fpga53_xfer(0xFFu);
+    fpga53_dma_arm(FPGA53_DRAIN_SAMPLES);
+}
+
+static uint8_t fpga53_dma_complete(void) {
+    return (DMA2_ISR & FPGA53_DMA_TCIF_RX) ? 1u : 0u;
+}
+
+/* Close out a finished transfer and return the point value: the mean of the
+ * first samples, calibrated like the fast path. */
+static uint8_t fpga53_dma_collect(void) {
+    uint16_t take = (uint16_t)FPGA53_SLOW_POINT_SAMPLES;
+    uint32_t sum = 0;
+    int16_t cal;
+
+    fpga53_dma_stop();
+    gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
+
+    if (take > FPGA53_CH_SAMPLES) {
+        take = FPGA53_CH_SAMPLES;
+    }
+    for (uint16_t i = 0; i < take; ++i) {
+        sum += fpga53_ch_buf[i];
+    }
+    cal = (int16_t)(sum / take) - (int16_t)FPGA53_ADC_OFFSET;
+    if (cal < 0) {
+        cal = 0;
+    }
+    return (uint8_t)cal;
+}
+
+/* Drop an in-flight transfer and release the bus, leaving the sampler ready to
+ * start a fresh point. Safe to call when nothing is in flight. */
+static void fpga53_dma_cancel(void) {
+    if (fpga53_pt_state == FPGA53_PT_IDLE) {
+        return;
+    }
+    fpga53_dma_stop();
+    gpio_set(GPIOB_BASE, 1u << 6);
+    fpga53_pt_state = FPGA53_PT_IDLE;
+}
+
+static void fpga53_dma_give_up(void) {
+    fpga53_dma_stop();
+    gpio_set(GPIOB_BASE, 1u << 6);
+    fpga53_pt_state = FPGA53_PT_IDLE;
+    fpga53_dma_polled = 1u;
+    fpga53_diag.dma_fail = 1u;
+}
+
+/* Returns 1 when sample[] holds a finished point. A 0 means "not this tick" —
+ * with the DMA sampler that is the normal case on half the ticks, not an
+ * error. */
 uint8_t fpga_capture_read_slow_point(uint8_t sample[2]) {
-    (void)sample;
-    return 0;
+    if (!sample || !fpga_loaded) {
+        return 0;
+    }
+    if (fpga53_bus_busy) {
+        ++fpga53_diag.slow_busy;
+        return 0;
+    }
+
+    if (fpga53_dma_polled) {
+        fpga53_bus_busy = 1u;
+#if FPGA53_SWAP_ORDER
+        sample[0] = fpga53_read_point_channel(0x05u);
+        sample[1] = fpga53_read_point_channel(0x04u);
+#else
+        sample[0] = fpga53_read_point_channel(0x04u);
+        sample[1] = fpga53_read_point_channel(0x05u);
+#endif
+        fpga53_slow_track(sample[0]);
+        ++fpga53_diag.slow_points;
+        fpga53_bus_busy = 0;
+        return 1u;
+    }
+
+#if FPGA53_SWAP_ORDER
+    const uint8_t op_a = 0x05u, op_b = 0x04u;
+#else
+    const uint8_t op_a = 0x04u, op_b = 0x05u;
+#endif
+
+    /* NB: an in-flight transfer is NOT signalled through fpga53_bus_busy. That
+     * flag means "the main loop owns the bus", and holding it across ticks
+     * made every following tick bail out at the check above — the state
+     * machine advanced once and stopped (bench 2026-08-15: ROLL n=1). The
+     * transfer's own state lives in fpga53_pt_state, and fpga_capture_read
+     * cancels it if the main loop ever needs the bus mid-flight. */
+    switch (fpga53_pt_state) {
+    case FPGA53_PT_IDLE:
+        fpga53_pt_wait = 0;
+        fpga53_dma_start(op_a);
+        fpga53_pt_state = FPGA53_PT_CH_A;
+        return 0;
+
+    case FPGA53_PT_CH_A:
+        if (!fpga53_dma_complete()) {
+            if (++fpga53_pt_wait >= FPGA53_DMA_WATCHDOG_TICKS) {
+                fpga53_dma_give_up();
+            }
+            return 0;
+        }
+        fpga53_pt_first = fpga53_dma_collect();
+        fpga53_pt_wait = 0;
+        fpga53_dma_start(op_b);
+        fpga53_pt_state = FPGA53_PT_CH_B;
+        return 0;
+
+    default:
+        if (!fpga53_dma_complete()) {
+            if (++fpga53_pt_wait >= FPGA53_DMA_WATCHDOG_TICKS) {
+                fpga53_dma_give_up();
+            }
+            return 0;
+        }
+        sample[0] = fpga53_pt_first;
+        sample[1] = fpga53_dma_collect();
+        fpga53_pt_state = FPGA53_PT_IDLE;
+        fpga53_slow_track(sample[0]);
+        ++fpga53_diag.slow_points;
+        return 1u;
+    }
 }
 
 #else /* !HW_TARGET_2C53T */

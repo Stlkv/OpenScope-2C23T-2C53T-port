@@ -63,6 +63,17 @@
 #define FSMC_BWTR1  REG32(FSMC_BASE + 0x104u)
 #define FSMC_WPCR1  REG32(FSMC_BASE + 0x220u)
 
+/* DMA2 drives the SPI3 window reads (stock uses DMA2 channel 1 for SPI3 too —
+ * 29 DMA2 register writes in its master init, SCOPE_ACQUISITION_BUGS.md).
+ * Channel N registers sit at 0x08 + 20*(N-1) from the controller base. */
+#define DMA2_BASE   0x40020400u
+#define DMA2_ISR    REG32(DMA2_BASE + 0x00u)
+#define DMA2_IFCR   REG32(DMA2_BASE + 0x04u)
+#define DMA2_CCR(ch)    REG32(DMA2_BASE + 0x08u + 20u * ((ch) - 1u))
+#define DMA2_CNDTR(ch)  REG32(DMA2_BASE + 0x0Cu + 20u * ((ch) - 1u))
+#define DMA2_CPAR(ch)   REG32(DMA2_BASE + 0x10u + 20u * ((ch) - 1u))
+#define DMA2_CMAR(ch)   REG32(DMA2_BASE + 0x14u + 20u * ((ch) - 1u))
+
 #define DMA_ISR     REG32(DMA1_BASE + 0x00u)
 #define DMA_IFCR    REG32(DMA1_BASE + 0x04u)
 #define DMA_CCR1    REG32(DMA1_BASE + 0x08u)
@@ -96,6 +107,7 @@
 #define TMR_EG(base)    REG32((base) + 0x14u)
 #define TMR_CCM1(base)  REG32((base) + 0x18u)
 #define TMR_CCEN(base)  REG32((base) + 0x20u)
+#define TMR_CVAL(base)  REG32((base) + 0x24u)
 #define TMR_PSC(base)   REG32((base) + 0x28u)
 #define TMR_PR(base)    REG32((base) + 0x2Cu)
 #define TMR_C1DT(base)  REG32((base) + 0x34u)

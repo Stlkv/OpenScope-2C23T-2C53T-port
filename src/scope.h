@@ -22,6 +22,12 @@ uint8_t scope_hw_slow_snapshot(uint8_t *ch1,
                                uint16_t *count,
                                uint16_t *seq);
 void scope_hw_slow_irq_handler(void);
+/* What the roll pacer is actually programmed with, plus what a point really
+ * costs: the timer clock is an assumption (see SCOPE_SLOW_TIMER_CLK_HZ), and
+ * cost/over say whether the sampler is keeping the pace it was asked for.
+ * cost is in timer ticks and only counts reads that fit inside their
+ * interval; over counts the ones that did not. */
+void scope_hw_slow_timer_debug(uint16_t *psc, uint16_t *pr, uint16_t *cost, uint16_t *over);
 uint8_t scope_hw_ready(void);
 uint8_t scope_hw_enabled(void);
 uint16_t scope_hw_frame_count(void);

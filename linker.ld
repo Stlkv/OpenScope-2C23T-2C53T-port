@@ -26,6 +26,16 @@ SECTIONS
     *(.ARM.extab*)
   }
 
+  /* Survives an MCU reset and the updater's direct jump into the new image,
+   * and must land at the SAME address in every build (the writer and the
+   * reader are two different firmware images). Hence: first thing in RAM,
+   * ahead of .data, and never touched by the startup code. */
+  .warm_token ORIGIN(RAM) (NOLOAD) :
+  {
+    KEEP(*(.warm_token))
+    . = ALIGN(8);
+  } > RAM
+
   .data :
   {
     __data_load = LOADADDR(.data);
