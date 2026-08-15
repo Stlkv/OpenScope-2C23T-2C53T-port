@@ -15,17 +15,9 @@
  * this text. Everything the LCD debug overlay shows, plus raw GPIO/SPI state,
  * readable without buttons or screenshots. */
 
-/* Sweep builds trade the roll and pin-state lines for the sweep table: the app
- * is at the 224 KB self-update ceiling and cannot carry both.
- * NB: this default must mirror fpga.c's — when it did not, a sweep build ran
- * the sweep and printed nothing, which reads exactly like a negative result
- * (bench 2026-08-15). */
-#ifndef FPGA53_SWEEP_TBIDX
-#define FPGA53_SWEEP_TBIDX 0
-#endif
-#ifndef FPGA53_SWEEP_TIMING
-#define FPGA53_SWEEP_TIMING FPGA53_SWEEP_TBIDX
-#endif
+/* Sweep builds trade the roll and pin-state lines for the sweep table.
+ * The flags themselves live in fpga.h — see the note there for what happened
+ * when this file kept its own copy of their defaults. */
 
 static uint16_t put_str(char *dst, uint16_t cap, uint16_t p, const char *s) {
     while (*s && p < cap) {

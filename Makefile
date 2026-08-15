@@ -174,6 +174,18 @@ release-2c53t-seam:
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-SEAM-08007000.bin
 	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-SEAM-08007000.bin
 
+# The timebase-index sweep in the form stock actually sends it: the two-byte
+# command `01 <idx>` over indices 0x00-0x13, results in DBG.TXT under TSW.
+# The 2026-08-15 sweep sent the index as a bare byte with no command in front
+# and measured a no-op. Feed a periodic signal with several periods in the
+# window (50 kHz gives ten) and keep a fast timebase.
+release-2c53t-tb01:
+	rm -rf $(BUILD_ROOT)/2c53t
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_SWEEP_TB01=1 -DFPGA53_SWEEP_TIMING_DWELL=16 $(SCOPE53_EXTRA)"
+	@mkdir -p $(DIST)
+	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-TB01-08007000.bin
+	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-TB01-08007000.bin
+
 # Same, plus the timing-register falsification sweep (0x0F/0x10/0x11 ladder,
 # results in DBG.TXT under TSW). Feed it a periodic signal before reading.
 release-2c53t-tsweep:

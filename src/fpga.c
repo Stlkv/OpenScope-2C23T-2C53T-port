@@ -190,18 +190,6 @@ enum {
  * the edge count rising and the period shrinking. */
 /* Sweep stock's one-byte "fast timebase config" instead of the register
  * ladder. Implies the sweep machinery below. */
-#ifndef FPGA53_SWEEP_TBIDX
-#define FPGA53_SWEEP_TBIDX 0
-#endif
-
-#ifndef FPGA53_SWEEP_TIMING
-#define FPGA53_SWEEP_TIMING FPGA53_SWEEP_TBIDX
-#endif
-
-/* Frames spent on each value. The window catches a random phase of the input
- * every frame, so a value needs several before its maximum spread means
- * anything; at ~34 fps a dozen frames is a third of a second, and the whole
- * 20-value sweep still finishes in under ten seconds. */
 #ifndef FPGA53_SWEEP_TIMING_DWELL
 #define FPGA53_SWEEP_TIMING_DWELL 12u
 #endif
@@ -969,6 +957,12 @@ static uint32_t fpga53_win_sum[2];
  * those crossings. Sample-rate experiments need a number, not an eyeball —
  * halve the rate and the period doubles, whatever the volts are doing.
  * Hysteresis at +-1/8 of the span keeps noise from manufacturing edges. */
+/* Honours the same head/tail trim as the renderer and the seam analyser.
+ * It did not until 2026-08-16, and the cost was visible: a glitch in the
+ * contaminated head adds spurious crossings, which inflates the edge count and
+ * deflates the mean period, so the same 50 kHz input reported T16=1478 in one
+ * dump and 1600 in the next. A metric that disagrees with itself between dumps
+ * cannot be the thing a sweep is judged by. */
 static void fpga53_window_metrics(void) {
     uint8_t mn = 0xFFu;
     uint8_t mx = 0;
@@ -979,7 +973,8 @@ static void fpga53_window_metrics(void) {
     uint16_t first = 0;
     uint16_t last = 0;
 
-    for (uint16_t i = 0; i < FPGA53_CH_SAMPLES; ++i) {
+    for (uint16_t i = FPGA53_HEAD_SKIP; i < FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP;
+         ++i) {
         uint8_t v = fpga53_ch_buf[i];
         if (v < mn) {
             mn = v;
@@ -996,8 +991,9 @@ static void fpga53_window_metrics(void) {
 
     hi = (uint8_t)(mn + (((uint16_t)(mx - mn) * 5u) / 8u));
     lo = (uint8_t)(mn + (((uint16_t)(mx - mn) * 3u) / 8u));
-    above = fpga53_ch_buf[0] >= hi ? 1u : 0u;
-    for (uint16_t i = 1; i < FPGA53_CH_SAMPLES; ++i) {
+    above = fpga53_ch_buf[FPGA53_HEAD_SKIP] >= hi ? 1u : 0u;
+    for (uint16_t i = FPGA53_HEAD_SKIP + 1u;
+         i < FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP; ++i) {
         uint8_t v = fpga53_ch_buf[i];
         if (!above && v >= hi) {
             above = 1u;
@@ -1294,7 +1290,14 @@ void fpga53_seam_band(uint8_t *vmin, uint8_t *vmax, uint8_t *hi, uint8_t *lo) {
  *
  * Otherwise: the old two-byte register ladder, kept because it costs nothing
  * and the machinery is shared. */
-#if FPGA53_SWEEP_TBIDX
+#if FPGA53_SWEEP_TB01
+/* The command stock actually sends: 0x01 then the timebase index. */
+static const uint8_t fpga53_tsweep_regs[] = { 0x01u };
+static const uint8_t fpga53_tsweep_vals[] = {
+    0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u, 0x08u, 0x09u,
+    0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu, 0x10u, 0x11u, 0x12u, 0x13u,
+};
+#elif FPGA53_SWEEP_TBIDX
 static const uint8_t fpga53_tsweep_regs[] = { 0x00u }; /* unused: writes are one byte */
 static const uint8_t fpga53_tsweep_vals[] = {
     0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u, 0x08u, 0x09u,

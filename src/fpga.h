@@ -104,6 +104,28 @@ enum {
     FPGA53_FRAME_VALID = FPGA53_WINDOW_VALID * 2,
 };
 
+/* Sweep flags. Same rule as the seam flag below: defined once, in the header
+ * both fpga.c and dbgdump.c include. fpga.c and dbgdump.c each used to carry a
+ * private copy of FPGA53_SWEEP_TIMING's default, the two drifted, and a bench
+ * run executed the sweep while printing nothing (2026-08-15).
+ *
+ * FPGA53_SWEEP_TB01 walks the TWO-BYTE command `01 <idx>` over the timebase
+ * indices 0x00-0x13. Stock's own auto-timebase does exactly this — hold an
+ * index for LUT[idx]+0x32 ticks, then step — with the dwell table extracted
+ * from the stock image at 0x0804D833 (base 0x08007000): 1 for indices 0-13,
+ * then 3, 5, 9, 21, 41, 82. Our 2026-08-15 sweep sent the index as a BARE
+ * byte with no command in front of it and measured a no-op, which is the
+ * expected result for a malformed command. */
+#ifndef FPGA53_SWEEP_TBIDX
+#define FPGA53_SWEEP_TBIDX 0
+#endif
+#ifndef FPGA53_SWEEP_TB01
+#define FPGA53_SWEEP_TB01 0
+#endif
+#ifndef FPGA53_SWEEP_TIMING
+#define FPGA53_SWEEP_TIMING (FPGA53_SWEEP_TBIDX || FPGA53_SWEEP_TB01)
+#endif
+
 /* Seam hunt. The default lives here, in the header both fpga.c and dbgdump.c
  * include, on purpose: the sweep flags kept a private copy of their default in
  * each file, the two drifted apart, and a bench run then executed the sweep
