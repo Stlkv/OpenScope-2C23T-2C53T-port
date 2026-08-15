@@ -1018,6 +1018,235 @@ static void fpga53_window_metrics(void) {
                                  : 0u;
 }
 
+#if FPGA53_SEAM_LOG
+/* Per-frame seam record: the full list of crossings of the same hysteresis
+ * band the window metric uses. On a clean capture every gap is the half-period
+ * and the list is flat; a rotation of the engine's ring buffer puts exactly one
+ * wrong gap in the list, at the wrap.
+ *
+ * BOTH polarities are recorded, unlike the window metric, which counts rising
+ * crossings only. Simulated against a rotated ring (50 kHz, 5 MSa/s): rising
+ * edges alone go blind whenever the wrap lands inside a plateau — which is
+ * exactly the reported symptom, a plateau stretched half again — while both
+ * polarities locate the wrap to +-13 samples over the whole window.
+ *
+ * Only frames the engine actually refreshed are kept. The bench showed each
+ * window being handed back four or five times before a refill, so a ring of
+ * raw reads spends most of itself on duplicates (2026-08-16).
+ *
+ * Runs off the bus, after the DMA read has released CS, so its cost races
+ * nothing. */
+enum { FPGA53_SEAM_ROWS = 12, FPGA53_SEAM_MAX_EDGES = FPGA53_SEAM_GAPS + 1u };
+
+static fpga53_seam_row_t fpga53_seam_ring[FPGA53_SEAM_ROWS];
+static uint8_t fpga53_seam_next;   /* next ring slot to write */
+static uint8_t fpga53_seam_filled;
+static uint32_t fpga53_seam_last_sum;
+static uint8_t fpga53_seam_strip_buf[FPGA53_SEAM_STRIP];
+static uint8_t fpga53_seam_head_buf[FPGA53_SEAM_HEAD];
+/* Same window head, but kept only for frames the analyser found a glitch in.
+ * The plain snapshot follows every read, and reads outnumber fresh frames four
+ * to one, so it almost always shows a frame with nothing wrong with it. */
+static uint8_t fpga53_seam_bad_buf[FPGA53_SEAM_HEAD];
+static uint16_t fpga53_seam_bad_first;
+static uint8_t fpga53_seam_bad_gap[4];
+/* Where the glitches actually reach, counted over every fresh frame since
+ * boot rather than eyeballed off the twelve rows a dump happens to hold. The
+ * skip that hides them has to be chosen from this, not from a sample of it. */
+static uint16_t fpga53_seam_gmax;    /* furthest sample a glitch started at */
+static uint16_t fpga53_seam_gframes; /* fresh frames carrying a glitch */
+static uint16_t fpga53_seam_frames;  /* fresh frames analysed */
+static uint8_t fpga53_seam_band_v[4]; /* vmin, vmax, hi, lo of the last window */
+
+/* Raw window, two views: every 15th sample for shape, and the first samples
+ * one by one — the defect lives in the first period and a decimated view of it
+ * is a view of nothing. */
+static void fpga53_seam_raw_snapshot(void) {
+    for (uint8_t i = 0; i < FPGA53_SEAM_STRIP; ++i) {
+        fpga53_seam_strip_buf[i] =
+            fpga53_ch_buf[(uint16_t)i * (FPGA53_CH_SAMPLES / FPGA53_SEAM_STRIP)];
+    }
+    for (uint8_t i = 0; i < FPGA53_SEAM_HEAD; ++i) {
+        fpga53_seam_head_buf[i] = fpga53_ch_buf[i];
+    }
+}
+
+static void fpga53_seam_note(void) {
+    uint16_t edge[FPGA53_SEAM_MAX_EDGES];
+    /* Filled in place, not built on the stack and copied: a struct assignment
+     * of this size makes the compiler reach for __aeabi_memcpy, which a
+     * freestanding build has no one to link against. */
+    fpga53_seam_row_t *row = &fpga53_seam_ring[fpga53_seam_next];
+    uint8_t vmin = 0xFFu;
+    uint8_t vmax = 0;
+    uint8_t n = 0;
+
+    if (fpga53_win_sum[0] == fpga53_seam_last_sum) {
+        return; /* same window handed back again: nothing new to record */
+    }
+    fpga53_seam_last_sum = fpga53_win_sum[0];
+
+    row->first = 0;
+    row->r2 = fpga53_diag.r2;
+    row->count = 0;
+    for (uint8_t i = 0; i < FPGA53_SEAM_GAPS; ++i) {
+        row->gap[i] = 0;
+    }
+
+    for (uint16_t i = FPGA53_HEAD_SKIP; i < FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP;
+         ++i) {
+        uint8_t v = fpga53_ch_buf[i];
+        if (v < vmin) {
+            vmin = v;
+        }
+        if (v > vmax) {
+            vmax = v;
+        }
+    }
+    fpga53_seam_band_v[0] = vmin;
+    fpga53_seam_band_v[1] = vmax;
+    fpga53_seam_band_v[2] = 0;
+    fpga53_seam_band_v[3] = 0;
+
+    if ((uint8_t)(vmax - vmin) >= FPGA53_METRIC_MIN_SPREAD) {
+        uint8_t hi = (uint8_t)(vmin + (((uint16_t)(vmax - vmin) * 5u) / 8u));
+        uint8_t lo = (uint8_t)(vmin + (((uint16_t)(vmax - vmin) * 3u) / 8u));
+        uint8_t above = fpga53_ch_buf[FPGA53_HEAD_SKIP] >= hi ? 1u : 0u;
+
+        fpga53_seam_band_v[2] = hi;
+        fpga53_seam_band_v[3] = lo;
+        /* Starts where the render starts. The gap list is then a direct check
+         * on what reaches the screen, not on a buffer nobody draws. */
+        for (uint16_t i = FPGA53_HEAD_SKIP + 1u;
+             i < FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP &&
+             n < FPGA53_SEAM_MAX_EDGES;
+             ++i) {
+            uint8_t v = fpga53_ch_buf[i];
+            if (!above && v >= hi) {
+                above = 1u;
+                edge[n++] = i;
+            } else if (above && v <= lo) {
+                above = 0;
+                edge[n++] = i;
+            }
+        }
+    }
+
+    if (n) {
+        row->first = edge[0];
+        row->count = (uint8_t)(n - 1u);
+        for (uint8_t i = 0; i < row->count; ++i) {
+            uint16_t g = (uint16_t)(edge[i + 1u] - edge[i]);
+            row->gap[i] = g > 255u ? 255u : (uint8_t)g;
+        }
+    }
+
+    ++fpga53_seam_frames;
+    {
+        uint16_t at = row->first;
+        uint8_t hit = 0;
+
+        for (uint8_t i = 0; i < row->count; ++i) {
+            if (row->gap[i] < 30u) {
+                hit = 1u;
+                if (at > fpga53_seam_gmax) {
+                    fpga53_seam_gmax = at;
+                }
+            }
+            at = (uint16_t)(at + row->gap[i]);
+        }
+        fpga53_seam_gframes = (uint16_t)(fpga53_seam_gframes + hit);
+    }
+
+    /* A glitch shows up as crossings far closer together than a half-period;
+     * 30 samples sits well below the 48-52 the grid runs at and well above the
+     * one-or-two-sample jitter of a real edge. */
+    for (uint8_t i = 1; i < row->count; ++i) {
+        /* From gap 1 on, not gap 0. The start-of-window transient always
+         * produces a short gap 0 when it happens to cross the band, and that
+         * case is already understood (raw head: one sample off the plateau,
+         * then a ~10-sample exponential recovery). What is still unexplained
+         * are the frames whose short gap sits at sample 40-70, well past any
+         * settling — so those are the ones worth keeping a head for. */
+        if (row->gap[i] < 30u) {
+            for (uint8_t j = 0; j < FPGA53_SEAM_HEAD; ++j) {
+                fpga53_seam_bad_buf[j] = fpga53_seam_head_buf[j];
+            }
+            fpga53_seam_bad_first = row->first;
+            for (uint8_t j = 0; j < 4u; ++j) {
+                fpga53_seam_bad_gap[j] = j < row->count ? row->gap[j] : 0;
+            }
+            break;
+        }
+    }
+
+    fpga53_seam_next = (uint8_t)((fpga53_seam_next + 1u) % FPGA53_SEAM_ROWS);
+    if (fpga53_seam_filled < FPGA53_SEAM_ROWS) {
+        ++fpga53_seam_filled;
+    }
+}
+
+const fpga53_seam_row_t *fpga53_seam_row(uint8_t i) {
+    uint8_t oldest;
+
+    if (i >= fpga53_seam_filled) {
+        return 0;
+    }
+    oldest = (uint8_t)((fpga53_seam_next + FPGA53_SEAM_ROWS - fpga53_seam_filled) %
+                       FPGA53_SEAM_ROWS);
+    return &fpga53_seam_ring[(uint8_t)((oldest + i) % FPGA53_SEAM_ROWS)];
+}
+
+uint8_t fpga53_seam_rows(void) {
+    return fpga53_seam_filled;
+}
+
+const uint8_t *fpga53_seam_strip(void) {
+    return fpga53_seam_strip_buf;
+}
+
+const uint8_t *fpga53_seam_head(void) {
+    return fpga53_seam_head_buf;
+}
+
+void fpga53_seam_stats(uint16_t *gmax, uint16_t *gframes, uint16_t *frames) {
+    if (gmax) {
+        *gmax = fpga53_seam_gmax;
+    }
+    if (gframes) {
+        *gframes = fpga53_seam_gframes;
+    }
+    if (frames) {
+        *frames = fpga53_seam_frames;
+    }
+}
+
+const uint8_t *fpga53_seam_bad_head(uint16_t *first, const uint8_t **gaps) {
+    if (first) {
+        *first = fpga53_seam_bad_first;
+    }
+    if (gaps) {
+        *gaps = fpga53_seam_bad_gap;
+    }
+    return fpga53_seam_bad_buf;
+}
+
+void fpga53_seam_band(uint8_t *vmin, uint8_t *vmax, uint8_t *hi, uint8_t *lo) {
+    if (vmin) {
+        *vmin = fpga53_seam_band_v[0];
+    }
+    if (vmax) {
+        *vmax = fpga53_seam_band_v[1];
+    }
+    if (hi) {
+        *hi = fpga53_seam_band_v[2];
+    }
+    if (lo) {
+        *lo = fpga53_seam_band_v[3];
+    }
+}
+#endif
+
 /* What the sweep walks.
  *
  * FPGA53_SWEEP_TBIDX: stock's "fast timebase config" as described in its own
@@ -1205,6 +1434,16 @@ static void fpga53_read_channel(uint8_t opcode) {
     fpga53_dma_stop();
     gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
 
+#if FPGA53_SEAM_LOG
+    /* Snapshot before the offset subtraction below. That subtraction clamps
+     * everything at or under the offset to zero, which makes "the signal is at
+     * its low level" and "these bytes are zeros" indistinguishable — and the
+     * head of the window is exactly where that distinction is the question. */
+    if (opcode == 0x04u) {
+        fpga53_seam_raw_snapshot();
+    }
+#endif
+
     for (uint16_t i = 0; i < FPGA53_CH_SAMPLES; ++i) {
         uint8_t raw = fpga53_ch_buf[i];
         if (raw < rmin) {
@@ -1385,10 +1624,13 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
     fpga53_read_channel(0x04u);
 #endif
     fpga53_window_metrics();
+#if FPGA53_SEAM_LOG
+    fpga53_seam_note();
+#endif
     for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
-        uint16_t src = (uint16_t)(i >> 1);
-        if (src >= FPGA53_CH_SAMPLES) {
-            src = FPGA53_CH_SAMPLES - 1u;
+        uint16_t src = (uint16_t)((i >> 1) + FPGA53_HEAD_SKIP);
+        if (src >= FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP) {
+            src = FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP - 1u;
         }
         fpga53_frame[(uint16_t)(i * 2u)] = fpga53_ch_buf[src];
     }
@@ -1405,9 +1647,9 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
     fpga53_read_channel(0x05u);
 #endif
     for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
-        uint16_t src = (uint16_t)(i >> 1);
-        if (src >= FPGA53_CH_SAMPLES) {
-            src = FPGA53_CH_SAMPLES - 1u;
+        uint16_t src = (uint16_t)((i >> 1) + FPGA53_HEAD_SKIP);
+        if (src >= FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP) {
+            src = FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP - 1u;
         }
         fpga53_frame[(uint16_t)(i * 2u + 1u)] = fpga53_ch_buf[src];
     }

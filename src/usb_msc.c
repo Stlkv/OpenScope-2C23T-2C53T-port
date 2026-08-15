@@ -1314,7 +1314,9 @@ static void raw_fat_service_dbgreq(void) {
     uint32_t req_addr = 0;
     uint32_t txt_addr = 0;
     uint32_t cluster = 0;
-    static char text[1024];
+    /* 2 KB since the seam build's table and window strip joined the dump; the
+     * cluster on this volume is 4 KB, so the buffer is the binding limit. */
+    static char text[2048];
     uint16_t len;
 
     if (!raw_fat_mount(&fat) || fat.bytes_per_sector > MSC_SECTOR_SIZE) {
@@ -1326,8 +1328,19 @@ static void raw_fat_service_dbgreq(void) {
     raw_fat_delete_update_file(req_addr); /* generic 0xE5 delete */
 
     len = dbgdump_render(text, sizeof(text));
-    if (!len ||
-        (uint32_t)len > (uint32_t)fat.bytes_per_sector * fat.sectors_per_cluster) {
+    /* The dump lives in a single cluster. Overshooting it used to abort the
+     * write, which leaves the previous DBG.TXT in place — a stale file that
+     * looks exactly like a fresh one, so a dump grown by one line reads as a
+     * firmware that stopped responding. Truncate instead: a short dump is
+     * visibly short. */
+    {
+        uint32_t room = (uint32_t)fat.bytes_per_sector * fat.sectors_per_cluster;
+
+        if ((uint32_t)len > room) {
+            len = (uint16_t)room;
+        }
+    }
+    if (!len) {
         return;
     }
 

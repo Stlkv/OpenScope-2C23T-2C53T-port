@@ -52,6 +52,97 @@ typedef struct {
     uint8_t tsweep_done;  /* timing sweep: 1 = table complete */
 } fpga53_diag_t;
 
+/* Leading and trailing window samples to drop: the engine settles for the
+ * first part of every acquisition, and drops samples while it does.
+ *
+ * Measured 2026-08-16 with the raw heads and the GLITCH counter in DBG.TXT.
+ * A glitch is a sample or several falling off the plateau followed by a
+ * ~10-sample exponential recovery — a signal cannot fall in one sample and
+ * rise in ten, so it is the acquisition and not the input. Over 168 fresh
+ * frames 124 carried one, and the furthest started at sample 91; with the
+ * glitch width and its recovery that puts the contaminated head at roughly
+ * the first 130 samples, or the first 26 us of a 205 us window. Past that the
+ * gap list is a perfect grid in every frame — which is why four earlier
+ * explanations (PC0 gating, ping-pong, the read/write race, ring addressing)
+ * and a fifth (rotation by r2) all came back negative: every one of them was
+ * a statement about the whole window.
+ *
+ * A head skip of 160 took the glitch rate from 124/168 to 3/171, and those
+ * three sat at sample 999 — the other end. Hence the tail trim.
+ *
+ * Why the engine needs this long is still open; stock's trace is clean, so
+ * stock almost certainly drops a head of its own.
+ *
+ * These live in the header because the renderer has to agree with them: the
+ * window is no longer 1023 samples, and a UI that still asks for the whole
+ * frame gets a flat line where the trimmed part used to be. */
+#ifndef FPGA53_HEAD_SKIP
+#define FPGA53_HEAD_SKIP 160u
+#endif
+#ifndef FPGA53_TAIL_SKIP
+#define FPGA53_TAIL_SKIP 32u
+#endif
+enum {
+    FPGA53_WINDOW_SAMPLES = 1023,
+    /* Window samples that survive the trim, and the frame slots they fill
+     * after the renderer's 2x stretch. */
+    FPGA53_WINDOW_VALID =
+        FPGA53_WINDOW_SAMPLES - (int)FPGA53_HEAD_SKIP - (int)FPGA53_TAIL_SKIP,
+    FPGA53_FRAME_VALID = FPGA53_WINDOW_VALID * 2,
+};
+
+/* Seam hunt. The default lives here, in the header both fpga.c and dbgdump.c
+ * include, on purpose: the sweep flags kept a private copy of their default in
+ * each file, the two drifted apart, and a bench run then executed the sweep
+ * while printing nothing — which reads exactly like a negative result
+ * (2026-08-15). One definition, no mirror to forget. */
+#ifndef FPGA53_SEAM_LOG
+#define FPGA53_SEAM_LOG 0
+#endif
+
+#if FPGA53_SEAM_LOG
+/* Where the frame's discontinuity sits, measured rather than eyeballed.
+ * Everything outside the data has been falsified (PC0 gating, ping-pong, the
+ * read/write race, ring addressing in the renderer, and — on 2026-08-16 — a
+ * rotation following r2). What the gap lists then showed is that the defect
+ * never moves: the tail of every window is a perfect grid and only the first
+ * period or two is wrong.
+ *
+ * The whole gap list, not a summary of it. The first cut recorded only the
+ * single worst interval, and on the bench that interval turned out to sit in
+ * the first period of every frame — an artefact of where the hysteresis state
+ * starts — which is exactly the shape that would hide a real seam further in.
+ * A summary can only answer the question it was built around; the list lets
+ * the next question be asked without another flash cycle. */
+enum { FPGA53_SEAM_GAPS = 24 };
+
+typedef struct {
+    uint16_t first;                   /* window index of the first crossing */
+    uint8_t r2;                       /* frame status byte: pointer suspect */
+    uint8_t count;                    /* gaps stored below */
+    uint8_t gap[FPGA53_SEAM_GAPS];    /* crossing-to-crossing, samples, 255 = over */
+} fpga53_seam_row_t;
+
+/* Oldest first; 0 past the end. */
+const fpga53_seam_row_t *fpga53_seam_row(uint8_t i);
+uint8_t fpga53_seam_rows(void);
+
+/* Every-16th sample of the last analysed window, plus the band the analyser
+ * derived from it. Without this a row of zeroes is ambiguous — a window with
+ * no periodic content and a window the hysteresis band simply failed to
+ * straddle look identical, and guessing between them costs a bench cycle. */
+enum { FPGA53_SEAM_STRIP = 64, FPGA53_SEAM_HEAD = 80 };
+const uint8_t *fpga53_seam_strip(void);
+/* The first FPGA53_SEAM_HEAD raw samples, undecimated and unclamped. */
+const uint8_t *fpga53_seam_head(void);
+/* Same, from the most recent frame the analyser found a glitch in, with that
+ * frame's first crossing and leading gaps. */
+const uint8_t *fpga53_seam_bad_head(uint16_t *first, const uint8_t **gaps);
+void fpga53_seam_band(uint8_t *vmin, uint8_t *vmax, uint8_t *hi, uint8_t *lo);
+/* Glitch reach since boot: furthest start index, frames hit, frames seen. */
+void fpga53_seam_stats(uint16_t *gmax, uint16_t *gframes, uint16_t *frames);
+#endif
+
 /* One timing-sweep row: what the window looked like while <reg> held <val>.
  * period is samples x16 (0 = no periodic content measurable). */
 typedef struct {

@@ -65,6 +65,95 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
 
     p = put_str(dst, cap, p, "OpenScope 2C53T DBG dump v2\n");
 
+    /* Seam table first, ahead of everything else: the dump is capped at one
+     * FAT cluster and this is the only part of it a seam build is run for.
+     * One line per fresh frame, oldest first: r2, the first crossing's index,
+     * then every crossing-to-crossing gap as a byte. A clean capture is a flat
+     * run of half-periods; a glitch is a gap far below them. GLITCH sums that
+     * up across every frame since boot, which is what a skip threshold has to
+     * be chosen from — twelve rows are a sample, not a bound. */
+#if FPGA53_SEAM_LOG
+    {
+        uint8_t rows = fpga53_seam_rows();
+
+        uint8_t vmin = 0, vmax = 0, hi = 0, lo = 0;
+        const uint8_t *strip = fpga53_seam_strip();
+
+        p = put_str(dst, cap, p, "SEAM r2:first:gaps x");
+        p = put_dec(dst, cap, p, rows);
+        p = put_str(dst, cap, p, "\n");
+        for (uint8_t i = 0; i < rows; ++i) {
+            const fpga53_seam_row_t *r = fpga53_seam_row(i);
+
+            p = put_hex(dst, cap, p, r->r2, 2);
+            p = put_str(dst, cap, p, ":");
+            p = put_hex(dst, cap, p, r->first, 3);
+            p = put_str(dst, cap, p, ":");
+            for (uint8_t g = 0; g < r->count; ++g) {
+                p = put_hex(dst, cap, p, r->gap[g], 2);
+            }
+            p = put_str(dst, cap, p, "\n");
+        }
+
+        /* The window itself, every 16th sample, and the band the analyser cut
+         * out of it. A table of zeroes says only "no periodic content found";
+         * this says whether that is because the window is flat, because it is
+         * noise, or because two outlier samples stretched the band past
+         * everything real in between. */
+        fpga53_seam_band(&vmin, &vmax, &hi, &lo);
+        {
+            uint16_t gmax = 0, gframes = 0, frames = 0;
+
+            fpga53_seam_stats(&gmax, &gframes, &frames);
+            p = put_str(dst, cap, p, "GLITCH max=");
+            p = put_dec(dst, cap, p, gmax);
+            p = put_str(dst, cap, p, " hit=");
+            p = put_dec(dst, cap, p, gframes);
+            p = put_str(dst, cap, p, "/");
+            p = put_dec(dst, cap, p, frames);
+            p = put_str(dst, cap, p, "\n");
+        }
+        p = put_str(dst, cap, p, "BAND ");
+        p = put_hex(dst, cap, p, vmin, 2);
+        p = put_str(dst, cap, p, "-");
+        p = put_hex(dst, cap, p, vmax, 2);
+        p = put_str(dst, cap, p, " hi=");
+        p = put_hex(dst, cap, p, hi, 2);
+        p = put_str(dst, cap, p, " lo=");
+        p = put_hex(dst, cap, p, lo, 2);
+        p = put_str(dst, cap, p, "\nWIN16 ");
+        for (uint8_t i = 0; i < FPGA53_SEAM_STRIP; ++i) {
+            p = put_hex(dst, cap, p, strip[i], 2);
+        }
+        /* Raw and undecimated, because the whole defect fits inside it.
+         * BADH is the same window head from the last frame with a glitch in
+         * it, prefixed by that frame's first crossing and leading gaps. */
+        {
+            const uint8_t *head = fpga53_seam_head();
+            const uint8_t *bad;
+            const uint8_t *bgap = 0;
+            uint16_t bfirst = 0;
+
+            p = put_str(dst, cap, p, "\nHEAD ");
+            for (uint8_t i = 0; i < FPGA53_SEAM_HEAD; ++i) {
+                p = put_hex(dst, cap, p, head[i], 2);
+            }
+            bad = fpga53_seam_bad_head(&bfirst, &bgap);
+            p = put_str(dst, cap, p, "\nBADH ");
+            p = put_hex(dst, cap, p, bfirst, 3);
+            p = put_str(dst, cap, p, ":");
+            for (uint8_t i = 0; i < 4u; ++i) {
+                p = put_hex(dst, cap, p, bgap[i], 2);
+            }
+            p = put_str(dst, cap, p, ":");
+            for (uint8_t i = 0; i < FPGA53_SEAM_HEAD; ++i) {
+                p = put_hex(dst, cap, p, bad[i], 2);
+            }
+        }
+        p = put_str(dst, cap, p, "\n");
+    }
+#endif
+
     /* The updater's own state. Without it a self-flash that silently refused
      * to apply is indistinguishable from one that applied — the file leaves
      * the volume either way, and the frame counters only tell you a boot is

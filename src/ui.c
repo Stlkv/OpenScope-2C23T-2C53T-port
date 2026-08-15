@@ -2881,6 +2881,13 @@ static uint16_t scope_visible_sample_count(void) {
         if (count < 2u) {
             count = 2u;
         }
+        /* Not the whole frame buffer: the capture drops a contaminated head
+         * and tail (see FPGA53_HEAD_SKIP), so the slots past FPGA53_FRAME_VALID
+         * hold nothing but the last real sample repeated. Asking for them
+         * draws a flat line at the right edge and calls it signal. */
+        if (count > FPGA53_FRAME_VALID) {
+            count = FPGA53_FRAME_VALID;
+        }
         if (count > SCOPE_SAMPLE_COUNT - 2u) {
             count = SCOPE_SAMPLE_COUNT - 2u;
         }

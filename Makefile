@@ -164,6 +164,16 @@ release-2c53t-embed:
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-EMBED-08007000.bin
 	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-EMBED-08007000.bin
 
+# Same, plus the per-frame seam record (SEAM table in DBG.TXT). Feed it a
+# periodic signal with several periods in the window — 50 kHz gives ~10 — and
+# read the table: r2 against the seam's position, one row per frame.
+release-2c53t-seam:
+	rm -rf $(BUILD_ROOT)/2c53t
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_SEAM_LOG=1 $(SCOPE53_EXTRA)"
+	@mkdir -p $(DIST)
+	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-SEAM-08007000.bin
+	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-SEAM-08007000.bin
+
 # Same, plus the timing-register falsification sweep (0x0F/0x10/0x11 ladder,
 # results in DBG.TXT under TSW). Feed it a periodic signal before reading.
 release-2c53t-tsweep:
