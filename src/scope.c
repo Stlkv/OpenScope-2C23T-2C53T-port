@@ -423,6 +423,11 @@ void scope_hw_configure_channels(uint8_t timebase,
     (void)ch2_vdiv;
 #endif
     fpga_write_scope_timing(scope_span_for_timebase(timebase));
+#if HW_TARGET_2C53T
+    /* The span above means nothing on this board — fpga_write_scope_timing is
+     * a stub. The rate is set by the engine's own index. */
+    fpga53_set_timebase(timebase);
+#endif
     delay_ms(SCOPE_TIMING_SETTLE_MS);
 
     fpga_capture_latch();
@@ -485,6 +490,11 @@ void scope_hw_slow_start(uint8_t timebase) {
     }
 
     fpga_write_scope_timing(scope_span_for_timebase(timebase));
+#if HW_TARGET_2C53T
+    /* The span above means nothing on this board — fpga_write_scope_timing is
+     * a stub. The rate is set by the engine's own index. */
+    fpga53_set_timebase(timebase);
+#endif
     delay_ms(SCOPE_TIMING_SETTLE_MS);
     fpga_capture_latch();
 

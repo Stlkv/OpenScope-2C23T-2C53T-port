@@ -222,6 +222,21 @@ void fpga53_scope_pose_reapply(void);
  * refreshes its window once one has been consumed. The roll pacer picks the
  * mode by interval: a full read is ~1.4 ms of SPI and needs room. */
 void fpga53_slow_point_set_full(uint8_t full);
+
+/* Sample-rate ladder, measured 2026-08-16 (EXPERIMENT-LOG, "ДЕЛИТЕЛЬ
+ * РАЗВЁРТКИ НАЙДЕН"). The engine takes the two-byte SPI3 command `01 <idx>`;
+ * against a 50 kHz square the indices came out as a 1-2-5 ladder on round
+ * sample counts:
+ *
+ *   idx 07  12.5 MSa/s     idx 0A  1.25 MSa/s
+ *   idx 08   5.00          idx 0B  0.50
+ *   idx 09   2.50          idx 0C  0.247
+ *
+ * Set the rate for a UI timebase step, and ask what a frame-buffer entry is
+ * worth in nanoseconds — the renderer needs the second to size the visible
+ * window, and it was a hardcoded 100 while there was only one rate. */
+void fpga53_set_timebase(uint8_t ui_timebase);
+uint32_t fpga53_frame_entry_ns(void);
 #endif
 
 void fpga_init_once(void);

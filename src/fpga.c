@@ -874,6 +874,88 @@ uint8_t fpga_ready(void) {
     return fpga_loaded;
 }
 
+#if HW_TARGET_2C53T
+/* UI timebase step -> engine index, and what one frame-buffer entry is then
+ * worth. Entry, not window sample: the renderer stretches the window 2x, so an
+ * entry is half a sample interval.
+ *
+ * The mapping picks, for each step, the fastest index whose window still spans
+ * the requested screen time — 831 trimmed samples, so 66 us at index 07 up to
+ * 3.4 ms at index 0C. Steps below 5 us/div ask for less time than even the
+ * fastest window holds and steps above 200 us/div for more than the slowest
+ * does; both clamp, and there the trace spans what the engine gives rather
+ * than what the label says.
+ *
+ * That leaves 500 us/div through 20 ms/div genuinely uncovered: too slow for
+ * index 0C's window, too fast for the roll sampler, which needs seconds. The
+ * indices that would cover it are probably 0x0F-0x13 — stock's dwell table
+ * grows exactly there — but against a 50 kHz input they returned two crossings
+ * or fewer and could not be told apart from a dead capture. That needs a
+ * slower input, not a guess. */
+static const uint8_t fpga53_tb_index[] = {
+    /* 50NS 100NS 200NS 500NS 1US 2US */
+    0x07u, 0x07u, 0x07u, 0x07u, 0x07u, 0x07u,
+    /* 5US  10US  20US  50US  100US 200US */
+    0x07u, 0x08u, 0x09u, 0x0Au, 0x0Bu, 0x0Cu,
+    /* 500US 1MS 2MS 5MS 10MS 20MS 50MS 100MS 200MS 500MS 1S 2S 5S 10S */
+    0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu,
+    0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu,
+};
+
+/* Nanoseconds per frame-buffer entry, indexed the same way. 0x0C is 2024 and
+ * not 2000 because that is what it measured: 0.0494 of the base rate, not
+ * 0.05. */
+static const uint16_t fpga53_tb_entry_ns[] = {
+    40u, 40u, 40u, 40u, 40u, 40u,
+    40u, 100u, 200u, 400u, 1000u, 2024u,
+    2024u, 2024u, 2024u, 2024u, 2024u, 2024u, 2024u, 2024u,
+    2024u, 2024u, 2024u, 2024u, 2024u, 2024u,
+};
+
+enum { FPGA53_TB_STEPS = sizeof(fpga53_tb_index) / sizeof(fpga53_tb_index[0]) };
+
+static uint8_t fpga53_tb_now = 0xFFu;
+static uint32_t fpga53_tb_entry_now = 100u;
+
+uint32_t fpga53_frame_entry_ns(void) {
+    return fpga53_tb_entry_now;
+}
+
+void fpga53_set_timebase(uint8_t ui_timebase) {
+    uint8_t idx;
+
+    if (!fpga_loaded) {
+        return;
+    }
+    if (ui_timebase >= (uint8_t)FPGA53_TB_STEPS) {
+        ui_timebase = (uint8_t)(FPGA53_TB_STEPS - 1u);
+    }
+    idx = fpga53_tb_index[ui_timebase];
+    fpga53_tb_entry_now = fpga53_tb_entry_ns[ui_timebase];
+    if (idx == fpga53_tb_now) {
+        return;
+    }
+    fpga53_tb_now = idx;
+
+    /* Same bus etiquette as a capture read: a roll transfer may be in flight,
+     * and clocking a command into someone else's CS frame is how a bus gets
+     * wedged. */
+    fpga53_bus_busy = 1u;
+    fpga53_dma_cancel();
+    gpio_clear(GPIOB_BASE, 1u << 6);
+    (void)fpga53_xfer(0x01u);
+    (void)fpga53_xfer(idx);
+    gpio_set(GPIOB_BASE, 1u << 6);
+    fpga53_bus_busy = 0;
+
+    /* Let the engine fill one whole window at the new rate before anyone reads
+     * it, or the first frame after a step is half old rate and half new. At
+     * index 0C a window is 4.1 ms, which is why this is computed and not a
+     * constant. */
+    delay_ms((uint32_t)((fpga53_tb_entry_now * 2u * FPGA53_CH_SAMPLES) / 1000000u) + 2u);
+}
+#endif
+
 /* Read-only build: timing / signal-buffer writes are not implemented for
  * the 2C53T yet. The capture rate stays whatever stock configured before
  * the warm handoff, so the UI timebase is cosmetic for now. */

@@ -2866,10 +2866,12 @@ static uint16_t scope_visible_sample_count(void) {
 
 #if HW_TARGET_2C53T
     /* Every non-roll step draws from the same 1023-sample capture, which the
-     * read stretches 2x into the frame buffer — so one buffer sample is 100 ns
-     * (5.00 MSa/s, measured 2026-08-15 against a 50 kHz square: 100 samples
-     * per 20 us period). Show as many of them as the requested division spans,
-     * capped by what the window actually holds.
+     * read stretches 2x into the frame buffer — so one buffer entry is half a
+     * sample interval. That interval used to be fixed at 200 ns (5.00 MSa/s,
+     * measured 2026-08-15 against a 50 kHz square: 100 samples per 20 us
+     * period); since 2026-08-16 the engine's rate is selectable and the entry
+     * is worth whatever fpga53_frame_entry_ns() says. Show as many entries as
+     * the requested division spans, capped by what the window actually holds.
      *
      * This used to cap at 300 samples, i.e. 30 us of a 205 us capture: 85% of
      * what the instrument had already digitised was thrown away before it
@@ -2877,7 +2879,17 @@ static uint16_t scope_visible_sample_count(void) {
      * a day and a half. */
     if (timebase < SCOPE53_ROLL_FLOOR) {
         uint32_t screen_ns = scope_timebase_unit_ns[timebase] * SCOPE_X_DIVS * 10u;
-        uint32_t count = (screen_ns + 50u) / 100u;
+        /* What an entry is worth now, not the single rate this used to assume.
+         * The engine's sample rate is selectable since 2026-08-16 and runs from
+         * 12.5 MSa/s down to 0.247, so a hardcoded 100 ns was right for exactly
+         * one of the six. */
+        uint32_t entry_ns = fpga53_frame_entry_ns();
+        uint32_t count;
+
+        if (!entry_ns) {
+            entry_ns = 100u;
+        }
+        count = (screen_ns + entry_ns / 2u) / entry_ns;
         if (count < 2u) {
             count = 2u;
         }
