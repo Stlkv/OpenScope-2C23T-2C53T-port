@@ -1056,6 +1056,14 @@ static uint8_t fpga53_seam_bad_gap[4];
 static uint16_t fpga53_seam_gmax;    /* furthest sample a glitch started at */
 static uint16_t fpga53_seam_gframes; /* fresh frames carrying a glitch */
 static uint16_t fpga53_seam_frames;  /* fresh frames analysed */
+static uint8_t fpga53_seam_pre[2];   /* r1, r2 of the last CH1 read */
+/* Is r2 a sample? Counted over every fresh frame, not over the dozen a dump
+ * holds. r1nz: frames whose r1 was anything but 00. jump: frames where r2 sits
+ * further from the first window sample than a real edge can travel in one
+ * sample step — the capture's own fall is six samples wide and its rise ten,
+ * so 0x30 is far outside anything the input can do. */
+static uint16_t fpga53_seam_r1nz;
+static uint16_t fpga53_seam_jump;
 static uint8_t fpga53_seam_band_v[4]; /* vmin, vmax, hi, lo of the last window */
 
 /* Raw window, two views: every 15th sample for shape, and the first samples
@@ -1070,6 +1078,7 @@ static void fpga53_seam_raw_snapshot(void) {
         fpga53_seam_head_buf[i] = fpga53_ch_buf[i];
     }
 }
+
 
 static void fpga53_seam_note(void) {
     uint16_t edge[FPGA53_SEAM_MAX_EDGES];
@@ -1089,6 +1098,11 @@ static void fpga53_seam_note(void) {
     row->first = 0;
     row->r2 = fpga53_diag.r2;
     row->count = 0;
+    row->pre[0] = fpga53_seam_pre[0];
+    row->pre[1] = fpga53_seam_pre[1];
+    for (uint8_t i = 0; i < 4u; ++i) {
+        row->pre[2u + i] = fpga53_seam_head_buf[i];
+    }
     for (uint8_t i = 0; i < FPGA53_SEAM_GAPS; ++i) {
         row->gap[i] = 0;
     }
@@ -1142,6 +1156,19 @@ static void fpga53_seam_note(void) {
     }
 
     ++fpga53_seam_frames;
+    if (row->pre[0]) {
+        ++fpga53_seam_r1nz;
+    }
+    {
+        int16_t d = (int16_t)row->pre[1] - (int16_t)row->pre[2];
+
+        if (d < 0) {
+            d = (int16_t)-d;
+        }
+        if (d > 0x30) {
+            ++fpga53_seam_jump;
+        }
+    }
     {
         uint16_t at = row->first;
         uint8_t hit = 0;
@@ -1207,6 +1234,15 @@ const uint8_t *fpga53_seam_strip(void) {
 
 const uint8_t *fpga53_seam_head(void) {
     return fpga53_seam_head_buf;
+}
+
+void fpga53_seam_pre_stats(uint16_t *r1nz, uint16_t *jump) {
+    if (r1nz) {
+        *r1nz = fpga53_seam_r1nz;
+    }
+    if (jump) {
+        *jump = fpga53_seam_jump;
+    }
 }
 
 void fpga53_seam_stats(uint16_t *gmax, uint16_t *gframes, uint16_t *frames) {
@@ -1464,6 +1500,10 @@ static void fpga53_read_channel(uint8_t opcode) {
         fpga53_diag.r0 = r0;
         fpga53_diag.r1 = r1;
         fpga53_diag.r2 = r2;
+#if FPGA53_SEAM_LOG
+        fpga53_seam_pre[0] = r1;
+        fpga53_seam_pre[1] = r2;
+#endif
         fpga53_diag.smin = rmin;
         fpga53_diag.smax = rmax;
         fpga53_win_sum[0] = sum;

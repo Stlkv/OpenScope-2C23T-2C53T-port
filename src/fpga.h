@@ -17,7 +17,14 @@ typedef struct {
     uint8_t pc0;
     uint16_t reads;
     uint16_t forced;
-    uint8_t r0, r1, r2;   /* CH1 frame status bytes */
+    /* CH1 read preamble. Not three status bytes, whatever this used to be
+     * called: measured 2026-08-16 over 193 frames, r1 was 00 in every single
+     * one, and r2 tracked the window's first sample continuously in 96% of
+     * them — the rest being windows that opened on a steep edge, where one
+     * sample step legitimately reaches 0x3B. So r2 IS the first sample and we
+     * discard it. That costs one sample in 1024, inside the head we now skip
+     * anyway, which is why the read is left alone. */
+    uint8_t r0, r1, r2;
     uint8_t smin, smax;   /* raw CH1 sample range, last read */
     uint16_t init_calls;  /* fpga_init_once entries */
     uint16_t cfg_calls;   /* scope_hw_configure_channels entries */
@@ -118,8 +125,18 @@ enum { FPGA53_SEAM_GAPS = 24 };
 
 typedef struct {
     uint16_t first;                   /* window index of the first crossing */
-    uint8_t r2;                       /* frame status byte: pointer suspect */
+    uint8_t r2;                       /* third byte of the read preamble */
     uint8_t count;                    /* gaps stored below */
+    /* r1, r2 and the first four raw window samples of the same read.
+     *
+     * Stock's bulk read sends ONE echo byte and then takes 1024 data bytes;
+     * ours sends the opcode and then discards two more bytes as status before
+     * taking 1023. If those two are really samples, we throw away the start of
+     * every window — and r2 has never once left the signal's own range, while
+     * r1 has never been anything but 00. Six consecutive bytes settle it: a
+     * sample sequence has to stay inside what the input can do, which on this
+     * capture is a six-sample fall and a ten-sample rise. */
+    uint8_t pre[6];
     uint8_t gap[FPGA53_SEAM_GAPS];    /* crossing-to-crossing, samples, 255 = over */
 } fpga53_seam_row_t;
 
@@ -141,6 +158,9 @@ const uint8_t *fpga53_seam_bad_head(uint16_t *first, const uint8_t **gaps);
 void fpga53_seam_band(uint8_t *vmin, uint8_t *vmax, uint8_t *hi, uint8_t *lo);
 /* Glitch reach since boot: furthest start index, frames hit, frames seen. */
 void fpga53_seam_stats(uint16_t *gmax, uint16_t *gframes, uint16_t *frames);
+/* Read-preamble evidence since boot: frames with a non-zero r1, and frames
+ * where r2 could not have been the sample before the window's first. */
+void fpga53_seam_pre_stats(uint16_t *r1nz, uint16_t *jump);
 #endif
 
 /* One timing-sweep row: what the window looked like while <reg> held <val>.

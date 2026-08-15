@@ -79,13 +79,15 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
         uint8_t vmin = 0, vmax = 0, hi = 0, lo = 0;
         const uint8_t *strip = fpga53_seam_strip();
 
-        p = put_str(dst, cap, p, "SEAM r2:first:gaps x");
+        p = put_str(dst, cap, p, "SEAM r1r2b0b1b2b3:first:gaps x");
         p = put_dec(dst, cap, p, rows);
         p = put_str(dst, cap, p, "\n");
         for (uint8_t i = 0; i < rows; ++i) {
             const fpga53_seam_row_t *r = fpga53_seam_row(i);
 
-            p = put_hex(dst, cap, p, r->r2, 2);
+            for (uint8_t k = 0; k < 6u; ++k) {
+                p = put_hex(dst, cap, p, r->pre[k], 2);
+            }
             p = put_str(dst, cap, p, ":");
             p = put_hex(dst, cap, p, r->first, 3);
             p = put_str(dst, cap, p, ":");
@@ -105,6 +107,14 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
             uint16_t gmax = 0, gframes = 0, frames = 0;
 
             fpga53_seam_stats(&gmax, &gframes, &frames);
+            uint16_t r1nz = 0, jump = 0;
+
+            fpga53_seam_pre_stats(&r1nz, &jump);
+            p = put_str(dst, cap, p, "PRE r1nz=");
+            p = put_dec(dst, cap, p, r1nz);
+            p = put_str(dst, cap, p, " jump=");
+            p = put_dec(dst, cap, p, jump);
+            p = put_str(dst, cap, p, "\n");
             p = put_str(dst, cap, p, "GLITCH max=");
             p = put_dec(dst, cap, p, gmax);
             p = put_str(dst, cap, p, " hit=");
