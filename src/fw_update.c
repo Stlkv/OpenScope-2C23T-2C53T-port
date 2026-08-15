@@ -24,8 +24,6 @@ enum {
     FW_APP_END = FW_APP_BASE + FW_MAX_SIZE,
     FW_STAGE_PAGE_COUNT = FW_MAX_SIZE / FW_PAGE_SIZE,
     FW_STAGE_PAGE_BYTES = (FW_STAGE_PAGE_COUNT + 7u) / 8u,
-    FW_STAGE_HALFWORD_COUNT = (FW_MAX_SIZE + 1u) / 2u,
-    FW_STAGE_HALFWORD_BYTES = (FW_STAGE_HALFWORD_COUNT + 7u) / 8u,
 
     FLASH_STS_BSY = 1u << 0,
     FLASH_STS_PGERR = 1u << 2,
@@ -61,7 +59,8 @@ static uint8_t fw_blob_mode;
 #define fw_blob_mode 0u
 #endif
 static uint8_t fw_stage_pages[FW_STAGE_PAGE_BYTES];
-static uint8_t fw_stage_halfwords[FW_STAGE_HALFWORD_BYTES];
+/* Bytes written contiguously from offset 0 of the staged file. */
+static uint32_t fw_covered;
 static uint8_t fw_page_buffer[FW_PAGE_SIZE];
 
 /*
@@ -222,18 +221,10 @@ static void fw_set_error(uint8_t error) {
 }
 
 static uint8_t fw_stage_expected_complete(void) {
-    uint32_t halfwords;
-
     if (fw_expected_size < 8192u || fw_expected_size > fw_dest_max()) {
         return 0;
     }
-    halfwords = (fw_expected_size + 1u) / 2u;
-    for (uint32_t bit = 0; bit < halfwords; ++bit) {
-        if (!bit_get(fw_stage_halfwords, bit)) {
-            return 0;
-        }
-    }
-    return 1;
+    return fw_covered >= fw_expected_size;
 }
 
 static void fw_maybe_ready(void) {
@@ -258,130 +249,102 @@ static void fw_stage_reset(uint32_t base_lba) {
     fw_apply_requested = 0;
     fw_apply_delay_loops = 0;
     bits_clear(fw_stage_pages, sizeof(fw_stage_pages));
-    bits_clear(fw_stage_halfwords, sizeof(fw_stage_halfwords));
+    fw_covered = 0;
     ++fw_status.sequence;
 }
 
-static uint8_t fw_stage_rewrite_page(uint32_t page_offset,
-                                     uint16_t page_inner,
-                                     const uint8_t *data,
-                                     uint16_t len) {
-    uint32_t page = page_offset / FW_PAGE_SIZE;
-    uint32_t first_halfword = page_offset / 2u;
-    uint32_t first_changed = (uint32_t)page_inner & ~1u;
-    uint32_t end_changed = ((uint32_t)page_inner + len + 1u) & ~1u;
-
-    for (uint32_t i = 0; i < FW_PAGE_SIZE; i += 2u) {
-        uint32_t bit = first_halfword + i / 2u;
-        uint16_t value = bit_get(fw_stage_halfwords, bit) ?
-                         REG16(fw_dest_base() + page_offset + i) : 0xFFFFu;
-        fw_page_buffer[i] = (uint8_t)value;
-        fw_page_buffer[i + 1u] = (uint8_t)(value >> 8);
-    }
+/*
+ * Programming is halfword-granular, and a programmed halfword cannot be
+ * changed without erasing its whole page — so the writer has to know what has
+ * already landed. It used to answer that from a bitmap with one bit per
+ * halfword: 14 KB of RAM for a 224 KB slot, growing with the slot, in a
+ * firmware whose free RAM is measured in single kilobytes.
+ *
+ * It never needed to. The only producer is the FAT reader in usb_msc.c, which
+ * walks the staged file sector by sector with offsets strictly increasing from
+ * zero, so a single watermark — bytes covered contiguously from the start —
+ * answers the same questions in four bytes:
+ *
+ *   behind the watermark   a re-send; accepted if flash already agrees with
+ *                          it, rejected if it does not (the page would have to
+ *                          be erased, and the bytes to rebuild it with are no
+ *                          longer in RAM)
+ *   at the watermark       the normal case: erase on first touch, program
+ *   ahead of the watermark a hole, which no legitimate producer can create;
+ *                          rejected rather than papered over
+ *
+ * A rejection ends the transfer the way every other staging error does: the
+ * file is deleted from the volume and has to be copied again, a few seconds of
+ * a cycle that is already automated. A silent hole would cost an image that
+ * passes its completeness check and does not boot.
+ */
+static uint8_t fw_flash_matches(uint32_t offset, const uint8_t *data, uint16_t len) {
+    const uint8_t *flash = (const uint8_t *)(fw_dest_base() + offset);
 
     for (uint16_t i = 0; i < len; ++i) {
-        fw_page_buffer[page_inner + i] = data[i];
-    }
-    for (uint32_t i = first_changed; i < end_changed; i += 2u) {
-        bit_set(fw_stage_halfwords, first_halfword + i / 2u);
-    }
-
-    flash_erase_page(fw_dest_base() + page_offset);
-    bit_set(fw_stage_pages, page);
-    for (uint32_t i = 0; i < FW_PAGE_SIZE; i += 2u) {
-        uint32_t bit = first_halfword + i / 2u;
-        if (bit_get(fw_stage_halfwords, bit)) {
-            uint16_t value = (uint16_t)fw_page_buffer[i] |
-                             ((uint16_t)fw_page_buffer[i + 1u] << 8);
-            flash_program_halfword(fw_dest_base() + page_offset + i, value);
+        if (flash[i] != data[i]) {
+            return 0;
         }
     }
     return 1;
 }
 
-static uint8_t fw_stage_write_page(uint32_t offset, const uint8_t *data, uint16_t len) {
-    uint32_t page_offset = offset & ~(FW_PAGE_SIZE - 1u);
-    uint16_t page_inner = (uint16_t)(offset - page_offset);
+static void fw_stage_program(uint32_t offset, const uint8_t *data, uint16_t len) {
     uint32_t addr = fw_dest_base() + offset;
-    uint32_t page = offset / FW_PAGE_SIZE;
-    uint8_t rewrite = (uint8_t)(offset & 1u);
-
-    if (page_inner + len > FW_PAGE_SIZE) {
-        fw_set_error(FW_UPDATE_ERR_RANGE);
-        return 0;
-    }
-
-    for (uint16_t i = 0; i < len && !rewrite; i = (uint16_t)(i + 2u)) {
-        uint32_t byte_off = offset + i;
-        uint32_t word_bit = byte_off / 2u;
-        uint16_t value = data[i];
-        if (i + 1u < len) {
-            value |= (uint16_t)data[i + 1u] << 8;
-        } else {
-            value |= 0xFF00u;
-        }
-        if (bit_get(fw_stage_halfwords, word_bit) && REG16(addr + i) != value) {
-            rewrite = 1;
-        }
-    }
 
     flash_unlock(addr);
-    if (rewrite) {
-        uint8_t ok = fw_stage_rewrite_page(page_offset, page_inner, data, len);
-        flash_lock(addr);
-        return ok;
-    }
-
-    if (!bit_get(fw_stage_pages, page)) {
-        flash_erase_page(fw_dest_base() + page * FW_PAGE_SIZE);
-        bit_set(fw_stage_pages, page);
-    }
-
     for (uint16_t i = 0; i < len; i = (uint16_t)(i + 2u)) {
-        uint32_t byte_off = offset + i;
-        uint32_t word_bit = byte_off / 2u;
+        uint32_t page = (offset + i) / FW_PAGE_SIZE;
         uint16_t value = data[i];
-        if (i + 1u < len) {
-            value |= (uint16_t)data[i + 1u] << 8;
-        } else {
-            value |= 0xFF00u;
-        }
-        if (bit_get(fw_stage_halfwords, word_bit)) {
-            if (REG16(addr + i) == value) {
-                continue;
-            }
-            flash_lock(addr);
-            return fw_stage_write_page(offset, data, len);
+
+        /* A trailing odd byte can only be the last byte of the file; pad it
+         * with the erased value so the halfword is programmable. */
+        value |= (i + 1u < len) ? ((uint16_t)data[i + 1u] << 8) : 0xFF00u;
+
+        if (!bit_get(fw_stage_pages, page)) {
+            flash_erase_page(fw_dest_base() + page * FW_PAGE_SIZE);
+            bit_set(fw_stage_pages, page);
         }
         flash_program_halfword(addr + i, value);
-        bit_set(fw_stage_halfwords, word_bit);
     }
     flash_lock(addr);
-    return 1;
 }
 
 static uint8_t fw_stage_write(uint32_t offset, const uint8_t *data, uint16_t len) {
-    uint32_t end_offset = offset + len;
-
     if (offset >= fw_dest_max() || (uint32_t)len > fw_dest_max() - offset) {
         fw_set_error(FW_UPDATE_ERR_RANGE);
         return 0;
     }
-
-    while (len) {
-        uint16_t page_inner = (uint16_t)(offset & (FW_PAGE_SIZE - 1u));
-        uint16_t chunk = (uint16_t)min_u32(len, FW_PAGE_SIZE - page_inner);
-        if (!fw_stage_write_page(offset, data, chunk)) {
-            flash_lock(fw_dest_base() + offset);
-            return 0;
-        }
-        offset += chunk;
-        data += chunk;
-        len = (uint16_t)(len - chunk);
+    if (offset & 1u) {
+        /* Halfword alignment is a hardware fact, and no producer emits odd
+         * offsets — only a trailing odd length, at end of file. */
+        fw_set_error(FW_UPDATE_ERR_ORDER);
+        return 0;
     }
 
-    if (fw_status.bytes < end_offset) {
-        fw_status.bytes = end_offset;
+    if (offset < fw_covered) {
+        uint16_t dup = (uint16_t)min_u32(fw_covered - offset, len);
+        if (!fw_flash_matches(offset, data, dup)) {
+            fw_set_error(FW_UPDATE_ERR_ORDER);
+            return 0;
+        }
+        offset += dup;
+        data += dup;
+        len = (uint16_t)(len - dup);
+        if (!len) {
+            return 1;
+        }
+    }
+    if (offset != fw_covered) {
+        fw_set_error(FW_UPDATE_ERR_ORDER);
+        return 0;
+    }
+
+    fw_stage_program(offset, data, len);
+    fw_covered = offset + len;
+
+    if (fw_status.bytes < fw_covered) {
+        fw_status.bytes = fw_covered;
         ++fw_status.sequence;
     }
     fw_maybe_ready();

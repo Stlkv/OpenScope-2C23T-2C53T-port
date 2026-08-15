@@ -1,6 +1,7 @@
 #include "dbgdump.h"
 
 #include "fpga.h"
+#include "fw_update.h"
 #include "hw.h"
 #include "scope.h"
 #include "ui.h"
@@ -62,7 +63,29 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
 
     fpga53_get_diag(&dg);
 
-    p = put_str(dst, cap, p, "OpenScope 2C53T DBG dump v1\n");
+    p = put_str(dst, cap, p, "OpenScope 2C53T DBG dump v2\n");
+
+    /* The updater's own state. Without it a self-flash that silently refused
+     * to apply is indistinguishable from one that applied — the file leaves
+     * the volume either way, and the frame counters only tell you a boot is
+     * old or young, not which image it is running. st: 0 idle, 1 staging,
+     * 2 ready, 3 error, 4 applying; err: 1 range, 2 vector, 3 order. */
+    {
+        fw_update_status_t fw;
+
+        fw_update_status(&fw);
+        p = put_str(dst, cap, p, "FW st=");
+        p = put_dec(dst, cap, p, fw.state);
+        p = put_str(dst, cap, p, " err=");
+        p = put_dec(dst, cap, p, fw.error);
+        p = put_str(dst, cap, p, " b=");
+        p = put_dec(dst, cap, p, fw.bytes);
+        p = put_str(dst, cap, p, "/");
+        p = put_dec(dst, cap, p, fw.expected_size);
+        p = put_str(dst, cap, p, " seq=");
+        p = put_dec(dst, cap, p, fw.sequence);
+        p = put_str(dst, cap, p, "\n");
+    }
 
     p = put_str(dst, cap, p, "I");
     p = put_dec(dst, cap, p, dg.inited);

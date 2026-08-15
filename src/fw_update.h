@@ -14,6 +14,10 @@ enum {
     FW_UPDATE_ERR_NONE,
     FW_UPDATE_ERR_RANGE,
     FW_UPDATE_ERR_VECTOR,
+    /* The staged bytes did not arrive in order, or a re-sent chunk disagreed
+     * with what is already in flash. Like every staging error this drops the
+     * file from the volume; copy it again to retry. */
+    FW_UPDATE_ERR_ORDER,
 };
 
 typedef struct {
