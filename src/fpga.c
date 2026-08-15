@@ -886,30 +886,45 @@ uint8_t fpga_ready(void) {
  * does; both clamp, and there the trace spans what the engine gives rather
  * than what the label says.
  *
- * That leaves 500 us/div through 20 ms/div genuinely uncovered: too slow for
- * index 0C's window, too fast for the roll sampler, which needs seconds. The
- * indices that would cover it are probably 0x0F-0x13 — stock's dwell table
- * grows exactly there — but against a 50 kHz input they returned two crossings
- * or fewer and could not be told apart from a dead capture. That needs a
- * slower input, not a guess. */
+ * 500 us/div through 5 ms/div used to be uncovered — too slow for index 0C's
+ * window, too fast for the roll sampler, which needs seconds. Indices 0x0D
+ * through 0x10 fill it, measured against a 2 kHz input: 0.125, 0.05, 0.025 and
+ * 0.0124 MSa/s. Against 50 kHz those same indices had returned two crossings
+ * or fewer and were written off as possibly dead. That was aliasing, not a
+ * dead capture: 40 us per sample against a 20 us period is far below Nyquist.
+ *
+ * 10 and 20 ms/div still clamp — they want 120 and 240 ms of window against
+ * the 67 ms index 0x10 gives. Indices 0x11-0x13 are slower again but measured
+ * two and a half samples per period even at 2 kHz, which is another alias.
+ * Those want a ~20 Hz input. */
 static const uint8_t fpga53_tb_index[] = {
     /* 50NS 100NS 200NS 500NS 1US 2US */
     0x07u, 0x07u, 0x07u, 0x07u, 0x07u, 0x07u,
     /* 5US  10US  20US  50US  100US 200US */
     0x07u, 0x08u, 0x09u, 0x0Au, 0x0Bu, 0x0Cu,
-    /* 500US 1MS 2MS 5MS 10MS 20MS 50MS 100MS 200MS 500MS 1S 2S 5S 10S */
-    0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu,
-    0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu, 0x0Cu,
+    /* 500US 1MS  2MS   5MS */
+    0x0Du, 0x0Eu, 0x0Fu, 0x10u,
+    /* 10MS 20MS — clamped: they want 120 and 240 ms of window and index 10
+     * gives 67 ms. Indices 11-13 are slower still, but at 2 kHz they measured
+     * two and a half samples per period, which is an alias, not a rate.
+     * Pinning them down wants a ~20 Hz input. */
+    0x10u, 0x10u,
+    /* 50MS onward belongs to the roll sampler; these entries only keep the
+     * table the same length as the UI's step list. */
+    0x10u, 0x10u, 0x10u, 0x10u, 0x10u, 0x10u, 0x10u, 0x10u,
 };
 
-/* Nanoseconds per frame-buffer entry, indexed the same way. 0x0C is 2024 and
- * not 2000 because that is what it measured: 0.0494 of the base rate, not
- * 0.05. */
+/* Nanoseconds per frame-buffer entry, indexed the same way — half a sample
+ * interval, because of the 2x stretch. Index 0x0C read 0.0494 of the base rate
+ * against a 50 kHz input, where it gets five samples per period, and an exact
+ * 0.2500 MSa/s against a 2 kHz one, where it gets 125. The second measurement
+ * is the one worth keeping. */
 static const uint16_t fpga53_tb_entry_ns[] = {
     40u, 40u, 40u, 40u, 40u, 40u,
-    40u, 100u, 200u, 400u, 1000u, 2024u,
-    2024u, 2024u, 2024u, 2024u, 2024u, 2024u, 2024u, 2024u,
-    2024u, 2024u, 2024u, 2024u, 2024u, 2024u,
+    40u, 100u, 200u, 400u, 1000u, 2000u,
+    4000u, 10000u, 20000u, 40404u,
+    40404u, 40404u,
+    40404u, 40404u, 40404u, 40404u, 40404u, 40404u, 40404u, 40404u,
 };
 
 enum { FPGA53_TB_STEPS = sizeof(fpga53_tb_index) / sizeof(fpga53_tb_index[0]) };
@@ -927,6 +942,13 @@ void fpga53_set_timebase(uint8_t ui_timebase) {
     if (!fpga_loaded) {
         return;
     }
+#if FPGA53_SWEEP_TB01
+    /* The sweep owns `01 <idx>` in a sweep build. Leaving both writers on the
+     * command means the UI silently overwrites whichever step the sweep is
+     * dwelling on, and the table comes out measuring the knob. */
+    (void)ui_timebase;
+    return;
+#else
     if (ui_timebase >= (uint8_t)FPGA53_TB_STEPS) {
         ui_timebase = (uint8_t)(FPGA53_TB_STEPS - 1u);
     }
@@ -953,6 +975,7 @@ void fpga53_set_timebase(uint8_t ui_timebase) {
      * index 0C a window is 4.1 ms, which is why this is computed and not a
      * constant. */
     delay_ms((uint32_t)((fpga53_tb_entry_now * 2u * FPGA53_CH_SAMPLES) / 1000000u) + 2u);
+#endif
 }
 #endif
 
