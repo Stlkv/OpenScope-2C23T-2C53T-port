@@ -44,6 +44,32 @@ typedef struct {
     uint16_t pose_calls;  /* fpga53_scope_pose_reapply entries (scope-mode entries) */
     uint16_t win_edges;   /* CH1 window: rising crossings of mid level, last read */
     uint16_t win_period;  /* CH1 window: mean edge-to-edge distance, samples x16 */
+    /* The same two for CH2, plus the trimmed range of both windows.
+     *
+     * Every number this port has measured since CH2 was proven independent on
+     * 2026-08-14 — the seam, the head skip, the sample-rate ladder — came off
+     * the CH1 window alone: the metric ran on the 0x04 buffer and the seam
+     * analyser only snapshotted opcode 0x04. CH2 had min/max over the whole
+     * untrimmed window and nothing else, which cannot tell a live second
+     * channel from a flat one that happens to sit at a different baseline.
+     *
+     * smin/smax above stay what they were, the raw range of the WHOLE window,
+     * dirty head included. wmin/wmax are the trimmed window the renderer
+     * actually draws, after the ADC offset subtraction — so the two channels'
+     * baselines and swings are comparable within one run, which is the only
+     * comparison worth making (journal numbers came off other builds). */
+    uint16_t win_edges2;
+    uint16_t win_period2;
+    uint8_t wmin, wmax;
+    uint8_t wmin2, wmax2;
+    /* Frontend state, for the CH2 hunt. crh_boot is GPIOD CRH sampled at
+     * fpga_init_once entry, BEFORE anything of ours writes PD12/PD13: if it
+     * reads 0xBB4BBBBB our unit boots those pins in EXMC alternate function
+     * like upstream's, where ODR is ignored and the input stays AC-coupled no
+     * matter what we write. fe_ch2 is the relay code last written to CH2's
+     * bank, so a dump says which row produced the numbers next to it. */
+    uint32_t crh_boot;
+    uint8_t fe_ch2;
     /* 32-bit on purpose: at the rates this sampler actually reaches a 16-bit
      * counter wraps in seconds, which makes "points per wall-clock second"
      * measured from two dumps ambiguous. */
@@ -190,6 +216,32 @@ void fpga53_seam_stats(uint16_t *gmax, uint16_t *gframes, uint16_t *frames);
  * where r2 could not have been the sample before the window's first. */
 void fpga53_seam_pre_stats(uint16_t *r1nz, uint16_t *jump);
 #endif
+
+/* Glitch reach per channel: furthest sample a short gap started at, fresh
+ * frames carrying one, fresh frames seen. Same rule the CH1-only seam build
+ * used on 2026-08-16 (a crossing-to-crossing gap under 30 samples), but always
+ * compiled in and counted for both windows, so "is CH2 as clean as CH1" is a
+ * question one dump answers instead of two flash cycles. The 30-sample
+ * threshold is tied to a 50 kHz input at 5 MSa/s, where the grid runs 48-52;
+ * on a slower input the window holds no crossings at all and the counters just
+ * stay at zero. ch: 0 = CH1 (opcode 0x04), 1 = CH2 (0x05). */
+void fpga53_glitch_stats(uint8_t ch,
+                         uint16_t *gmax,
+                         uint16_t *hit,
+                         uint16_t *frames);
+
+/* Trimmed-window envelope across frames, per channel — min of the minima, max
+ * of the maxima — cleared by the read. A single window is 166 us and holds a
+ * flat level on any slow input, so this is the number that says whether a
+ * channel follows a signal the window cannot contain. */
+void fpga53_window_envelope(uint8_t ch, uint8_t *emin, uint8_t *emax);
+
+/* Decimated raw samples of each channel's last window — the trimmed part, the
+ * one the renderer draws, before the ADC offset subtraction. Returns the
+ * buffer and reports its length and the sample step it was taken at. Summary
+ * numbers cannot distinguish "the window holds eight periods" from "it holds
+ * two and then a rail"; this can. */
+const uint8_t *fpga53_window_strip(uint8_t ch, uint8_t *len, uint8_t *step);
 
 /* One timing-sweep row: what the window looked like while <reg> held <val>.
  * period is samples x16 (0 = no periodic content measurable). */

@@ -234,6 +234,44 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
         p = put_str(dst, cap, p, "\n");
     }
 #endif
+    /* Both channels, measured the same way, in the same run. Everything this
+     * port measured after CH2 was proven independent on 2026-08-14 came off
+     * the CH1 window alone, so CH2's health after the DMA read, the head skip
+     * and the sample-rate work is untested — and comparing a fresh CH2 number
+     * against a CH1 number from another build's journal entry is exactly the
+     * kind of eyeballing that has cost this project days.
+     *
+     *   w   = trimmed window range this frame (ADC offset already removed)
+     *   env = envelope across frames since the previous dump; the liveness
+     *         test on inputs slower than the 166 us window
+     *   e/T16 = rising crossings and mean period x16, window samples
+     *   G   = glitch reach: furthest start / frames hit / fresh frames */
+    for (uint8_t ch = 0; ch < 2u; ++ch) {
+        uint16_t gmax = 0, hit = 0, frames = 0;
+        uint8_t emin = 0, emax = 0;
+
+        fpga53_glitch_stats(ch, &gmax, &hit, &frames);
+        fpga53_window_envelope(ch, &emin, &emax);
+        p = put_str(dst, cap, p, ch ? "C2 w=" : "C1 w=");
+        p = put_hex(dst, cap, p, ch ? dg.wmin2 : dg.wmin, 2);
+        p = put_str(dst, cap, p, "-");
+        p = put_hex(dst, cap, p, ch ? dg.wmax2 : dg.wmax, 2);
+        p = put_str(dst, cap, p, " env=");
+        p = put_hex(dst, cap, p, emin, 2);
+        p = put_str(dst, cap, p, "-");
+        p = put_hex(dst, cap, p, emax, 2);
+        p = put_str(dst, cap, p, " e=");
+        p = put_dec(dst, cap, p, ch ? dg.win_edges2 : dg.win_edges);
+        p = put_str(dst, cap, p, " T16=");
+        p = put_dec(dst, cap, p, ch ? dg.win_period2 : dg.win_period);
+        p = put_str(dst, cap, p, " G=");
+        p = put_dec(dst, cap, p, gmax);
+        p = put_str(dst, cap, p, "/");
+        p = put_dec(dst, cap, p, hit);
+        p = put_str(dst, cap, p, "/");
+        p = put_dec(dst, cap, p, frames);
+        p = put_str(dst, cap, p, "\n");
+    }
 
     p = put_str(dst, cap, p, "Q=");
     for (uint8_t i = 0; i < 5u; ++i) {
@@ -369,7 +407,61 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
     p = put_hex(dst, cap, p, GPIO_IDR(GPIOC_BASE) & 0xFFFFu, 4);
     p = put_str(dst, cap, p, " E=");
     p = put_hex(dst, cap, p, GPIO_IDR(GPIOE_BASE) & 0xFFFFu, 4);
+    p = put_str(dst, cap, p, " D=");
+    p = put_hex(dst, cap, p, GPIO_IDR(GPIOD_BASE) & 0xFFFFu, 4);
     p = put_str(dst, cap, p, "\n");
+
+    /* The frontend, as pins rather than as intent. crh0 is GPIOD CRH at boot,
+     * before we wrote anything: nibbles 4 and 5 (PD12, PD13) reading 8 or B
+     * mean alternate function, where EXMC owns the pin and our level writes go
+     * nowhere — upstream's unit boots 0xBB4BBBBB and is AC-coupled forever
+     * because of it. crh is the same register now. r2 is the relay code this
+     * build wrote to CH2's bank; the four pin levels after it are read back
+     * from IDR, so a bank that did not take is visible rather than assumed. */
+    {
+        uint32_t a = GPIO_IDR(GPIOA_BASE);
+        uint32_t b = GPIO_IDR(GPIOB_BASE);
+        uint32_t c = GPIO_IDR(GPIOC_BASE);
+        uint32_t e = GPIO_IDR(GPIOE_BASE);
+        uint32_t d = GPIO_IDR(GPIOD_BASE);
+
+        p = put_str(dst, cap, p, "FE crh0=");
+        p = put_hex(dst, cap, p, dg.crh_boot, 8);
+        p = put_str(dst, cap, p, " crh=");
+        p = put_hex(dst, cap, p, GPIO_CRH(GPIOD_BASE), 8);
+        p = put_str(dst, cap, p, " r2=");
+        p = put_hex(dst, cap, p, dg.fe_ch2, 2);
+        p = put_str(dst, cap, p, " ch1[c12,e4,e5,e6]=");
+        p = put_dec(dst, cap, p, (c >> 12) & 1u);
+        p = put_dec(dst, cap, p, (e >> 4) & 1u);
+        p = put_dec(dst, cap, p, (e >> 5) & 1u);
+        p = put_dec(dst, cap, p, (e >> 6) & 1u);
+        p = put_str(dst, cap, p, " ch2[a15,b11,b10,a10]=");
+        p = put_dec(dst, cap, p, (a >> 15) & 1u);
+        p = put_dec(dst, cap, p, (b >> 11) & 1u);
+        p = put_dec(dst, cap, p, (b >> 10) & 1u);
+        p = put_dec(dst, cap, p, (a >> 10) & 1u);
+        p = put_str(dst, cap, p, " cpl[d12,d13]=");
+        p = put_dec(dst, cap, p, (d >> 12) & 1u);
+        p = put_dec(dst, cap, p, (d >> 13) & 1u);
+        p = put_str(dst, cap, p, "\n");
+    }
+
+    /* The windows themselves, decimated: 64 raw samples stepped across the
+     * trimmed region each channel's renderer draws from. This is the line that
+     * says whether a window carries the periods its edge count claims. */
+    for (uint8_t ch = 0; ch < 2u; ++ch) {
+        uint8_t len = 0, step = 0;
+        const uint8_t *s = fpga53_window_strip(ch, &len, &step);
+
+        p = put_str(dst, cap, p, ch ? "S2/" : "S1/");
+        p = put_dec(dst, cap, p, step);
+        p = put_str(dst, cap, p, " ");
+        for (uint8_t i = 0; i < len; ++i) {
+            p = put_hex(dst, cap, p, s[i], 2);
+        }
+        p = put_str(dst, cap, p, "\n");
+    }
 
     /* The ODR line (what our code wrote, against IDR's actual pin levels) was
      * dropped 2026-08-15 for flash room. It existed for the frontend-pose

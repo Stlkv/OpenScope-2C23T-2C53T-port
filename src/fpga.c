@@ -140,6 +140,13 @@ enum {
 #define FPGA53_FE_SCOPE_POSE 0
 #endif
 
+/* Drive the PD12/PD13 coupling relays (HIGH = DC) instead of leaving them
+ * wherever the boot put them. Part of the scope pose, so it rides the same
+ * flag by default. */
+#ifndef FPGA53_FE_COUPLING
+#define FPGA53_FE_COUPLING FPGA53_FE_SCOPE_POSE
+#endif
+
 /* Stock-style paced readout: never gate on PC0 — stock reads the 0x04/0x05
  * window pair every ~29 ms unconditionally, and each read hands back the
  * latest (re-armed) capture. Bench 2026-08-13: PC0-gating breaks one way or
@@ -347,6 +354,14 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->pose_calls = fpga53_diag.pose_calls;
     d->win_edges = fpga53_diag.win_edges;
     d->win_period = fpga53_diag.win_period;
+    d->win_edges2 = fpga53_diag.win_edges2;
+    d->win_period2 = fpga53_diag.win_period2;
+    d->wmin = fpga53_diag.wmin;
+    d->wmax = fpga53_diag.wmax;
+    d->wmin2 = fpga53_diag.wmin2;
+    d->wmax2 = fpga53_diag.wmax2;
+    d->crh_boot = fpga53_diag.crh_boot;
+    d->fe_ch2 = fpga53_diag.fe_ch2;
     d->slow_points = fpga53_diag.slow_points;
     d->slow_busy = fpga53_diag.slow_busy;
     d->slow_min = fpga53_diag.slow_min;
@@ -633,26 +648,123 @@ static void fpga53_tmr13_ref_apply(void) {
 #endif
 }
 
-/* Analog frontend: upstream's scope posture, case 7 of their
- * fpga_set_scope_frontend_range + PC12 HIGH = DC coupling. Cold boots own the
- * relay bank — floating coils leave CH2's input path open.
+/* Stock's coarse relay/attenuator ladder, ONE table shared by both channels
+ * under a pin isomorphism (upstream 4c8ae0b, both range functions traced
+ * arm-by-arm from the stock image: gpio_mux_portc_porte @ 0x080088A4 for CH1,
+ * gpio_mux_porta_portb @ 0x08008A58 for CH2):
  *
- * Plus stock's scope-mode selector/mux posture (upstream Exp R decode of the
- * 4-way PC2:PC1 selector — stock takes the ==3 arm: PC2 HIGH, PC1 LOW — and
- * PC11 = meter MUX enable, HIGH only in meter mode). All three float in our
- * builds (IDR shows PC1/PC2 pulled high); a wrong selector pose is a live
- * candidate for the dead CH2 input path. */
-static void fpga53_fe_scope_pose_apply(void) {
-#if FPGA53_FE_SCOPE_POSE
-    gpio_set(GPIOC_BASE, 1u << 12);                    /* PC12 HIGH — DC */
-    gpio_clear(GPIOE_BASE, 1u << 4);
-    gpio_set(GPIOE_BASE, (1u << 5) | (1u << 6));
-    gpio_clear(GPIOA_BASE, (1u << 15) | (1u << 10));
-    gpio_clear(GPIOB_BASE, 1u << 10);
+ *   bit0 = input PATH select   PC12 <-> PA15   HIGH = direct, LOW = attenuated
+ *   bit1 =                     PE4  <-> PB11
+ *   bit2 =                     PE5  <-> PB10
+ *   bit3 =                     PE6  <-> PA10
+ *
+ * Two things this table says that our hand-written pose got wrong. First, the
+ * two channels have INDEPENDENT banks — CH2's is not a spectator of CH1's.
+ * Second, bit0 is the input path, not the coupling: LOW attenuates about 30x
+ * rather than disconnecting. Our pose put CH1 on 0x0D (path direct) and left
+ * CH2's pins at 0x02 (path attenuated, and 0x0D is not even a stock code), so
+ * the same probe signal reached the two channels through paths differing by
+ * that factor — which is what the bench measured on 2026-08-16 as "CH2 flat":
+ * 6 counts of envelope against CH1's 189. */
+static const uint8_t fpga53_relay_tbl[10] = {
+    0x0Bu, 0x0Fu, 0x05u, 0x03u, 0x07u, 0x0Au, 0x0Eu, 0x0Cu, 0x02u, 0x06u,
+};
+
+/* Which row each channel's bank takes. CH1 keeps the pose it has been running
+ * on for days (0x0D, direct path) so it stays the control in this experiment —
+ * changing both banks at once would move CH1's ~30 mV/count calibration in the
+ * same run that is supposed to judge CH2. CH2 takes row 0, the isomorphic
+ * direct-path code.
+ *
+ * Row 0 is 0x0B, so bit1 is set and PB11 stays HIGH: this build changes CH2's
+ * bank without releasing the pin our config and arm path holds. Rows whose
+ * bit1 is clear (2, 7) drive PB11 LOW, which upstream measured as harmless to
+ * an armed capture but we have not — and this pose runs after the arm writes,
+ * which is the only order in which that is worth trying. */
+#ifndef FPGA53_CH2_RELAY_ROW
+#define FPGA53_CH2_RELAY_ROW 0
+#endif
+#ifndef FPGA53_CH1_RELAY_RAW
+#define FPGA53_CH1_RELAY_RAW 0x0Du
+#endif
+
+static void fpga53_relay_apply_ch1(uint8_t bits) {
+    if (bits & 0x01u) {
+        gpio_set(GPIOC_BASE, 1u << 12);
+    } else {
+        gpio_clear(GPIOC_BASE, 1u << 12);
+    }
+    if (bits & 0x02u) {
+        gpio_set(GPIOE_BASE, 1u << 4);
+    } else {
+        gpio_clear(GPIOE_BASE, 1u << 4);
+    }
+    if (bits & 0x04u) {
+        gpio_set(GPIOE_BASE, 1u << 5);
+    } else {
+        gpio_clear(GPIOE_BASE, 1u << 5);
+    }
+    if (bits & 0x08u) {
+        gpio_set(GPIOE_BASE, 1u << 6);
+    } else {
+        gpio_clear(GPIOE_BASE, 1u << 6);
+    }
     gpio_config_mask(GPIOC_BASE, 1u << 12, 0x1u);
     gpio_config_mask(GPIOE_BASE, (1u << 4) | (1u << 5) | (1u << 6), 0x1u);
+}
+
+static void fpga53_relay_apply_ch2(uint8_t bits) {
+    if (bits & 0x01u) {
+        gpio_set(GPIOA_BASE, 1u << 15);
+    } else {
+        gpio_clear(GPIOA_BASE, 1u << 15);
+    }
+    if (bits & 0x02u) {
+        gpio_set(GPIOB_BASE, 1u << 11);
+    } else {
+        gpio_clear(GPIOB_BASE, 1u << 11);
+    }
+    if (bits & 0x04u) {
+        gpio_set(GPIOB_BASE, 1u << 10);
+    } else {
+        gpio_clear(GPIOB_BASE, 1u << 10);
+    }
+    if (bits & 0x08u) {
+        gpio_set(GPIOA_BASE, 1u << 10);
+    } else {
+        gpio_clear(GPIOA_BASE, 1u << 10);
+    }
     gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10), 0x1u);
-    gpio_config_mask(GPIOB_BASE, 1u << 10, 0x1u);
+    gpio_config_mask(GPIOB_BASE, (1u << 10) | (1u << 11), 0x1u);
+    fpga53_diag.fe_ch2 = bits;
+}
+
+/* Input coupling: PD12 (CH1) and PD13 (CH2), HIGH = DC.
+ *
+ * Our port has never written these pins — only PD2/PD3 — and the reset default
+ * leaves PD12 in EXMC alternate function (address line A17), where ODR is
+ * ignored and the pin sits LOW. Upstream found this on their unit (GPIOD CRH
+ * read 0xBB4BBBBB) and measured what it costs: a permanently AC-coupled input
+ * with a ~9 Hz high-pass, which they had spent a morning attributing to the
+ * analog front end. Whether OUR unit boots the same way is what crh_boot in
+ * the dump answers — it is sampled before this function runs. */
+static void fpga53_fe_coupling_apply(void) {
+#if FPGA53_FE_COUPLING
+    gpio_set(GPIOD_BASE, (1u << 12) | (1u << 13));     /* both DC */
+    gpio_config_mask(GPIOD_BASE, (1u << 12) | (1u << 13), 0x1u);
+#endif
+}
+
+/* Analog frontend for scope mode: both relay banks from the stock table, the
+ * coupling relays, and stock's scope-mode selector/mux posture (upstream Exp R
+ * decode of the 4-way PC2:PC1 selector — stock takes the ==3 arm: PC2 HIGH,
+ * PC1 LOW — and PC11 = meter MUX enable, HIGH only in meter mode). Cold boots
+ * own the relay bank: floating coils leave the input path wherever it was. */
+static void fpga53_fe_scope_pose_apply(void) {
+#if FPGA53_FE_SCOPE_POSE
+    fpga53_relay_apply_ch1((uint8_t)FPGA53_CH1_RELAY_RAW);
+    fpga53_relay_apply_ch2(fpga53_relay_tbl[FPGA53_CH2_RELAY_ROW]);
+    fpga53_fe_coupling_apply();
     gpio_set(GPIOC_BASE, 1u << 2);                     /* PC2 HIGH */
     gpio_clear(GPIOC_BASE, (1u << 1) | (1u << 11));    /* PC1 LOW, PC11 LOW */
     gpio_config_mask(GPIOC_BASE, (1u << 1) | (1u << 2) | (1u << 11), 0x1u);
@@ -684,6 +796,10 @@ void fpga_init_once(void) {
     if (fpga_loaded) {
         return;
     }
+    /* Before any of our writes: how the boot left GPIOD's high half. The
+     * coupling pins live there, and an alternate-function nibble means our
+     * later BSRR writes to them are ignored. */
+    fpga53_diag.crh_boot = GPIO_CRH(GPIOD_BASE);
     /* Configuration owns the bus outright — the slow-point sampler must not
      * clock a byte into the middle of the bitstream upload. */
     fpga53_bus_busy = 1u;
@@ -1111,7 +1227,35 @@ static uint32_t fpga53_win_sum[2];
  * deflates the mean period, so the same 50 kHz input reported T16=1478 in one
  * dump and 1600 in the next. A metric that disagrees with itself between dumps
  * cannot be the thing a sweep is judged by. */
-static void fpga53_window_metrics(void) {
+/* Runs per channel, on whichever window is currently in fpga53_ch_buf: the two
+ * reads share the buffer, so CH2's numbers have to be taken between its read
+ * and the next CH1 read rather than at the end of the frame.
+ *
+ * It also carries the glitch count that used to live in the seam build alone.
+ * That count is what decided FPGA53_HEAD_SKIP, and it only ever looked at CH1;
+ * keeping it here, for both channels and in every scope build, is what makes
+ * "did CH2 survive the read rewrite" answerable from one dump — with CH1 in
+ * the same dump as the baseline, which is the only baseline worth trusting. */
+static uint16_t fpga53_gl_max[2];
+static uint16_t fpga53_gl_hit[2];
+static uint16_t fpga53_gl_frames[2];
+static uint32_t fpga53_gl_last[2];
+
+/* Envelope of the trimmed window across frames, per channel, cleared every
+ * time a dump reads it. One window is 166 us, so on a slow input it holds a
+ * flat level and its own min-max says nothing about whether the channel is
+ * alive — but the level wanders between frames, and the envelope catches that
+ * wandering. It is what makes a 20 Hz input usable as a liveness test: the
+ * channel with the probe on it swings, the other one sits still. */
+static uint8_t fpga53_env_min[2] = {0xFFu, 0xFFu};
+static uint8_t fpga53_env_max[2];
+
+/* A crossing pair closer than this is the acquisition, not the input: at
+ * 50 kHz and 5 MSa/s the grid runs 48-52 samples, and a real edge jitters by
+ * one or two. Same constant the 2026-08-16 seam hunt used. */
+enum { FPGA53_GLITCH_GAP = 30u };
+
+static void fpga53_window_metrics(uint8_t ch) {
     uint8_t mn = 0xFFu;
     uint8_t mx = 0;
     uint8_t hi;
@@ -1120,6 +1264,19 @@ static void fpga53_window_metrics(void) {
     uint16_t edges = 0;
     uint16_t first = 0;
     uint16_t last = 0;
+    uint16_t prev = 0;   /* previous crossing of EITHER polarity, 0 = none yet */
+    uint8_t hit = 0;
+    /* The engine hands the same window back four or five times before it
+     * refills, so counting every read would inflate the denominator with
+     * duplicates — and unequally between channels, since the two are read at
+     * different points of the refill. The rolling sum of the whole window is
+     * the freshness test the seam analyser already used. */
+    uint8_t fresh = fpga53_win_sum[ch] != fpga53_gl_last[ch] ? 1u : 0u;
+
+    fpga53_gl_last[ch] = fpga53_win_sum[ch];
+    if (fresh) {
+        ++fpga53_gl_frames[ch];
+    }
 
     for (uint16_t i = FPGA53_HEAD_SKIP; i < FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP;
          ++i) {
@@ -1131,9 +1288,29 @@ static void fpga53_window_metrics(void) {
             mx = v;
         }
     }
+    if (ch) {
+        fpga53_diag.wmin2 = mn;
+        fpga53_diag.wmax2 = mx;
+    } else {
+        fpga53_diag.wmin = mn;
+        fpga53_diag.wmax = mx;
+    }
+    if (fresh) {
+        if (mn < fpga53_env_min[ch]) {
+            fpga53_env_min[ch] = mn;
+        }
+        if (mx > fpga53_env_max[ch]) {
+            fpga53_env_max[ch] = mx;
+        }
+    }
     if ((uint8_t)(mx - mn) < FPGA53_METRIC_MIN_SPREAD) {
-        fpga53_diag.win_edges = 0;
-        fpga53_diag.win_period = 0;
+        if (ch) {
+            fpga53_diag.win_edges2 = 0;
+            fpga53_diag.win_period2 = 0;
+        } else {
+            fpga53_diag.win_edges = 0;
+            fpga53_diag.win_period = 0;
+        }
         return;
     }
 
@@ -1143,6 +1320,8 @@ static void fpga53_window_metrics(void) {
     for (uint16_t i = FPGA53_HEAD_SKIP + 1u;
          i < FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP; ++i) {
         uint8_t v = fpga53_ch_buf[i];
+        uint8_t crossed = 0;
+
         if (!above && v >= hi) {
             above = 1u;
             if (!edges) {
@@ -1151,15 +1330,78 @@ static void fpga53_window_metrics(void) {
                 last = i;
             }
             ++edges;
+            crossed = 1u;
         } else if (above && v <= lo) {
             above = 0;
+            crossed = 1u;
+        }
+        /* Both polarities, unlike the period metric above: a glitch inside a
+         * plateau shows as a falling crossing followed by a rising one a few
+         * samples later, and counting rising edges alone goes blind to it. */
+        if (crossed) {
+            if (prev && (uint16_t)(i - prev) < FPGA53_GLITCH_GAP) {
+                hit = 1u;
+                if (fresh && prev > fpga53_gl_max[ch]) {
+                    fpga53_gl_max[ch] = prev;
+                }
+            }
+            prev = i;
         }
     }
 
-    fpga53_diag.win_edges = edges;
-    fpga53_diag.win_period = (edges >= 2u)
-                                 ? (uint16_t)(((uint32_t)(last - first) * 16u) / (edges - 1u))
-                                 : 0u;
+    if (fresh && hit) {
+        ++fpga53_gl_hit[ch];
+    }
+
+    if (ch) {
+        fpga53_diag.win_edges2 = edges;
+        fpga53_diag.win_period2 =
+            (edges >= 2u)
+                ? (uint16_t)(((uint32_t)(last - first) * 16u) / (edges - 1u))
+                : 0u;
+    } else {
+        fpga53_diag.win_edges = edges;
+        fpga53_diag.win_period =
+            (edges >= 2u)
+                ? (uint16_t)(((uint32_t)(last - first) * 16u) / (edges - 1u))
+                : 0u;
+    }
+}
+
+void fpga53_window_envelope(uint8_t ch, uint8_t *emin, uint8_t *emax) {
+    if (ch > 1u) {
+        ch = 1u;
+    }
+    if (emin) {
+        *emin = fpga53_env_min[ch];
+    }
+    if (emax) {
+        *emax = fpga53_env_max[ch];
+    }
+    /* Read and clear: an envelope that never resets saturates on the first
+     * connect-disconnect and then reports the same span forever, which reads
+     * exactly like a live channel. Each dump gets the span since the previous
+     * one, so the bench gesture is "attach the probe, take a dump". */
+    fpga53_env_min[ch] = 0xFFu;
+    fpga53_env_max[ch] = 0;
+}
+
+void fpga53_glitch_stats(uint8_t ch,
+                         uint16_t *gmax,
+                         uint16_t *hit,
+                         uint16_t *frames) {
+    if (ch > 1u) {
+        ch = 1u;
+    }
+    if (gmax) {
+        *gmax = fpga53_gl_max[ch];
+    }
+    if (hit) {
+        *hit = fpga53_gl_hit[ch];
+    }
+    if (frames) {
+        *frames = fpga53_gl_frames[ch];
+    }
 }
 
 #if FPGA53_SEAM_LOG
@@ -1621,6 +1863,47 @@ void fpga53_tsweep_axes(const uint8_t **regs,
  * and the sample post-processing happens afterwards, off the bus, where its
  * cost no longer races anything.
  */
+/* Decimated raw window per channel, kept for the dump.
+ *
+ * The bench on 2026-08-16 hit a case the summary numbers cannot settle: with
+ * the probe on CH2 the metric reported eight crossings spread across the
+ * window, while the screen showed one or two periods at the left edge and a
+ * flat top for the rest. One of the two is wrong about what the window holds,
+ * and neither min/max nor an edge count can say which — a decimated strip of
+ * the samples themselves can. Raw, before the offset subtraction clamps the
+ * low end to zero, and stepped across the trimmed window the renderer draws. */
+enum { FPGA53_STRIP_LEN = 64 };
+static uint8_t fpga53_strip[2][FPGA53_STRIP_LEN];
+
+const uint8_t *fpga53_window_strip(uint8_t ch, uint8_t *len, uint8_t *step) {
+    uint16_t s = (uint16_t)((FPGA53_CH_SAMPLES - FPGA53_HEAD_SKIP -
+                             FPGA53_TAIL_SKIP) / FPGA53_STRIP_LEN);
+
+    if (ch > 1u) {
+        ch = 1u;
+    }
+    if (len) {
+        *len = FPGA53_STRIP_LEN;
+    }
+    if (step) {
+        *step = s > 255u ? 255u : (uint8_t)s;
+    }
+    return fpga53_strip[ch];
+}
+
+static void fpga53_strip_take(uint8_t ch) {
+    uint16_t step = (uint16_t)((FPGA53_CH_SAMPLES - FPGA53_HEAD_SKIP -
+                                FPGA53_TAIL_SKIP) / FPGA53_STRIP_LEN);
+
+    if (!step) {
+        step = 1u;
+    }
+    for (uint8_t i = 0; i < FPGA53_STRIP_LEN; ++i) {
+        fpga53_strip[ch][i] =
+            fpga53_ch_buf[(uint16_t)(FPGA53_HEAD_SKIP + (uint16_t)i * step)];
+    }
+}
+
 static void fpga53_read_channel(uint8_t opcode) {
     uint8_t rmin = 0xFFu;
     uint8_t rmax = 0;
@@ -1647,6 +1930,8 @@ static void fpga53_read_channel(uint8_t opcode) {
         fpga53_seam_raw_snapshot();
     }
 #endif
+
+    fpga53_strip_take(opcode == 0x04u ? 0u : 1u);
 
     for (uint16_t i = 0; i < FPGA53_CH_SAMPLES; ++i) {
         uint8_t raw = fpga53_ch_buf[i];
@@ -1831,7 +2116,10 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
 #else
     fpga53_read_channel(0x04u);
 #endif
-    fpga53_window_metrics();
+    /* Indexed by the trace the samples land in, not by the opcode: under
+     * FPGA53_SWAP_ORDER the two reads trade places, and what a dump needs to
+     * name is the channel the user sees on screen. */
+    fpga53_window_metrics(0u);
 #if FPGA53_SEAM_LOG
     fpga53_seam_note();
 #endif
@@ -1854,6 +2142,7 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
 #else
     fpga53_read_channel(0x05u);
 #endif
+    fpga53_window_metrics(1u);
     for (uint16_t i = 0; i < FPGA_SAMPLE_COUNT; ++i) {
         uint16_t src = (uint16_t)((i >> 1) + FPGA53_HEAD_SKIP);
         if (src >= FPGA53_CH_SAMPLES - FPGA53_TAIL_SKIP) {
