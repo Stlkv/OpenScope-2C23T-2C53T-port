@@ -4639,11 +4639,45 @@ static uint8_t scope_find_trigger_offset(const uint8_t *samples, uint16_t *offse
         return 0;
     }
 
-    for (uint16_t i = 1; i < SCOPE_SAMPLE_COUNT; ++i) {
+    /* Search, and start drawing, only inside the part of the frame that holds
+     * a capture. On 2C53T the read drops a contaminated head and tail, so the
+     * slots past FPGA53_FRAME_VALID are the last real sample repeated to the
+     * end of the buffer — an edge "found" there is an artefact, and an offset
+     * that puts the visible window there draws a flat line and calls it a
+     * trace. That is what the bench saw on 2026-08-16: one period at the left
+     * edge and a straight line across the rest of the screen, on a channel
+     * whose window the dump showed carrying eight clean periods.
+     *
+     * The offset is clamped rather than wrapped for the same reason. The old
+     * expression masked with SCOPE_SAMPLE_COUNT-1, so an edge to the LEFT of
+     * the requested trigger position made the subtraction negative and the
+     * mask turned it into ~2000 — a start position past the end of the
+     * capture. Clamping costs the trigger its exact screen column when the
+     * edge sits near a boundary; wrapping cost the whole trace. */
+    uint16_t limit = SCOPE_SAMPLE_COUNT;
+    uint16_t max_start;
+    uint16_t visible = scope_visible_sample_count();
+
+#if HW_TARGET_2C53T
+    if (ui.scope_display != SCOPE_DISPLAY_ROLL && limit > (uint16_t)FPGA53_FRAME_VALID) {
+        limit = (uint16_t)FPGA53_FRAME_VALID;
+    }
+#endif
+    max_start = limit > visible ? (uint16_t)(limit - visible) : 0u;
+
+    for (uint16_t i = 1; i < limit; ++i) {
         uint8_t prev = samples[(uint16_t)((i - 1u) * 2u + src)];
         uint8_t cur = samples[(uint16_t)(i * 2u + src)];
         if (scope_trigger_crossed(prev, cur)) {
-            *offset = (uint16_t)((i - trigger_screen_pos) & (SCOPE_SAMPLE_COUNT - 1u));
+            int32_t start = (int32_t)i - (int32_t)trigger_screen_pos;
+
+            if (start < 0) {
+                start = 0;
+            }
+            if (start > (int32_t)max_start) {
+                start = (int32_t)max_start;
+            }
+            *offset = (uint16_t)start;
             return 1;
         }
     }
@@ -4931,11 +4965,18 @@ static int16_t scope_sample_y(uint16_t x,
          * those were where it came from. Past the end of the capture there is
          * simply nothing to draw. */
         int32_t pos = (int32_t)idx + (int32_t)scope_trigger_offset + h_offset;
+        /* The capture ends at FPGA53_FRAME_VALID, not at the end of the
+         * buffer: the slots between the two are the last real sample repeated
+         * by the read, and clamping to the buffer end drew them as signal. */
+        int32_t last = (int32_t)FPGA53_FRAME_VALID - 1;
+        if (last > (int32_t)(SCOPE_SAMPLE_COUNT - 2u)) {
+            last = (int32_t)(SCOPE_SAMPLE_COUNT - 2u);
+        }
         if (pos < 0) {
             pos = 0;
         }
-        if (pos > (int32_t)(SCOPE_SAMPLE_COUNT - 2u)) {
-            pos = (int32_t)(SCOPE_SAMPLE_COUNT - 2u);
+        if (pos > last) {
+            pos = last;
         }
         idx = (uint16_t)pos;
 #else
