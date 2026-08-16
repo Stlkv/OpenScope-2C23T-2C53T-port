@@ -164,6 +164,17 @@ release-2c53t-embed:
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-EMBED-08007000.bin
 	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-EMBED-08007000.bin
 
+# The CH2 relay ladder: hold each row of the stock table for a dwell and record
+# what CH2's window swings by under it (RSW table in DBG.TXT). Needs a steady
+# signal on the CH2 probe — 50 kHz is fine, the envelope does not care — and
+# takes about ten seconds, after which the bank parks back on its normal row.
+release-2c53t-rsweep:
+	rm -rf $(BUILD_ROOT)/2c53t
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_RELAY_SWEEP=1 $(SCOPE53_EXTRA)"
+	@mkdir -p $(DIST)
+	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-RSWEEP-08007000.bin
+	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-RSWEEP-08007000.bin
+
 # Same, plus the per-frame seam record (SEAM table in DBG.TXT). Feed it a
 # periodic signal with several periods in the window — 50 kHz gives ~10 — and
 # read the table: r2 against the seam's position, one row per frame.
