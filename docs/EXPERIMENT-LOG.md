@@ -48,6 +48,30 @@ that separates them is a build that holds PB11 LOW through config and arm, on an
 honest cold boot: if `DONE_FINAL` fails to set, the pin belongs to the run path
 and our rows 2 and 7 are only safe because they come late.
 
+**The discriminator was built and run the same evening — and the pin is free at
+every stage.** `make release-2c53t-pb11low` (`FPGA53_PB11_LOW_AT_CONFIG=1`)
+drives PB11 LOW at the very first bring-up write, before the bitstream, and
+nothing raises it again until the UI's first relay write. GPIOB is sampled once
+the instant the arm writes end and before the pose runs, because otherwise the
+dump could only show where the volts/div row left the pin. Honest cold boot,
+probe on CH2, 0.2 Vpp at 50 kHz, CH2 on row 2:
+
+```
+PB11 cfglow=1 idrb_arm=4000 b11_arm=0
+V=8120681B B=00039020 A=8003F460 WARM=0 BS=1
+C2 w=2E-9D env=00-9F e=9 T16=1552
+```
+
+`b11_arm=0` — config and arm both ran with the pin LOW. `A=8003F460` —
+DONE_FINAL set anyway. `C2` 111 counts and 9 edges — the same numbers as dump E
+above, which reached them with PB11 HIGH during config. **So on this unit PB11
+is a relay line and nothing else: it is not needed to configure, not needed to
+arm, and not needed to keep frames coming.** The "needed during config, free
+afterwards" reading is dead, which means upstream's arm failure without PB11 is
+either a board-revision difference or something else in their arm path — and it
+is now theirs to localise, with one unit's worth of evidence that the pin itself
+is innocent.
+
 **Not readable in these dumps:** the `G` glitch counters. They accumulate from
 boot, the timebase changed mid-session, and the 30-count threshold is tied to a
 particular amplitude and rate. Raw dumps of all five, with the full `FE`, `IDR`

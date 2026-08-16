@@ -120,6 +120,25 @@ enum {
 #define FPGA53_SEND_CFG 0
 #endif
 
+/* Bench experiment for issue #18 (2026-08-16): hold PB11 LOW through config
+ * AND the arm writes, instead of the HIGH level stock holds there.
+ *
+ * The two projects measured this pin from opposite ends and got opposite
+ * answers. Here, an armed engine keeps delivering data with PB11 LOW — rows 2
+ * and 7 of the relay ladder depend on it, five dumps on 2026-08-16. Upstream's
+ * guest-coldtrace will not ARM unless the pin is HIGH, and the reconstructed
+ * netlist constraints call the same pad run_enable. Neither result contradicts
+ * the other while our pose runs AFTER the arm writes: the pin can be needed
+ * during config and free afterwards.
+ *
+ * This build is the discriminator. If the part still reaches DONE_FINAL and
+ * frames still carry data with the pin LOW from the first bring-up write, PB11
+ * is a relay on this hardware and upstream's arm failure is something else. If
+ * config or the arm dies, the pin belongs to the run path and our rows 2 and 7
+ * are only safe because they come late — which the volts/div ladder would then
+ * have to work around. The flag's default is in fpga.h, where the dump can see
+ * it too. */
+
 /* PC0 data-ready polarity. Upstream's working cold rig (guest-coldtrace,
  * issue #18 2026-08-13) treats PC0 as ACTIVE LOW with an input pull-up
  * (undriven = HIGH = not ready); our warm-handoff builds historically used
@@ -905,7 +924,14 @@ void fpga_init_once(void) {
     /* Pre-load safe output levels BEFORE switching pin modes (no glitches):
      * CS idle HIGH, SPI-enable HIGH, active-mode HIGH — same levels stock
      * holds in scope mode, so the warm handoff does not disturb the FPGA. */
+#if FPGA53_PB11_LOW_AT_CONFIG
+    /* The one deviation from stock's levels, and the point of this build: PB11
+     * goes out LOW here and stays LOW until the UI's first relay write. */
+    gpio_set(GPIOB_BASE, 1u << 6);
+    gpio_clear(GPIOB_BASE, 1u << 11);
+#else
     gpio_set(GPIOB_BASE, (1u << 6) | (1u << 11));
+#endif
     gpio_set(GPIOC_BASE, 1u << 6);
     gpio_config_mask(GPIOB_BASE, (1u << 6) | (1u << 11), 0x1u);
     gpio_config_mask(GPIOC_BASE, 1u << 6, 0x1u);
@@ -1058,6 +1084,12 @@ void fpga_init_once(void) {
         SPI_CTRL1(SPI3_BASE) = ctrl1_saved; /* restore fast BR + SPE */
     }
 #endif
+
+    /* GPIOB the instant the arm sequence ends and before any pose or relay
+     * write can move PB11 again. Without this the dump can only show the pin
+     * where the volts/div row left it, which says nothing about the level the
+     * config and the arm actually ran under. */
+    fpga53_diag.idrb_arm = GPIO_IDR(GPIOB_BASE);
 
     fpga53_fe_scope_pose_apply();
 

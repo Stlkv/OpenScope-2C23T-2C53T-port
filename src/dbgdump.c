@@ -445,6 +445,17 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
         p = put_dec(dst, cap, p, (d >> 12) & 1u);
         p = put_dec(dst, cap, p, (d >> 13) & 1u);
         p = put_str(dst, cap, p, "\n");
+
+        /* What PB11 was doing while config and the arm ran, and which build
+         * this is: without the flag in the dump, a run that behaved normally
+         * cannot be told from a run of the ordinary build. */
+        p = put_str(dst, cap, p, "PB11 cfglow=");
+        p = put_dec(dst, cap, p, (uint32_t)FPGA53_PB11_LOW_AT_CONFIG);
+        p = put_str(dst, cap, p, " idrb_arm=");
+        p = put_hex(dst, cap, p, dg.idrb_arm, 4);
+        p = put_str(dst, cap, p, " b11_arm=");
+        p = put_dec(dst, cap, p, (dg.idrb_arm >> 11) & 1u);
+        p = put_str(dst, cap, p, "\n");
     }
 
 #if FPGA53_RELAY_SWEEP

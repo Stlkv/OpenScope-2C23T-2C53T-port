@@ -70,6 +70,10 @@ typedef struct {
      * bank, so a dump says which row produced the numbers next to it. */
     uint32_t crh_boot;
     uint8_t fe_ch2;
+    /* GPIOB sampled once, right after the arm writes and before the pose runs.
+     * Bit 11 of it is the only honest answer to "what level did config and arm
+     * see on PB11", since the relay row overwrites the pin milliseconds later. */
+    uint32_t idrb_arm;
     /* 32-bit on purpose: at the rates this sampler actually reaches a 16-bit
      * counter wraps in seconds, which makes "points per wall-clock second"
      * measured from two dumps ambiguous. */
@@ -265,6 +269,13 @@ void fpga53_window_envelope(uint8_t ch, uint8_t *emin, uint8_t *emax);
  * numbers cannot distinguish "the window holds eight periods" from "it holds
  * two and then a rail"; this can. */
 const uint8_t *fpga53_window_strip(uint8_t ch, uint8_t *len, uint8_t *step);
+
+/* Hold PB11 LOW through config and the arm writes (issue #18 discriminator,
+ * see the note at its use in fpga.c). Lives here because the dump prints it,
+ * and a flag whose default is written twice eventually disagrees with itself. */
+#ifndef FPGA53_PB11_LOW_AT_CONFIG
+#define FPGA53_PB11_LOW_AT_CONFIG 0
+#endif
 
 #ifndef FPGA53_RELAY_SWEEP
 #define FPGA53_RELAY_SWEEP 0

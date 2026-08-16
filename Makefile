@@ -175,6 +175,21 @@ release-2c53t-rsweep:
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-RSWEEP-08007000.bin
 	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-RSWEEP-08007000.bin
 
+# PB11 held LOW through config and the arm writes, where every other build
+# holds it HIGH like stock. This is the discriminator for issue #18: on this
+# bench an already-armed capture keeps its data with PB11 LOW, on upstream's
+# the part will not arm without it — and both can be true if the pin only
+# matters before the pose runs. Needs an honest COLD boot (a warm reboot skips
+# configuration and answers nothing) and a signal on the probe; read `A=` for
+# DONE_FINAL, `PB11 b11_arm=` for the level config and arm actually saw, and
+# C1/C2 for whether frames carry data.
+release-2c53t-pb11low:
+	rm -rf $(BUILD_ROOT)/2c53t
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_PB11_LOW_AT_CONFIG=1 $(SCOPE53_EXTRA)"
+	@mkdir -p $(DIST)
+	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-PB11LOW-08007000.bin
+	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-PB11LOW-08007000.bin
+
 # Same, plus the per-frame seam record (SEAM table in DBG.TXT). Feed it a
 # periodic signal with several periods in the window — 50 kHz gives ~10 — and
 # read the table: r2 against the seam's position, one row per frame.
