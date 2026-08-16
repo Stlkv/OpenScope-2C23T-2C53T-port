@@ -5339,6 +5339,34 @@ static void draw_scope_calibration_overlay(void) {
 }
 
 static int32_t scope_raw_delta_mv(uint8_t idx, uint8_t raw) {
+#if HW_TARGET_2C53T
+    /* Measured scale, not the 2C23T one. The relay ladder is the volts/div
+     * ladder at 25 counts per division (bench 2026-08-16), so the step alone
+     * says what a count is worth, and zero is where the channel sits with
+     * nothing on the probe — not the 128 a signed-centred ADC would use. Our
+     * samples come back with the ADC offset already subtracted, which puts
+     * that level near FPGA53_ZERO_COUNT.
+     *
+     * The old expression, delta*754/range_code, was the 2C23T ladder scaled by
+     * 0.94 and referred to 128; on this board it was arithmetic on a number
+     * nobody had measured, which is how a channel could read 68 V peak-to-peak
+     * off a 300 mV input. */
+    {
+        uint8_t vdiv;
+        int32_t delta;
+        int32_t uv;
+        int32_t mv;
+
+        if (idx >= 2u) {
+            idx = 0;
+        }
+        vdiv = scope_vdiv_ch[idx] < SCOPE_VDIV_COUNT ? scope_vdiv_ch[idx] : 0u;
+        delta = (int32_t)raw - (int32_t)FPGA53_ZERO_COUNT;
+        uv = delta * (int32_t)fpga53_range_uv_per_count(vdiv, scope_vdiv_base_mv[vdiv]);
+        mv = uv >= 0 ? (uv + 500) / 1000 : (uv - 500) / 1000;
+        return scope_probe_x10[idx] ? mv * 10 : mv;
+    }
+#else
     int32_t delta = (int32_t)raw - 128;
     int32_t numerator;
     int32_t mv;
@@ -5353,9 +5381,27 @@ static int32_t scope_raw_delta_mv(uint8_t idx, uint8_t raw) {
         (numerator + (int32_t)range / 2) / (int32_t)range :
         (numerator - (int32_t)range / 2) / (int32_t)range;
     return scope_probe_x10[idx] ? mv * 10 : mv;
+#endif
 }
 
 static uint32_t scope_raw_span_mv(uint8_t idx, uint8_t raw_span) {
+#if HW_TARGET_2C53T
+    /* Same ladder as scope_raw_delta_mv, minus the zero reference: a span is a
+     * difference and does not care where zero sits. */
+    {
+        uint8_t vdiv;
+        uint32_t uv;
+        uint32_t out;
+
+        if (idx >= 2u) {
+            idx = 0;
+        }
+        vdiv = scope_vdiv_ch[idx] < SCOPE_VDIV_COUNT ? scope_vdiv_ch[idx] : 0u;
+        uv = (uint32_t)raw_span * fpga53_range_uv_per_count(vdiv, scope_vdiv_base_mv[vdiv]);
+        out = (uv + 500u) / 1000u;
+        return scope_probe_x10[idx] ? out * 10u : out;
+    }
+#else
     uint32_t mv;
     uint16_t range;
 
@@ -5365,6 +5411,7 @@ static uint32_t scope_raw_span_mv(uint8_t idx, uint8_t raw_span) {
     range = scope_range_code_for_channel(idx);
     mv = ((uint32_t)raw_span * 754u + range / 2u) / range;
     return scope_probe_x10[idx] ? mv * 10u : mv;
+#endif
 }
 
 static uint32_t scope_estimate_freq_hz_window(uint8_t idx, uint16_t start, uint16_t end, uint8_t min_raw, uint8_t max_raw) {

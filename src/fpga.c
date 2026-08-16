@@ -670,23 +670,36 @@ static const uint8_t fpga53_relay_tbl[10] = {
     0x0Bu, 0x0Fu, 0x05u, 0x03u, 0x07u, 0x0Au, 0x0Eu, 0x0Cu, 0x02u, 0x06u,
 };
 
-/* Which row each channel's bank takes. CH1 keeps the pose it has been running
- * on for days (0x0D, direct path) so it stays the control in this experiment —
- * changing both banks at once would move CH1's ~30 mV/count calibration in the
- * same run that is supposed to judge CH2. CH2 takes row 0, the isomorphic
- * direct-path code.
+/* The table IS the volts/div ladder. Measured on CH2 at three input amplitudes,
+ * each row's gain taken as the SLOPE between two unclipped points so that the
+ * noise floor — five counts at the coarse rows, fifteen at the sensitive ones —
+ * drops out instead of inflating the small spans:
  *
- * Row 0 is 0x0B, so bit1 is set and PB11 stays HIGH: this build changes CH2's
- * bank without releasing the pin our config and arm path holds. Rows whose
- * bit1 is clear (2, 7) drive PB11 LOW, which upstream measured as harmless to
- * an armed capture but we have not — and this pose runs after the arm writes,
- * which is the only order in which that is worth trying. */
-#ifndef FPGA53_CH2_RELAY_ROW
-#define FPGA53_CH2_RELAY_ROW 0
-#endif
-#ifndef FPGA53_CH1_RELAY_RAW
-#define FPGA53_CH1_RELAY_RAW 0x0Du
-#endif
+ *   row        0     1     2     3     4     5     6     7     8     9
+ *   mV/count   0.4   0.80  1.98  4.0   7.5   19.4  35.0  ~117  ~233  ~350
+ *   1-2-5      0.4   0.8   2     4     8     20    40    80    200   400
+ *
+ * Row 4 came out 7.4 from the 100/300 mV pair and 7.69 from the 300/1000 pair,
+ * independently — that agreement is what says the method is sound. Rows 7-9
+ * rest on differences of six, three and two counts and are the loose end; they
+ * need volts at the input, not millivolts.
+ *
+ * At 25 counts per division that ladder is exactly ten 1-2-5 steps, 10 mV/div
+ * through 10 V/div, which is stock's own ladder. Our UI carries nine of them
+ * from 20 mV up, so a volts/div index becomes a row by adding one, and row 0
+ * is the sensitive step we do not offer yet. Nothing is fitted and nothing is
+ * left over for software to make up: the relay ladder and the knob are the
+ * same ladder.
+ *
+ * Rows 2 and 7 clear bit1, which drives PB11 LOW — the pin config and arm hold
+ * HIGH. Upstream measured that an armed capture survives it and we now depend
+ * on that at two volts/div settings; the pose runs after the arm writes, so if
+ * a capture ever dies on those steps, this is the first place to look. */
+enum { FPGA53_RELAY_COUNTS_PER_DIV = 25 };
+
+/* Row per channel, as the knob last set it. The default sits mid-ladder for
+ * the boot frames before the UI has configured anything. */
+static uint8_t fpga53_relay_row[2] = {4u, 4u};
 
 static void fpga53_relay_apply_ch1(uint8_t bits) {
     if (bits & 0x01u) {
@@ -739,6 +752,88 @@ static void fpga53_relay_apply_ch2(uint8_t bits) {
     fpga53_diag.fe_ch2 = bits;
 }
 
+/* Relay-ladder sweep: what each row of the stock table is actually worth.
+ *
+ * The table is stock's own, but nothing in it says which row corresponds to
+ * which volts/div — upstream measured the rows are not 1:1 with the ten vdiv
+ * settings and that the fine gain lives in the digital layer. Our UI has nine
+ * steps against the table's ten rows, so binding the knob to a row needs the
+ * ladder measured rather than assumed: hold each row for a dwell, record the
+ * envelope of CH2's trimmed window over the second half of it (the first half
+ * is relay settling), and print the ten spans. With one fixed input on the
+ * probe those spans ARE the attenuation ladder.
+ *
+ * CH2 only, CH1 left where it is, so the run has one variable. */
+#ifndef FPGA53_RELAY_SWEEP
+#define FPGA53_RELAY_SWEEP 0
+#endif
+#ifndef FPGA53_RELAY_DWELL
+#define FPGA53_RELAY_DWELL 24
+#endif
+
+#if FPGA53_RELAY_SWEEP
+/* Two sets: the pass being measured now, and the last one that completed.
+ * A single pass per boot cannot be checked against anything — the first run of
+ * this sweep recorded 20 counts for row 0 while the very same dump, on the
+ * very same row, showed 63. Reporting only completed passes, and numbering
+ * them, is what turns that into a reading someone can reproduce or refute. */
+static uint8_t fpga53_rsw_min[10];
+static uint8_t fpga53_rsw_max[10];
+static uint8_t fpga53_rsw_live_min[10];
+static uint8_t fpga53_rsw_live_max[10];
+static uint8_t fpga53_rsw_row;
+static uint8_t fpga53_rsw_dwell;
+static uint8_t fpga53_rsw_pass;
+
+void fpga53_relay_sweep_get(uint8_t row, uint8_t *code, uint8_t *mn, uint8_t *mx,
+                            uint8_t *pass) {
+    if (row > 9u) {
+        row = 9u;
+    }
+    if (code) {
+        *code = fpga53_relay_tbl[row];
+    }
+    if (mn) {
+        *mn = fpga53_rsw_min[row];
+    }
+    if (mx) {
+        *mx = fpga53_rsw_max[row];
+    }
+    if (pass) {
+        *pass = fpga53_rsw_pass;
+    }
+}
+#endif
+
+void fpga53_set_channel_range(uint8_t ch, uint8_t vdiv_idx) {
+    /* Our nine volts/div steps start at 20 mV, the ladder's row 1. */
+    uint8_t row = (uint8_t)(vdiv_idx + 1u);
+
+    if (ch > 1u) {
+        return;
+    }
+    if (row > 9u) {
+        row = 9u;
+    }
+    if (fpga53_relay_row[ch] == row) {
+        return; /* relays: write only on a change, they are mechanical */
+    }
+    fpga53_relay_row[ch] = row;
+    if (ch) {
+        fpga53_relay_apply_ch2(fpga53_relay_tbl[row]);
+    } else {
+        fpga53_relay_apply_ch1(fpga53_relay_tbl[row]);
+    }
+}
+
+uint16_t fpga53_range_uv_per_count(uint8_t vdiv_idx, uint32_t vdiv_mv) {
+    (void)vdiv_idx;
+    /* One division is 25 counts by construction of the ladder above, so the
+     * volts/div setting alone fixes what a count is worth. Microvolts because
+     * the sensitive steps are fractions of a millivolt per count. */
+    return (uint16_t)((vdiv_mv * 1000u) / FPGA53_RELAY_COUNTS_PER_DIV);
+}
+
 /* Input coupling: PD12 (CH1) and PD13 (CH2), HIGH = DC.
  *
  * Our port has never written these pins — only PD2/PD3 — and the reset default
@@ -762,8 +857,8 @@ static void fpga53_fe_coupling_apply(void) {
  * own the relay bank: floating coils leave the input path wherever it was. */
 static void fpga53_fe_scope_pose_apply(void) {
 #if FPGA53_FE_SCOPE_POSE
-    fpga53_relay_apply_ch1((uint8_t)FPGA53_CH1_RELAY_RAW);
-    fpga53_relay_apply_ch2(fpga53_relay_tbl[FPGA53_CH2_RELAY_ROW]);
+    fpga53_relay_apply_ch1(fpga53_relay_tbl[fpga53_relay_row[0]]);
+    fpga53_relay_apply_ch2(fpga53_relay_tbl[fpga53_relay_row[1]]);
     fpga53_fe_coupling_apply();
     gpio_set(GPIOC_BASE, 1u << 2);                     /* PC2 HIGH */
     gpio_clear(GPIOC_BASE, (1u << 1) | (1u << 11));    /* PC1 LOW, PC11 LOW */
@@ -2150,6 +2245,40 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
         }
         fpga53_frame[(uint16_t)(i * 2u + 1u)] = fpga53_ch_buf[src];
     }
+
+#if FPGA53_RELAY_SWEEP
+    /* One row per dwell, measured on the second half of it. Runs once and
+     * parks the bank back on row 0, so the relays stop clicking and the device
+     * is left in the pose the rest of the session expects. */
+    {
+        if (!fpga53_rsw_dwell) {
+            fpga53_relay_apply_ch2(fpga53_relay_tbl[fpga53_rsw_row]);
+            fpga53_rsw_live_min[fpga53_rsw_row] = 0xFFu;
+            fpga53_rsw_live_max[fpga53_rsw_row] = 0;
+        } else if (fpga53_rsw_dwell >= (uint8_t)(FPGA53_RELAY_DWELL / 2u)) {
+            if (fpga53_diag.wmin2 < fpga53_rsw_live_min[fpga53_rsw_row]) {
+                fpga53_rsw_live_min[fpga53_rsw_row] = fpga53_diag.wmin2;
+            }
+            if (fpga53_diag.wmax2 > fpga53_rsw_live_max[fpga53_rsw_row]) {
+                fpga53_rsw_live_max[fpga53_rsw_row] = fpga53_diag.wmax2;
+            }
+        }
+        if (++fpga53_rsw_dwell >= (uint8_t)FPGA53_RELAY_DWELL) {
+            fpga53_rsw_dwell = 0;
+            if (++fpga53_rsw_row >= 10u) {
+                fpga53_rsw_row = 0;
+                /* Publish the finished pass whole: a dump that catches the
+                 * sweep mid-lap would otherwise mix rows from two passes and
+                 * read as a ladder that changed shape. */
+                for (uint8_t i = 0; i < 10u; ++i) {
+                    fpga53_rsw_min[i] = fpga53_rsw_live_min[i];
+                    fpga53_rsw_max[i] = fpga53_rsw_live_max[i];
+                }
+                ++fpga53_rsw_pass;
+            }
+        }
+    }
+#endif
 
     fpga53_tsweep_step();
 

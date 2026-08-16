@@ -121,6 +121,17 @@ typedef struct {
 #ifndef FPGA53_TAIL_SKIP
 #define FPGA53_TAIL_SKIP 32u
 #endif
+/* Where a channel sits with nothing on the probe, in samples as the renderer
+ * sees them (the ADC offset is already subtracted by the read). Measured
+ * 2026-08-16 across the ladder rows: CH2 held 0x28 on every unclipped row, CH1
+ * read a few counts higher on the off-ladder code it used to be pinned to.
+ * This is the zero the volts conversion refers to — 128 is what a signed ADC
+ * would use and this one is not that. A per-channel calibration belongs here
+ * eventually; one constant is what today's numbers support. */
+#ifndef FPGA53_ZERO_COUNT
+#define FPGA53_ZERO_COUNT 40
+#endif
+
 enum {
     FPGA53_WINDOW_SAMPLES = 1023,
     /* Window samples that survive the trim, and the frame slots they fill
@@ -217,6 +228,18 @@ void fpga53_seam_stats(uint16_t *gmax, uint16_t *gframes, uint16_t *frames);
 void fpga53_seam_pre_stats(uint16_t *r1nz, uint16_t *jump);
 #endif
 
+/* Point a channel's relay bank at the row its volts/div step calls for. The
+ * stock relay table turned out to BE the volts/div ladder — ten 1-2-5 steps at
+ * 25 counts per division, measured on the bench 2026-08-16 — and our nine
+ * steps start one row in, so the mapping is index + 1 and nothing else.
+ * ch: 0 = CH1, 1 = CH2. Writes only when the row changes; these are relays. */
+void fpga53_set_channel_range(uint8_t ch, uint8_t vdiv_idx);
+
+/* What one sample count is worth at a given volts/div, in microvolts. Falls
+ * out of the same ladder: a division is 25 counts, so the setting alone fixes
+ * it. Microvolts because the sensitive steps are under a millivolt a count. */
+uint16_t fpga53_range_uv_per_count(uint8_t vdiv_idx, uint32_t vdiv_mv);
+
 /* Glitch reach per channel: furthest sample a short gap started at, fresh
  * frames carrying one, fresh frames seen. Same rule the CH1-only seam build
  * used on 2026-08-16 (a crossing-to-crossing gap under 30 samples), but always
@@ -242,6 +265,19 @@ void fpga53_window_envelope(uint8_t ch, uint8_t *emin, uint8_t *emax);
  * numbers cannot distinguish "the window holds eight periods" from "it holds
  * two and then a rail"; this can. */
 const uint8_t *fpga53_window_strip(uint8_t ch, uint8_t *len, uint8_t *step);
+
+#ifndef FPGA53_RELAY_SWEEP
+#define FPGA53_RELAY_SWEEP 0
+#endif
+#if FPGA53_RELAY_SWEEP
+/* Relay-ladder sweep results: for each of the stock table's ten rows, the code
+ * written and the envelope CH2's window showed while it was held. With a fixed
+ * input on the CH2 probe these spans are the attenuation ladder, which is what
+ * a volts/div knob has to be bound to. pass = how many complete laps have been published (the table is
+ * always a whole pass, never a mix of two). */
+void fpga53_relay_sweep_get(uint8_t row, uint8_t *code, uint8_t *mn, uint8_t *mx,
+                            uint8_t *pass);
+#endif
 
 /* One timing-sweep row: what the window looked like while <reg> held <val>.
  * period is samples x16 (0 = no periodic content measurable). */

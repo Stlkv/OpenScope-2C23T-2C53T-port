@@ -427,6 +427,12 @@ void scope_hw_configure_channels(uint8_t timebase,
     /* The span above means nothing on this board — fpga_write_scope_timing is
      * a stub. The rate is set by the engine's own index. */
     fpga53_set_timebase(timebase);
+    /* Volts/div, for the first time as an analog control rather than a label:
+     * each channel's relay bank takes the ladder row its step calls for. The
+     * SCOPE_ATTENUATOR_CONFIG path above stays off on this board — it is
+     * 2C23T's, and it drives one shared range index at the wrong pins. */
+    fpga53_set_channel_range(0u, ch1_vdiv);
+    fpga53_set_channel_range(1u, ch2_vdiv);
 #endif
     delay_ms(SCOPE_TIMING_SETTLE_MS);
 

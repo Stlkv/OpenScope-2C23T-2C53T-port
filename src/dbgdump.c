@@ -447,6 +447,33 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
         p = put_str(dst, cap, p, "\n");
     }
 
+#if FPGA53_RELAY_SWEEP
+    /* One line per relay row: the code and the envelope CH2 showed under it.
+     * Read with a fixed input on the CH2 probe, this is the attenuation
+     * ladder — the thing the volts/div knob needs before it can mean volts. */
+    {
+        uint8_t pass = 0;
+
+        p = put_str(dst, cap, p, "RSW row:code:min-max\n");
+        for (uint8_t i = 0; i < 10u; ++i) {
+            uint8_t code = 0, mn = 0, mx = 0;
+
+            fpga53_relay_sweep_get(i, &code, &mn, &mx, &pass);
+            p = put_dec(dst, cap, p, i);
+            p = put_str(dst, cap, p, ":");
+            p = put_hex(dst, cap, p, code, 2);
+            p = put_str(dst, cap, p, ":");
+            p = put_hex(dst, cap, p, mn, 2);
+            p = put_str(dst, cap, p, "-");
+            p = put_hex(dst, cap, p, mx, 2);
+            p = put_str(dst, cap, p, i == 9u ? "\n" : " ");
+        }
+        p = put_str(dst, cap, p, "RSW pass=");
+        p = put_dec(dst, cap, p, pass);
+        p = put_str(dst, cap, p, "\n");
+    }
+#endif
+
     /* The windows themselves, decimated: 64 raw samples stepped across the
      * trimmed region each channel's renderer draws from. This is the line that
      * says whether a window carries the periods its edge count claims. */
