@@ -449,6 +449,30 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
         /* What PB11 was doing while config and the arm ran, and which build
          * this is: without the flag in the dump, a run that behaved normally
          * cannot be told from a run of the ordinary build. */
+#if FPGA53_OP0A_PROBE
+        /* Both passes, all six bytes, and the 16-bit value stock would have
+         * assembled from them. Printed raw so a reader can disagree with our
+         * assembly without reflashing anything. */
+        for (uint8_t pass = 0; pass < 2u; ++pass) {
+            p = put_str(dst, cap, p, "OP0A pass");
+            p = put_dec(dst, cap, p, pass);
+            p = put_str(dst, cap, p, " f09=");
+            for (uint8_t i = 0; i < 3u; ++i) {
+                p = put_hex(dst, cap, p, dg.op09_bytes[pass][i], 2);
+            }
+            p = put_str(dst, cap, p, " f0A=");
+            for (uint8_t i = 0; i < 3u; ++i) {
+                p = put_hex(dst, cap, p, dg.op0a_bytes[pass][i], 2);
+            }
+            p = put_str(dst, cap, p, " v=");
+            p = put_hex(dst, cap, p,
+                        ((uint32_t)dg.op09_bytes[pass][2] << 8) |
+                            dg.op0a_bytes[pass][2],
+                        4);
+            p = put_str(dst, cap, p, "\n");
+        }
+#endif
+
         p = put_str(dst, cap, p, "PB11 cfglow=");
         p = put_dec(dst, cap, p, (uint32_t)FPGA53_PB11_LOW_AT_CONFIG);
         p = put_str(dst, cap, p, " idrb_arm=");

@@ -1091,6 +1091,28 @@ void fpga_init_once(void) {
      * config and the arm actually ran under. */
     fpga53_diag.idrb_arm = GPIO_IDR(GPIOB_BASE);
 
+#if FPGA53_OP0A_PROBE
+    /* Stock's 16-bit read: op 0x09 carries the high byte, then CS drops and a
+     * second frame with opcode 0x0A carries the low one. Frame shape is stock's
+     * own — opcode, one dummy, then the byte that matters — and both passes run
+     * here, with the engine armed and before the pose, so nothing of ours has
+     * touched the frontend between the config and the number. */
+    for (uint8_t pass = 0; pass < 2u; ++pass) {
+        gpio_clear(GPIOB_BASE, 1u << 6);
+        fpga53_diag.op09_bytes[pass][0] = fpga53_xfer(0x09u);
+        fpga53_diag.op09_bytes[pass][1] = fpga53_xfer(0xFFu);
+        fpga53_diag.op09_bytes[pass][2] = fpga53_xfer(0xFFu);
+        gpio_set(GPIOB_BASE, 1u << 6);
+        delay_ms(1);
+        gpio_clear(GPIOB_BASE, 1u << 6);
+        fpga53_diag.op0a_bytes[pass][0] = fpga53_xfer(0x0Au);
+        fpga53_diag.op0a_bytes[pass][1] = fpga53_xfer(0xFFu);
+        fpga53_diag.op0a_bytes[pass][2] = fpga53_xfer(0xFFu);
+        gpio_set(GPIOB_BASE, 1u << 6);
+        delay_ms(1);
+    }
+#endif
+
     fpga53_fe_scope_pose_apply();
 
 #ifdef FPGA53_TBIDX_SET

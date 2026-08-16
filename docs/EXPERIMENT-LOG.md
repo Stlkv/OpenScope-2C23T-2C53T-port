@@ -8,6 +8,41 @@ repository. Numbers, dump lines and commit hashes are as recorded on the bench;
 negative results are written up as carefully as positive ones, because half the
 value of this file is knowing where not to go again.
 
+## The op 0x09 / 0x0A pair reads deterministically here — and not comparably (2026-08-16, night)
+
+Upstream decoded a 16-bit read out of stock's dispatch table that nothing else
+reaches: op `0x09` carries the high byte, CS drops, a frame with opcode `0x0A`
+carries the low one. On their bench unit it is a stable `0x0089` with byte 0 of
+the op-09 frame reading `0x80`. A second unit's value would separate "constant
+of the design" from "something per-device", so `make release-2c53t-op0a` reads
+the pair twice, right after the arm writes and before the pose.
+
+Two cold boots, byte for byte identical:
+
+```
+OP0A pass0 f09=010000 f0A=080040 v=0040
+OP0A pass1 f09=3FFA00 f0A=000080 v=0080
+```
+
+So the read is deterministic and reproducible across boots — but it is not the
+same read they are making. Two things say so. The two passes, a millisecond
+apart, differ; theirs repeat. And `0x40` against `0x80` is one bit of position,
+not an increment, while our frame bytes (`01 00 00`, `3F FA 00`) look nothing
+like their `0x80`-led ones. That is the signature of this port's known readback
+defect — the extra high bit seen in `V=8120681B` against the true `0120681B` —
+rather than of a different value in the register.
+
+**So this cannot answer their question yet, and reporting `0x0040` as "our
+unit's value" would be worse than reporting nothing.** What separates the two
+readings is cheap: read the pair several times on our `/8` clock and again on
+`/256`, the divider the arm writes and the status read already require. If the
+numbers settle and take their shape at `/256`, the defect is our read clock, and
+that fixes more than this experiment — the same suspect sits under every skewed
+readback we have logged.
+
+Config survives the reads either way: `A=8003F460`, DONE_FINAL set, frames
+running afterwards.
+
 ## PB11 LOW does not stop a running capture — measured with a signal (2026-08-16, evening)
 
 Upstream asked for this one directly (issue #18, 2026-08-16): on their bench

@@ -70,6 +70,14 @@ typedef struct {
      * bank, so a dump says which row produced the numbers next to it. */
     uint32_t crh_boot;
     uint8_t fe_ch2;
+    /* The op 0x09 / 0x0A pair, read twice back to back. Two passes because a
+     * value that differs between them is a counter, not a constant, and that
+     * distinction costs nothing to make here and cannot be made later from one
+     * number. All three bytes of each frame are kept: upstream saw byte 0 of
+     * the op-09 frame read 0x80 on five tries of six, which is either a
+     * ready flag or noise, and only the raw bytes can ever say which. */
+    uint8_t op09_bytes[2][3];
+    uint8_t op0a_bytes[2][3];
     /* GPIOB sampled once, right after the arm writes and before the pose runs.
      * Bit 11 of it is the only honest answer to "what level did config and arm
      * see on PB11", since the relay row overwrites the pin milliseconds later. */
@@ -269,6 +277,18 @@ void fpga53_window_envelope(uint8_t ch, uint8_t *emin, uint8_t *emax);
  * numbers cannot distinguish "the window holds eight periods" from "it holds
  * two and then a rail"; this can. */
 const uint8_t *fpga53_window_strip(uint8_t ch, uint8_t *len, uint8_t *step);
+
+/* Read stock's op 0x09 / 0x0A pair once the engine is armed (issue #18,
+ * 2026-08-16). Upstream decoded the pair from the stock dispatch table — op
+ * 0x09's handler reads a byte, toggles CS and opens a second frame with an
+ * opcode nothing else reaches — and reads a stable 0x0089 on their bench unit,
+ * meaning unknown. A second unit's value is the cheapest thing that separates
+ * "constant of the design" from "something per-device", and no amount of
+ * reading the image can produce it. Off by default: this sends opcodes our
+ * port has never sent to a configured part. */
+#ifndef FPGA53_OP0A_PROBE
+#define FPGA53_OP0A_PROBE 0
+#endif
 
 /* Hold PB11 LOW through config and the arm writes (issue #18 discriminator,
  * see the note at its use in fpga.c). Lives here because the dump prints it,

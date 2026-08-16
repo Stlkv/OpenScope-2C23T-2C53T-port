@@ -175,6 +175,18 @@ release-2c53t-rsweep:
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-RSWEEP-08007000.bin
 	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-RSWEEP-08007000.bin
 
+# Stock's op 0x09 / 0x0A pair, read twice with the engine armed (OP0A lines in
+# DBG.TXT). Upstream reads a stable 0x0089 on their unit and does not know what
+# it is; a second unit's value is what tells a design constant from something
+# per-device. Otherwise an ordinary scope build - no signal needed, but the
+# usual honest cold boot is, since the read happens right after the arm.
+release-2c53t-op0a:
+	rm -rf $(BUILD_ROOT)/2c53t
+	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_OP0A_PROBE=1 $(SCOPE53_EXTRA)"
+	@mkdir -p $(DIST)
+	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-OP0A-08007000.bin
+	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-OP0A-08007000.bin
+
 # PB11 held LOW through config and the arm writes, where every other build
 # holds it HIGH like stock. This is the discriminator for issue #18: on this
 # bench an already-armed capture keeps its data with PB11 LOW, on upstream's
