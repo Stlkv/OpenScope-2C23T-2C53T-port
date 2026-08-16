@@ -8,6 +8,51 @@ repository. Numbers, dump lines and commit hashes are as recorded on the bench;
 negative results are written up as carefully as positive ones, because half the
 value of this file is knowing where not to go again.
 
+## PB11 LOW does not stop a running capture — measured with a signal (2026-08-16, evening)
+
+Upstream asked for this one directly (issue #18, 2026-08-16): on their bench
+`guest-coldtrace` will not arm unless PB11 is HIGH, and Komzpa's reconstructed
+constraints call the same pad `run_enable` — yet the stock relay table clears
+bit1 on rows 2 and 7, which we depend on at two volts/div settings. Their
+question was precise: not "do frames keep coming" but "do frames keep coming
+**with data**".
+
+**Rig.** Square 50 kHz, 50% duty, offset 0; timebase 10 us/div (`01 08`,
+5.00 MSa/s); cold boot, `WARM=0`, `A=8003F460`. Rows: 3 = `0x03` (PB11 HIGH),
+2 = `0x05` (PB11 LOW), 7 = `0x0C` (PB11 LOW). PB11 read back twice per dump —
+once from the `FE` line's `ch2[a15,b11,b10,a10]`, once from raw `IDR B`
+(`997D` = HIGH, `957D` = LOW), so the parse cannot flatter itself.
+
+| dump | probe, amplitude | CH2 row | PB11 | measured |
+|---|---|---|---|---|
+| A | CH1, 1 Vpp | 3 | HIGH | CH1 136 counts, 8 edges, `T16=1600` |
+| B | CH1, 1 Vpp | 2 | **LOW** | CH1 136 counts, 8 edges, `T16=1600` |
+| C | CH1, 1 Vpp | 7 | **LOW** | CH1 136 counts, 8 edges, `T16=1600` |
+| D | CH2, 0.2 Vpp | 3 | HIGH | CH2 60 counts, 9 edges, `T16=1502` |
+| E | CH2, 0.2 Vpp | 2 | **LOW** | CH2 **111 counts**, 9 edges, `T16=1504` |
+
+The frame counter advances across every step — 19073, 20961, 23104, 26842,
+28982 — so these are fresh windows, not a frozen buffer read five times. D and E
+also cross-check the ladder: the envelopes give 121/61 = 1.98 where the table
+predicts 4.0/1.98 = 2.02. E is the one that matters most: data arrives on the
+very channel whose relay row released the pin.
+
+**The caveat that may dissolve the disagreement.** Our pose runs AFTER the arm
+writes, and config and arm hold PB11 HIGH on every boot. So what is measured
+here is that PB11 LOW does not stop an **already configured and armed** engine.
+It is not measured — and does not follow — that the part will configure or arm
+with PB11 LOW, which is the stage upstream reports failing. Both observations
+can be true at once, with the pin mattering during config and free afterwards,
+and in that case there is no board-revision difference to look for. The test
+that separates them is a build that holds PB11 LOW through config and arm, on an
+honest cold boot: if `DONE_FINAL` fails to set, the pin belongs to the run path
+and our rows 2 and 7 are only safe because they come late.
+
+**Not readable in these dumps:** the `G` glitch counters. They accumulate from
+boot, the timebase changed mid-session, and the 30-count threshold is tied to a
+particular amplitude and rate. Raw dumps of all five, with the full `FE`, `IDR`
+and `S1`/`S2` lines, are archived outside the repository with the bench notes.
+
 ## CH2 REALLY SOLVED: its relay bank was on the attenuated path (2026-08-16)
 
 **What was wrong.** Stock has two independent relay banks, one per channel, and
