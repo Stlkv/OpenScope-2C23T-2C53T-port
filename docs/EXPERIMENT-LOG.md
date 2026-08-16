@@ -8,7 +8,7 @@ repository. Numbers, dump lines and commit hashes are as recorded on the bench;
 negative results are written up as carefully as positive ones, because half the
 value of this file is knowing where not to go again.
 
-## The op 0x09 / 0x0A pair reads deterministically here — and not comparably (2026-08-16, night)
+## The op 0x09 / 0x0A pair has nothing under it here — and the 0x03 read is samples (2026-08-16, night)
 
 Upstream decoded a 16-bit read out of stock's dispatch table that nothing else
 reaches: op `0x09` carries the high byte, CS drops, a frame with opcode `0x0A`
@@ -24,23 +24,47 @@ OP0A pass0 f09=010000 f0A=080040 v=0040
 OP0A pass1 f09=3FFA00 f0A=000080 v=0080
 ```
 
-So the read is deterministic and reproducible across boots — but it is not the
-same read they are making. Two things say so. The two passes, a millisecond
-apart, differ; theirs repeat. And `0x40` against `0x80` is one bit of position,
-not an increment, while our frame bytes (`01 00 00`, `3F FA 00`) look nothing
-like their `0x80`-led ones. That is the signature of this port's known readback
-defect — the extra high bit seen in `V=8120681B` against the true `0120681B` —
-rather than of a different value in the register.
+That looked deterministic, and the reading on the bench was that the read clock
+was skewing an otherwise real value — this port has a known readback skew, the
+extra high bit in `V=8120681B` against a true `0120681B`. So the next build read
+the pair four times on `/8` and four more on `/256`, the divider the arm writes
+and the status read already require:
 
-**So this cannot answer their question yet, and reporting `0x0040` as "our
-unit's value" would be worse than reporting nothing.** What separates the two
-readings is cheap: read the pair several times on our `/8` clock and again on
-`/256`, the divider the arm writes and the status read already require. If the
-numbers settle and take their shape at `/256`, the defect is our read clock, and
-that fixes more than this experiment — the same suspect sits under every skewed
-readback we have logged.
+```
+OP0A br8   p0 f09=000000 f0A=AA0220 v=0020
+OP0A br8   p1 f09=E00300 f0A=004000 v=0000
+OP0A br8   p2 f09=20AF75 f0A=000010 v=7510
+OP0A br8   p3 f09=010800 f0A=000000 v=0000
+OP0A br256 p0 f09=100000 f0A=010000 v=0000
+OP0A br256 p1 f09=79FA00 f0A=17FA00 v=0000
+OP0A br256 p2 f09=08C00F f0A=080040 v=0F40
+OP0A br256 p3 f09=0000C8 f0A=000080 v=C880
+```
 
-Config survives the reads either way: `A=8003F460`, DONE_FINAL set, frames
+**Nothing settles, on either divider — and the two-pass determinism was an
+artifact.** Pass 0 of this build differs from pass 0 of the previous one
+(`000000/AA0220` against `010000/080040`), and the only difference between the
+builds is loop length and a divider switch, i.e. timing. Two passes under
+identical conditions had simply landed identically twice; four passes show there
+is no value underneath. The bytes — `AA`, `FA`, `C8`, `75` — look like an
+undriven line, which fits: MISO is a floating input here, so when the part
+answers nothing, noise is what gets clocked in.
+
+**So we have no number to report, and reporting one would have been worse than
+reporting nothing.** On this unit those opcodes do not answer, while `0x04`/`0x05`
+return real data over the same bus in the same boot — so upstream's stable
+`0x0089` is about their state or their unit, not a constant we can confirm.
+Line closed rather than pursued: the next step would be checking whether the
+opcode needs a precondition, and nothing depends on the answer.
+
+**One useful thing did fall out of the same dumps.** Our `0x03` status read
+returns `Q=00 00 4E 4C 4C` — zeros followed by bytes that sit exactly on the
+window baseline (`0x4A–0x4D`). That is upstream's re-decode of stock's `0x03`
+confirmed on a second unit and an independent codebase: it is a live-sample
+readback, not the config-state register `00 01 42 2E` this project asserted for
+months.
+
+Config survives the reads throughout: `A=8003F460`, DONE_FINAL set, frames
 running afterwards.
 
 ## PB11 LOW does not stop a running capture — measured with a signal (2026-08-16, evening)

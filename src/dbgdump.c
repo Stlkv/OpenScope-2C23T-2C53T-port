@@ -453,9 +453,9 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
         /* Both passes, all six bytes, and the 16-bit value stock would have
          * assembled from them. Printed raw so a reader can disagree with our
          * assembly without reflashing anything. */
-        for (uint8_t pass = 0; pass < 2u; ++pass) {
-            p = put_str(dst, cap, p, "OP0A pass");
-            p = put_dec(dst, cap, p, pass);
+        for (uint8_t pass = 0; pass < 8u; ++pass) {
+            p = put_str(dst, cap, p, pass < 4u ? "OP0A br8 p" : "OP0A br256 p");
+            p = put_dec(dst, cap, p, pass & 3u);
             p = put_str(dst, cap, p, " f09=");
             for (uint8_t i = 0; i < 3u; ++i) {
                 p = put_hex(dst, cap, p, dg.op09_bytes[pass][i], 2);

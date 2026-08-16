@@ -76,8 +76,12 @@ typedef struct {
      * number. All three bytes of each frame are kept: upstream saw byte 0 of
      * the op-09 frame read 0x80 on five tries of six, which is either a
      * ready flag or noise, and only the raw bytes can ever say which. */
-    uint8_t op09_bytes[2][3];
-    uint8_t op0a_bytes[2][3];
+    /* Eight passes: four on the working read clock (/8) and four on /256, the
+     * divider the arm writes and the status read already require. Four rather
+     * than two per clock because one repeat cannot tell a value that settles
+     * from a value that alternates. */
+    uint8_t op09_bytes[8][3];
+    uint8_t op0a_bytes[8][3];
     /* GPIOB sampled once, right after the arm writes and before the pose runs.
      * Bit 11 of it is the only honest answer to "what level did config and arm
      * see on PB11", since the relay row overwrites the pin milliseconds later. */

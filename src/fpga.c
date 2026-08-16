@@ -1097,7 +1097,18 @@ void fpga_init_once(void) {
      * own — opcode, one dummy, then the byte that matters — and both passes run
      * here, with the engine armed and before the pose, so nothing of ours has
      * touched the frontend between the config and the number. */
-    for (uint8_t pass = 0; pass < 2u; ++pass) {
+    for (uint8_t pass = 0; pass < 8u; ++pass) {
+        /* Passes 4-7 repeat the whole thing at /256. Two cold boots on /8 gave
+         * bytes that were reproducible but shaped nothing like upstream's, and
+         * a one-bit step between passes is what this port's known readback skew
+         * looks like — so the clock is the variable to move before the number
+         * means anything. */
+        if (pass == 4u) {
+            SPI_CTRL1(SPI3_BASE) &= ~(1u << 6); /* SPE=0 */
+            SPI_CTRL1(SPI3_BASE) =
+                (SPI_CTRL1(SPI3_BASE) & ~(7u << 3)) | (7u << 3); /* BR=/256 */
+            SPI_CTRL1(SPI3_BASE) |= 1u << 6; /* SPE=1 */
+        }
         gpio_clear(GPIOB_BASE, 1u << 6);
         fpga53_diag.op09_bytes[pass][0] = fpga53_xfer(0x09u);
         fpga53_diag.op09_bytes[pass][1] = fpga53_xfer(0xFFu);
@@ -1111,6 +1122,11 @@ void fpga_init_once(void) {
         gpio_set(GPIOB_BASE, 1u << 6);
         delay_ms(1);
     }
+    /* Back to the working read clock, whatever the probe did. */
+    SPI_CTRL1(SPI3_BASE) &= ~(1u << 6);
+    SPI_CTRL1(SPI3_BASE) = (SPI_CTRL1(SPI3_BASE) & ~(7u << 3)) |
+                           (((uint32_t)FPGA_SPI_BR & 7u) << 3);
+    SPI_CTRL1(SPI3_BASE) |= 1u << 6;
 #endif
 
     fpga53_fe_scope_pose_apply();
