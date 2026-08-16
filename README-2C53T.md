@@ -1,10 +1,14 @@
 # Experimental 2C53T port (FNIRSI 2C53T target)
 
 This branch ports the F2C23T firmware to the **FNIRSI 2C53T** and adds an
-experimental read-only FPGA transport that produces **live oscilloscope
-waveforms on CH1** via a "warm handoff" from stock firmware. Findings and
-open questions are tracked in
+experimental FPGA transport that produces **live oscilloscope waveforms on both
+channels** from a cold boot. Findings and open questions are tracked in
 [OpenScope-2C53T issue #18](https://github.com/DavidClawson/OpenScope-2C53T/issues/18).
+
+The bench journal — every measurement, the numbers behind each conclusion, and
+the negative results — is in [docs/EXPERIMENT-LOG.md](docs/EXPERIMENT-LOG.md).
+Newest sections first; read the top two for the current state of the capture
+path and the vertical scale.
 
 ## What works on the 2C53T
 
@@ -14,9 +18,14 @@ open questions are tracked in
 - **Live CH1 waveform** after a warm handoff (see below); Vpp measurements
 - On-screen transport telemetry (two white lines in the scope grid)
 
-Not working yet: CH2 (both ADCs sample CH1 in the inherited FPGA state —
-see issue #18), timebase/vdiv control of real capture, DMM (different UART
-on this board), signal generator, buzzer.
+Working as of 2026-08-16: both channels independently (CH2's relay bank had
+been sitting on the attenuated path), the timebase knob over the engine's own
+sample-rate ladder from 5 us/div to 5 ms/div plus roll, and the volts/div knob
+over the relay ladder with volts computed from a measured scale.
+
+Not working yet: absolute vertical calibration (readings run 7-10% high against
+a generator's dial and want a proper reference), the signal generator, the
+buzzer, and the 500 us/div to 20 ms/div timebase gap.
 
 ## Build
 
