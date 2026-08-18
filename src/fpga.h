@@ -346,8 +346,8 @@ void fpga53_scope_pose_reapply(void);
  * mode by interval: a full read is ~1.4 ms of SPI and needs room. */
 void fpga53_slow_point_set_full(uint8_t full);
 
-/* Sample-rate ladder, measured 2026-08-16 (EXPERIMENT-LOG, "ДЕЛИТЕЛЬ
- * РАЗВЁРТКИ НАЙДЕН"). The engine takes the two-byte SPI3 command `01 <idx>`;
+/* Sample-rate ladder, measured 2026-08-16 (EXPERIMENT-LOG, "THE SAMPLE-RATE
+ * DIVIDER FOUND"). The engine takes the two-byte SPI3 command `01 <idx>`;
  * against a 50 kHz square the indices came out as a 1-2-5 ladder on round
  * sample counts:
  *
