@@ -10,17 +10,32 @@
  * of headroom" into "half the slot free", so the default build reads it from
  * its own region of internal flash instead.
  *
- * Flash map (AT32F403A, 1 MB, 0x08000000-0x080FFFFF):
+ * Flash map (AT32F403A, 1 MB, 0x08000000-0x080FFFFF) — the SHARED map,
+ * agreed geometry for BOTH firmwares that take turns in the app slot
+ * (this port and upstream DavidClawson's OpenScope; see
+ * docs/plans/flash-uklad-v2-2026-08-22.md in the workspace):
  *
- *   0x08000000  factory IAP bootloader           28 KB
- *   0x08007000  app slot                        224 KB   <- the image we build
- *   0x08040000  self-update staging             256 KB   <- room to grow to
- *   0x08080000  FPGA bitstream store            128 KB   <- this region
- *   0x080A0000  free                            384 KB
+ *   0x08000000  factory IAP bootloader           28 KB   nobody writes this
+ *   0x08006000  factory calibration page          4 KB   dump/restore tooling
+ *   0x08007000  app slot                     to 740 KB   whichever firmware
+ *                                                        is installed; the
+ *                                                        upstream image is
+ *                                                        595 KB and GROWING
+ *   0x08040000  self-update staging (ours)              transient; only used
+ *                                                        while THIS port runs,
+ *                                                        whose image is small,
+ *                                                        so the overlap with
+ *                                                        app-slot growth room
+ *                                                        is harmless
+ *   0x080C0000  FPGA bitstream store            128 KB   <- this region
+ *   0x080E0000  reserve                          126 KB
+ *   0x080FF800  settings (ours)                   2 KB
  *
- * The store is deliberately placed above the staging area's growth room, so
- * enlarging the app slot later (staging can run to 0x08080000) does not have
- * to move the bitstream and re-provision every unit.
+ * MOVED 2026-08-22, from 0x08080000: the upstream image outgrew 512 KB and
+ * overwrote the old location twice on this bench. 0x080C0000 clears a 740 KB
+ * app-slot ceiling. Migration is one file: the store is provisioned by
+ * dropping F2C23T-FPGA-BITSTREAM.BIN on the USB volume, and a boot with an
+ * empty/invalid store just reports BS=0 until that is done.
  *
  * Layout inside the store: a 16-byte header followed by the payload. The whole
  * thing is written verbatim from a file the host drops on the USB volume, so
@@ -30,7 +45,7 @@
  * which is why the header may sit ahead of the data it describes.
  */
 
-#define FPGA_BS_STORE_BASE  0x08080000u
+#define FPGA_BS_STORE_BASE  0x080C0000u
 #define FPGA_BS_STORE_MAX   0x00020000u /* 128 KB */
 #define FPGA_BS_HDR_BYTES   16u
 #define FPGA_BS_DATA_BASE   (FPGA_BS_STORE_BASE + FPGA_BS_HDR_BYTES)
