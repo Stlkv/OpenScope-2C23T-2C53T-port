@@ -3,6 +3,7 @@
 #include "board.h"
 #include "dbgdump.h"
 #include "fpga_bitstream_store.h"
+#include "fw_cache.h"
 #include "fw_update.h"
 #include "hw.h"
 #include "screenshot.h"
@@ -1546,6 +1547,113 @@ static void raw_fat_service_calrstor(void) {
     msc_unit_attention = 1;
 }
 
+/* ─── Firmware cache + swap triggers (fw_cache.c) ─────────────────────
+ * FWCACHEA.BIN / FWCACHEB.BIN: copy the file's bytes into cache slot A/B
+ * on the W25Q (manifest written last). SWAPA / SWAPB (empty files):
+ * verify the slot and install it over the app slot, ending in a system
+ * reset. All trigger files are deleted BEFORE acting, like DBGREQ — the
+ * idle scan repeats, and a surviving trigger would re-run a 10-second
+ * copy (or a reflash!) per scan. Verdicts: the FWC line in DBG.TXT. */
+
+static uint8_t root_entry_is_named(const uint8_t *entry, const char *name11) {
+    if (entry[0] == 0x00u || entry[0] == 0xE5u || (entry[11] & 0x18u)) {
+        return 0;
+    }
+    for (uint8_t i = 0; i < 11u; ++i) {
+        if (entry[i] != (uint8_t)name11[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint8_t root_entry_is_cache_a(const uint8_t *e) { return root_entry_is_named(e, "FWCACHEABIN"); }
+static uint8_t root_entry_is_cache_b(const uint8_t *e) { return root_entry_is_named(e, "FWCACHEBBIN"); }
+static uint8_t root_entry_is_swap_a(const uint8_t *e)  { return root_entry_is_named(e, "SWAPA      "); }
+static uint8_t root_entry_is_swap_b(const uint8_t *e)  { return root_entry_is_named(e, "SWAPB      "); }
+
+static uint8_t raw_fat_service_cache_intake(const raw_fat_volume_t *fat,
+                                            uint8_t (*pred)(const uint8_t *),
+                                            uint8_t slot) {
+    raw_fat_file_t file;
+    uint32_t ent_addr = 0;
+    uint32_t cluster;
+    uint32_t remaining;
+    uint16_t guard = 0;
+    uint8_t entry[32];
+
+    if (!raw_fat_find_named(fat, pred, &ent_addr)) {
+        return 0;
+    }
+    if (!raw_fat_read_bytes(fat, ent_addr, entry, sizeof(entry))) {
+        return 1;
+    }
+    raw_fat_delete_update_file(ent_addr); /* before acting; chain stays readable */
+
+    file.size = (uint32_t)entry[28] | ((uint32_t)entry[29] << 8) |
+                ((uint32_t)entry[30] << 16) | ((uint32_t)entry[31] << 24);
+    file.first_cluster = (uint32_t)entry[26] | ((uint32_t)entry[27] << 8);
+    if (fat->type == FAT_TYPE_32) {
+        file.first_cluster |=
+            ((uint32_t)entry[20] | ((uint32_t)entry[21] << 8)) << 16;
+    }
+
+    if (!fw_cache_intake_begin(slot, file.size)) {
+        return 1; /* status carries the verdict */
+    }
+    cluster = file.first_cluster;
+    remaining = file.size;
+    while (remaining && cluster >= 2u && !raw_fat_cluster_is_eoc(fat, cluster) &&
+           guard++ < 4096u) {
+        uint32_t lba = raw_fat_cluster_lba(fat, cluster);
+        for (uint8_t i = 0; i < fat->sectors_per_cluster && remaining; ++i) {
+            uint16_t chunk = remaining > fat->bytes_per_sector
+                                 ? fat->bytes_per_sector
+                                 : (uint16_t)remaining;
+            if (!raw_fat_read_sector(fat, lba + i, msc_root_shadow)) {
+                fw_cache_intake_abort();
+                return 1;
+            }
+            if (!fw_cache_intake_data(msc_root_shadow, chunk)) {
+                return 1;
+            }
+            remaining -= chunk;
+        }
+        if (remaining && !raw_fat_next_cluster(fat, cluster, &cluster)) {
+            fw_cache_intake_abort();
+            return 1;
+        }
+    }
+    (void)fw_cache_intake_finish();
+    return 1;
+}
+
+static void raw_fat_service_cache(void) {
+    raw_fat_volume_t fat;
+    uint32_t ent_addr = 0;
+
+    if (!raw_fat_mount(&fat) || fat.bytes_per_sector > MSC_SECTOR_SIZE) {
+        return;
+    }
+    uint8_t worked = 0;
+    worked |= raw_fat_service_cache_intake(&fat, root_entry_is_cache_a, FW_CACHE_SLOT_A);
+    worked |= raw_fat_service_cache_intake(&fat, root_entry_is_cache_b, FW_CACHE_SLOT_B);
+
+    if (raw_fat_find_named(&fat, root_entry_is_swap_a, &ent_addr)) {
+        raw_fat_delete_update_file(ent_addr);
+        fw_cache_swap(FW_CACHE_SLOT_A); /* returns only on refusal */
+        worked = 1;
+    }
+    if (raw_fat_find_named(&fat, root_entry_is_swap_b, &ent_addr)) {
+        raw_fat_delete_update_file(ent_addr);
+        fw_cache_swap(FW_CACHE_SLOT_B);
+        worked = 1;
+    }
+    if (worked) {
+        msc_unit_attention = 1;
+    }
+}
+
 static void raw_fat_scan_and_stage_update(void) {
     raw_fat_volume_t fat;
     raw_fat_file_t file;
@@ -1554,6 +1662,7 @@ static void raw_fat_scan_and_stage_update(void) {
     raw_fat_service_dbgreq();
     raw_fat_service_calreq();
     raw_fat_service_calrstor();
+    raw_fat_service_cache();
     if (!raw_fat_mount(&fat)) {
         return;
     }

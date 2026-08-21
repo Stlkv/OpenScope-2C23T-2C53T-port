@@ -1,6 +1,7 @@
 #include "dbgdump.h"
 
 #include "fpga.h"
+#include "fw_cache.h"
 #include "fw_update.h"
 #include "hw.h"
 #include "scope.h"
@@ -598,6 +599,23 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
     p = put_dec(dst, cap, p, fw_cal_restore_runs());
     p = put_str(dst, cap, p, " fcrc=");
     p = put_hex(dst, cap, p, fw_cal_restore_crc(), 8);
+    p = put_str(dst, cap, p, "\n");
+
+    /* Firmware cache (fw_cache.c): per-slot manifest size/crc (0 = no valid
+     * manifest), last intake and swap verdicts. A successful swap is never
+     * seen here — the device resets into the other firmware. */
+    p = put_str(dst, cap, p, "FWC A=");
+    p = put_dec(dst, cap, p, fw_cache_slot_size(FW_CACHE_SLOT_A));
+    p = put_str(dst, cap, p, "/");
+    p = put_hex(dst, cap, p, fw_cache_slot_crc(FW_CACHE_SLOT_A), 8);
+    p = put_str(dst, cap, p, " B=");
+    p = put_dec(dst, cap, p, fw_cache_slot_size(FW_CACHE_SLOT_B));
+    p = put_str(dst, cap, p, "/");
+    p = put_hex(dst, cap, p, fw_cache_slot_crc(FW_CACHE_SLOT_B), 8);
+    p = put_str(dst, cap, p, " in=");
+    p = put_hex(dst, cap, p, fw_cache_intake_status(), 2);
+    p = put_str(dst, cap, p, " sw=");
+    p = put_hex(dst, cap, p, fw_cache_swap_status(), 2);
     p = put_str(dst, cap, p, "\n");
 
     return p;
