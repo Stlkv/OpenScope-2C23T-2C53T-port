@@ -22,8 +22,16 @@
 
 enum {
     CACHE_SLOT_SPAN   = 0x00100000u,
-    CACHE_SLOT_A_BASE = 0x00E00000u,
-    CACHE_SLOT_B_BASE = 0x00F00000u,
+    /* Inside upstream's W25Q map these two megabytes are the TAIL of its
+     * read-only screenshot volume ("uservol", 0x200000..0xF00000) — the
+     * one region its firmware never writes. 0xF00000+ is OFF LIMITS: its
+     * usercal / settings / modules / scratch regions live there (an
+     * earlier revision of this file put slot B at 0xF00000 and clobbered
+     * them — caught 2026-08-22). The clean end state is upstream carving
+     * an explicit "fwcache" region out of uservol's tail; these addresses
+     * are that proposal. */
+    CACHE_SLOT_A_BASE = 0x00D00000u,
+    CACHE_SLOT_B_BASE = 0x00E00000u,
     CACHE_SECTOR      = 4096u,
     CACHE_DATA_OFF    = CACHE_SECTOR,           /* manifest sector first */
     CACHE_DATA_MAX    = 0x000B9000u,            /* 0x08007000..0x080C0000 */

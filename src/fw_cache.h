@@ -21,13 +21,16 @@
  *
  * Chip layout (W25Q128, 16 MB; volume LBA0 = chip addr 0):
  *
- *   0x00E00000  slot A: manifest sector (4K) + image data   1 MB
- *   0x00F00000  slot B: manifest sector (4K) + image data   1 MB
+ *   0x00D00000  slot A: manifest sector (4K) + image data   1 MB
+ *   0x00E00000  slot B: manifest sector (4K) + image data   1 MB
  *
- * The FAT volume spans the chip, so a sufficiently full volume COULD place
- * file clusters up here; the manifest CRC catches any such clobber at swap
- * time and a re-drop of the cache file heals it. A carved-out region layer
- * is the clean fix and is deliberately out of scope here.
+ * These 2 MB sit in the tail of upstream's read-only screenshot volume,
+ * clear of its usercal/settings/modules/scratch regions at 0xF00000+
+ * (slot B lived at 0xF00000 for one night and clobbered them — moved
+ * 2026-08-22). A FAT volume could still place file clusters here; the
+ * manifest CRC catches any clobber at swap time and a re-drop heals it.
+ * The clean end state is an explicit shared "fwcache" region, proposed
+ * to upstream alongside the fwload PR.
  *
  * Fits the shared flash map in fpga_bitstream_store.h: installed images may
  * run 0x08007000..0x080C0000 (740 KB ceiling, below the bitstream store).
