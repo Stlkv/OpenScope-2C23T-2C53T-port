@@ -1267,12 +1267,13 @@ static uint8_t raw_fat_find_named(const raw_fat_volume_t *fat,
 }
 
 static uint8_t raw_fat_write_dbg_entry(uint32_t dir_byte_addr,
+                                       const char *name11,
                                        uint32_t first_cluster,
                                        uint32_t size) {
     uint8_t entry[32];
 
     buf_zero(entry, sizeof(entry));
-    buf_copy(entry, (const uint8_t *)"DBG     TXT", 11);
+    buf_copy(entry, (const uint8_t *)name11, 11);
     entry[11] = 0x20;
     entry[12] = 0x18;
     put_le16(&entry[20], (uint16_t)(first_cluster >> 16));
@@ -1356,7 +1357,7 @@ static void raw_fat_service_dbgreq(void) {
         }
         if (cluster < 2u ||
             !raw_fat_write_dbg_cluster(&fat, cluster, text, len) ||
-            !raw_fat_write_dbg_entry(txt_addr, cluster, len)) {
+            !raw_fat_write_dbg_entry(txt_addr, "DBG     TXT", cluster, len)) {
             return;
         }
     } else {
@@ -1368,10 +1369,180 @@ static void raw_fat_service_dbgreq(void) {
         }
         cluster = raw_screenshot_clusters[0];
         if (!raw_fat_write_dbg_cluster(&fat, cluster, text, len) ||
-            !raw_fat_write_dbg_entry(txt_addr, cluster, len)) {
+            !raw_fat_write_dbg_entry(txt_addr, "DBG     TXT", cluster, len)) {
             return;
         }
     }
+    msc_unit_attention = 1;
+}
+
+/* ─── Host-triggered calibration dump: CALREQ → CAL.BIN ───────────────
+ * Same trigger discipline as DBGREQ above: the host drops an EMPTY file
+ * named CALREQ (no extension) in the root; the idle scan spots it, deletes
+ * it and (re)writes CAL.BIN — the raw 4096-byte factory-calibration page
+ * at 0x08006000, which is exactly one cluster on this volume. MCU flash is
+ * only READ here; the integrity cross-check is the CAL crc=/ff= line in
+ * DBG.TXT (dbgdump.c), same CRC-32 as `crc32 CAL.BIN` on the host. */
+
+static uint8_t root_entry_is_calreq(const uint8_t *entry) {
+    static const uint8_t name[11] = {'C', 'A', 'L', 'R', 'E', 'Q',
+                                     ' ', ' ', ' ', ' ', ' '};
+    if (entry[0] == 0x00u || entry[0] == 0xE5u || (entry[11] & 0x18u)) {
+        return 0;
+    }
+    for (uint8_t i = 0; i < 11u; ++i) {
+        if (entry[i] != name[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint8_t root_entry_is_calbin(const uint8_t *entry) {
+    static const uint8_t name[11] = {'C', 'A', 'L', ' ', ' ', ' ',
+                                     ' ', ' ', 'B', 'I', 'N'};
+    if (entry[0] == 0x00u || entry[0] == 0xE5u || (entry[11] & 0x18u)) {
+        return 0;
+    }
+    for (uint8_t i = 0; i < 11u; ++i) {
+        if (entry[i] != name[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void raw_fat_service_calreq(void) {
+    raw_fat_volume_t fat;
+    uint32_t req_addr = 0;
+    uint32_t bin_addr = 0;
+    uint32_t cluster = 0;
+    const char *page = (const char *)0x08006000u;
+    const uint16_t len = 4096u;
+
+    if (!raw_fat_mount(&fat) || fat.bytes_per_sector > MSC_SECTOR_SIZE) {
+        return;
+    }
+    if (!raw_fat_find_named(&fat, root_entry_is_calreq, &req_addr)) {
+        return;
+    }
+    raw_fat_delete_update_file(req_addr); /* generic 0xE5 delete */
+
+    /* The write is bounded by one cluster the same way DBG.TXT is. On this
+     * volume a cluster is 4096 bytes — the whole page, not a truncation —
+     * and this guard keeps a smaller-cluster volume from silently clipping
+     * the file: no CAL.BIN is better than a short one that looks complete. */
+    if ((uint32_t)fat.bytes_per_sector * fat.sectors_per_cluster <
+        (uint32_t)len) {
+        return;
+    }
+
+    if (raw_fat_find_named(&fat, root_entry_is_calbin, &bin_addr)) {
+        /* Overwrite in place: reuse the existing entry's first cluster. */
+        uint8_t entry[32];
+        if (!raw_fat_read_bytes(&fat, bin_addr, entry, sizeof(entry))) {
+            return;
+        }
+        cluster = (uint32_t)entry[26] | ((uint32_t)entry[27] << 8);
+        if (fat.type == FAT_TYPE_32) {
+            cluster |= ((uint32_t)entry[20] | ((uint32_t)entry[21] << 8)) << 16;
+        }
+        if (cluster < 2u ||
+            !raw_fat_write_dbg_cluster(&fat, cluster, page, len) ||
+            !raw_fat_write_dbg_entry(bin_addr, "CAL     BIN", cluster, len)) {
+            return;
+        }
+    } else {
+        uint16_t unused_index = 0;
+        if (!raw_fat_find_screenshot_dir_entry(&fat, &bin_addr, &unused_index) ||
+            !raw_fat_find_free_clusters(&fat, 1u) ||
+            !raw_fat_link_clusters(&fat, 1u)) {
+            return;
+        }
+        cluster = raw_screenshot_clusters[0];
+        if (!raw_fat_write_dbg_cluster(&fat, cluster, page, len) ||
+            !raw_fat_write_dbg_entry(bin_addr, "CAL     BIN", cluster, len)) {
+            return;
+        }
+    }
+    msc_unit_attention = 1;
+}
+
+/* ─── Host-triggered calibration restore: CALRSTOR.BIN → cal page ─────
+ * The host drops CALRSTOR.BIN (exactly 4096 bytes — the CAL.BIN artifact
+ * from a previous CALREQ dump) in the root; the idle scan spots it,
+ * deletes the entry, reads its one cluster and hands the bytes to
+ * fw_cal_restore() (fw_update.c — target address fixed there, size gated
+ * there, verified by read-back). The verdict is the CALW st=/runs=/fcrc=
+ * fields in DBG.TXT; this function deliberately has no verdict channel of
+ * its own so there is exactly one place to look.
+ *
+ * The entry is deleted BEFORE acting, like DBGREQ: the idle scan runs
+ * repeatedly, and a surviving trigger file would re-run a flash write per
+ * scan. One file, one restore attempt; copy again to retry. */
+
+static uint8_t root_entry_is_calrstor(const uint8_t *entry) {
+    static const uint8_t name[11] = {'C', 'A', 'L', 'R', 'S', 'T', 'O', 'R',
+                                     'B', 'I', 'N'};
+    if (entry[0] == 0x00u || entry[0] == 0xE5u || (entry[11] & 0x18u)) {
+        return 0;
+    }
+    for (uint8_t i = 0; i < 11u; ++i) {
+        if (entry[i] != name[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void raw_fat_service_calrstor(void) {
+    raw_fat_volume_t fat;
+    /* One cluster of file body. Static because 4 KB is too big for the MSC
+     * task stack; idle-scan calls are serialized so one buffer suffices. */
+    static uint8_t body[4096];
+    uint8_t entry[32];
+    uint32_t ent_addr = 0;
+    uint32_t cluster = 0;
+    uint32_t size = 0;
+    uint32_t lba;
+
+    if (!raw_fat_mount(&fat) || fat.bytes_per_sector > MSC_SECTOR_SIZE) {
+        return;
+    }
+    if (!raw_fat_find_named(&fat, root_entry_is_calrstor, &ent_addr)) {
+        return;
+    }
+    if (!raw_fat_read_bytes(&fat, ent_addr, entry, sizeof(entry))) {
+        return;
+    }
+    raw_fat_delete_update_file(ent_addr); /* generic 0xE5 delete, before acting */
+
+    size = (uint32_t)entry[28] | ((uint32_t)entry[29] << 8) |
+           ((uint32_t)entry[30] << 16) | ((uint32_t)entry[31] << 24);
+    cluster = (uint32_t)entry[26] | ((uint32_t)entry[27] << 8);
+    if (fat.type == FAT_TYPE_32) {
+        cluster |= ((uint32_t)entry[20] | ((uint32_t)entry[21] << 8)) << 16;
+    }
+
+    /* A wrong-size file is refused by fw_cal_restore (CALW st=E1) without
+     * reading the body; reading it would need chain-walking that a correct
+     * file (4096 bytes = one cluster on this volume) never needs. */
+    if (size != sizeof(body) || cluster < 2u ||
+        (uint32_t)fat.bytes_per_sector * fat.sectors_per_cluster <
+            sizeof(body)) {
+        (void)fw_cal_restore(0, size);
+        msc_unit_attention = 1;
+        return;
+    }
+
+    lba = raw_fat_cluster_lba(&fat, cluster);
+    for (uint8_t s = 0; s < fat.sectors_per_cluster; ++s) {
+        if (!raw_fat_read_sector(&fat, lba + s,
+                                 body + (uint32_t)s * fat.bytes_per_sector)) {
+            return; /* unreadable body: leave CALW untouched, no half-reads */
+        }
+    }
+    (void)fw_cal_restore(body, sizeof(body));
     msc_unit_attention = 1;
 }
 
@@ -1381,6 +1552,8 @@ static void raw_fat_scan_and_stage_update(void) {
 
     ++msc_dbg_scan_runs;
     raw_fat_service_dbgreq();
+    raw_fat_service_calreq();
+    raw_fat_service_calrstor();
     if (!raw_fat_mount(&fat)) {
         return;
     }

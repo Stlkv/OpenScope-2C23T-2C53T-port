@@ -49,6 +49,36 @@ static uint16_t put_dec(char *dst, uint16_t cap, uint16_t p, uint32_t v) {
     return p;
 }
 
+/* The factory-calibration page, memory-mapped. Read-only here and in the
+ * CALREQ path — nothing in this port programs or erases this address. */
+#define CALDUMP_BASE ((const uint8_t *)0x08006000u)
+#define CALDUMP_LEN  4096u
+
+uint32_t dbgdump_crc32(const uint8_t *p, uint32_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < len; ++i) {
+        crc ^= p[i];
+        for (uint8_t b = 0; b < 8u; ++b) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static uint32_t dbgdump_cal_crc32(void) {
+    return dbgdump_crc32(CALDUMP_BASE, CALDUMP_LEN);
+}
+
+static uint32_t dbgdump_cal_ff_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < CALDUMP_LEN; ++i) {
+        if (CALDUMP_BASE[i] == 0xFFu) {
+            ++n;
+        }
+    }
+    return n;
+}
+
 uint16_t dbgdump_render(char *dst, uint16_t cap) {
     fpga53_diag_t dg;
     uint16_t p = 0;
@@ -543,6 +573,31 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
     p = put_hex(dst, cap, p, ui_debug_mode_byte(), 2);
     p = put_str(dst, cap, p, " POSE=");
     p = put_dec(dst, cap, p, dg.pose_calls);
+    p = put_str(dst, cap, p, "\n");
+
+    /* Factory-calibration page fingerprint (0x08006000..0x08006FFF — where
+     * stock keeps per-device cal; upstream's v0.3.0 firmware overwrites it,
+     * this port never touches it). crc is CRC-32 (reflected, poly
+     * 0xEDB88320, init/xorout 0xFFFFFFFF — matches zlib and `crc32` on the
+     * host); ff counts 0xFF bytes, so an erased page shows ff=4096 at a
+     * glance. The raw bytes travel as CAL.BIN via the CALREQ trigger
+     * (usb_msc.c); this line is the cross-check that the file arrived
+     * intact, and two dumps agreeing is the stability check. */
+    p = put_str(dst, cap, p, "CAL crc=");
+    p = put_hex(dst, cap, p, dbgdump_cal_crc32(), 8);
+    p = put_str(dst, cap, p, " ff=");
+    p = put_dec(dst, cap, p, dbgdump_cal_ff_count());
+
+    /* Cal-restore verdict (CALRSTOR.BIN path): st= the latched status code
+     * (fw_update.h), runs= how many times a file was processed, fcrc= the
+     * CRC of the LAST file offered — compare against the CAL crc= above to
+     * see what a no-op verdict was a no-op against. */
+    p = put_str(dst, cap, p, " CALW st=");
+    p = put_hex(dst, cap, p, fw_cal_restore_status(), 2);
+    p = put_str(dst, cap, p, " runs=");
+    p = put_dec(dst, cap, p, fw_cal_restore_runs());
+    p = put_str(dst, cap, p, " fcrc=");
+    p = put_hex(dst, cap, p, fw_cal_restore_crc(), 8);
     p = put_str(dst, cap, p, "\n");
 
     return p;

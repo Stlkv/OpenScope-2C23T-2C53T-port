@@ -1,6 +1,7 @@
 #include "fw_update.h"
 
 #include "app_config.h"
+#include "dbgdump.h"   /* dbgdump_crc32 — the shared CRC-32 (cal restore) */
 #include "fpga_bitstream_store.h"
 #include "hw.h"
 
@@ -170,6 +171,82 @@ static void flash_program_halfword(uint32_t addr, uint16_t value) {
         FLASH_CTRL &= ~FLASH_CTRL_PG;
     }
     flash_clear_status(addr);
+}
+
+/* ─── Factory-calibration restore ─────────────────────────────────────
+ * Writes a 4096-byte image back over the factory-calibration page. The
+ * source file arrives as CALRSTOR.BIN on the USB volume (usb_msc.c); this
+ * function is the only thing in the port that programs the page, and the
+ * dump path (CALREQ/dbgdump) never writes it.
+ *
+ * Safety posture, in order of importance:
+ *   - The target address is compile-time fixed. Nothing in the file can
+ *     steer the write; a wrong file can at worst write wrong CAL bytes,
+ *     which the dump artifact recovers from by re-running the restore.
+ *   - Exact-size gate: anything but 4096 bytes is refused untouched.
+ *   - Identical content is a no-op: the page is not erased just to be
+ *     rebuilt into itself, so a redundant restore carries zero risk.
+ *   - Programmed content is verified by direct read-back compare; the
+ *     verdict is latched and printed by the CALW line in DBG.TXT.
+ *
+ * CAL_RESTORE_BASE is overridable for the bench proof-run against a free
+ * page (0x080FE800 — inside the 0x080A0000+ free region, clear of the
+ * settings page at 0x080FF800) so erase+program+verify can be exercised
+ * end-to-end without touching the real calibration. */
+#ifndef CAL_RESTORE_BASE
+#define CAL_RESTORE_BASE 0x08006000u
+#endif
+enum { CAL_RESTORE_LEN = 4096u };
+
+static uint8_t  cal_restore_last_status; /* FW_CAL_RESTORE_* (fw_update.h) */
+static uint8_t  cal_restore_run_count;
+static uint32_t cal_restore_file_crc;
+
+uint8_t  fw_cal_restore_status(void) { return cal_restore_last_status; }
+uint8_t  fw_cal_restore_runs(void)   { return cal_restore_run_count; }
+uint32_t fw_cal_restore_crc(void)    { return cal_restore_file_crc; }
+
+uint8_t fw_cal_restore(const uint8_t *data, uint32_t len) {
+    const volatile uint8_t *page = (const volatile uint8_t *)CAL_RESTORE_BASE;
+    uint32_t i;
+    uint8_t identical = 1;
+
+    ++cal_restore_run_count;
+    if (data == 0 || len != CAL_RESTORE_LEN) {
+        cal_restore_file_crc = 0;
+        cal_restore_last_status = FW_CAL_RESTORE_BADSIZE;
+        return cal_restore_last_status;
+    }
+    cal_restore_file_crc = dbgdump_crc32(data, CAL_RESTORE_LEN);
+
+    for (i = 0; i < CAL_RESTORE_LEN; ++i) {
+        if (page[i] != data[i]) {
+            identical = 0;
+            break;
+        }
+    }
+    if (identical) {
+        cal_restore_last_status = FW_CAL_RESTORE_IDENTICAL;
+        return cal_restore_last_status;
+    }
+
+    flash_unlock(CAL_RESTORE_BASE);
+    flash_erase_page(CAL_RESTORE_BASE);
+    flash_erase_page(CAL_RESTORE_BASE + FW_PAGE_SIZE);
+    for (i = 0; i < CAL_RESTORE_LEN; i += 2u) {
+        flash_program_halfword(CAL_RESTORE_BASE + i,
+                               (uint16_t)(data[i] | ((uint16_t)data[i + 1u] << 8)));
+    }
+    flash_lock(CAL_RESTORE_BASE);
+
+    for (i = 0; i < CAL_RESTORE_LEN; ++i) {
+        if (page[i] != data[i]) {
+            cal_restore_last_status = FW_CAL_RESTORE_MISMATCH;
+            return cal_restore_last_status;
+        }
+    }
+    cal_restore_last_status = FW_CAL_RESTORE_WRITTEN;
+    return cal_restore_last_status;
 }
 
 static uint32_t fw_dest_base(void) {
