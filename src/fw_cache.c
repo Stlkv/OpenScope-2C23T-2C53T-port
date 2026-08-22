@@ -198,6 +198,13 @@ void fw_cache_intake_abort(void)
 uint8_t fw_cache_intake_status(void) { return intake_status; }
 uint8_t fw_cache_swap_status(void) { return swap_status; }
 
+/* The CRC of what was actually taken, in its final (xor-ed) form. A streaming
+ * caller compares this against the host's figure BEFORE finish() writes the
+ * manifest: the manifest CRC is computed over the same bytes, so it agrees
+ * with a corrupted image just as happily as with a good one. */
+uint32_t fw_cache_intake_crc(void) { return intake_crc ^ 0xFFFFFFFFu; }
+uint32_t fw_cache_intake_bytes(void) { return intake_written; }
+
 static uint8_t read_manifest(uint8_t slot, cache_manifest_t *m)
 {
     if (!w25q_read(slot_base(slot), (uint8_t *)m, sizeof(*m))) {

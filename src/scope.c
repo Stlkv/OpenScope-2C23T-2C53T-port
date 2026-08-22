@@ -289,6 +289,7 @@ static uint32_t scope_span_for_timebase(uint8_t timebase) {
     return span;
 }
 
+#if SCOPE_HW_CAPTURE && HW_TARGET_2C53T
 /* Interval between roll points, in timer ticks. The ms-granular sibling below
  * bottoms out at 1 ms per point — 3.3 ms/div — which is far slower than the
  * bus can sample and would leave the whole interesting range (mains hum,
@@ -321,7 +322,9 @@ static uint16_t scope_slow_interval_ticks_for_timebase(uint8_t timebase) {
     }
     return (uint16_t)ticks;
 }
+#endif /* SCOPE_HW_CAPTURE && HW_TARGET_2C53T */
 
+#if SCOPE_HW_CAPTURE && !HW_TARGET_2C53T
 static uint16_t scope_slow_interval_ms_for_timebase(uint8_t timebase) {
     uint32_t div_ms;
     uint32_t interval;
@@ -342,6 +345,7 @@ static uint16_t scope_slow_interval_ms_for_timebase(uint8_t timebase) {
     }
     return (uint16_t)interval;
 }
+#endif /* SCOPE_HW_CAPTURE && !HW_TARGET_2C53T */
 
 uint8_t scope_hw_enabled(void) {
     return SCOPE_HW_CAPTURE ? 1u : 0u;

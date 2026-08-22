@@ -15,15 +15,42 @@
 #endif
 #define FW_STORE_WRITER FPGA53_BITSTREAM_EXTERN
 
+/* On 2C53T a dropped firmware image no longer lands in internal flash at all:
+ * usb_msc.c reads it back through the FAT chain into a W25Q cache slot and
+ * fw_cache.c installs it from RAM with a system reset. What is left here is
+ * the writer for the ONE region this file still owns -- the bitstream store --
+ * plus the transfer status the screen, DBG.TXT and the CDC shell read, and the
+ * factory-cal restore. See docs/plans/drop-internal-staging-2026-08-22.md
+ * in the workspace.
+ *
+ * The 2C23T targets keep the staging path: that hardware has neither the store
+ * nor our cache layout, and we cannot test it. */
+#if HW_TARGET_2C53T
+#define FW_STAGING 0
+#else
+#define FW_STAGING 1
+#endif
+
 enum {
     FW_APP_BASE = APP_BASE_ADDR,
+#if FW_STAGING
     FW_STAGE_BASE = FW_STAGE_BASE_ADDR,
+#endif
     FW_RAM_BASE = 0x20000000u,
     FW_RAM_END = 0x20036078u,
     FW_PAGE_SIZE = 2048u,
     FW_MAX_SIZE = APP_FLASH_SIZE_BYTES,
     FW_APP_END = FW_APP_BASE + FW_MAX_SIZE,
-    FW_STAGE_PAGE_COUNT = FW_MAX_SIZE / FW_PAGE_SIZE,
+    /* Erase-tracking bitmap: one bit per page of the largest destination this
+     * writer can still address. With staging gone that is the store, so the
+     * bitmap stops growing with the app slot -- which is what made widening
+     * the slot expensive before (14 KB of RAM in the halfword-bitmap era). */
+#if FW_STAGING
+    FW_DEST_MAX_BYTES = FW_MAX_SIZE,
+#else
+    FW_DEST_MAX_BYTES = FPGA_BS_STORE_MAX,
+#endif
+    FW_STAGE_PAGE_COUNT = FW_DEST_MAX_BYTES / FW_PAGE_SIZE,
     FW_STAGE_PAGE_BYTES = (FW_STAGE_PAGE_COUNT + 7u) / 8u,
 
     FLASH_STS_BSY = 1u << 0,
@@ -51,18 +78,36 @@ static uint8_t fw_stage_started;
  * afterwards. Everything else about the transfer — page erase, halfword
  * programming, resume-safe bookkeeping — is identical, so the destination is
  * a variable rather than a second copy of the writer. */
-#if FW_STORE_WRITER
+#if FW_STORE_WRITER && FW_STAGING
 static uint8_t fw_blob_mode;
+#elif FW_STORE_WRITER
+/* Without staging the store is the only destination this writer has. */
+#define fw_blob_mode 1u
 #else
 /* The provisioning image carries the payload itself and has no room to spare:
  * with fw_blob_mode a constant, the destination logic and the whole bank-1
  * register path fold away. */
 #define fw_blob_mode 0u
 #endif
+#if !FW_STAGING
+/* 1 = this transfer's bytes are handled by fw_cache.c (an image on its way to
+ * a W25Q slot); this file only tracks the status the UI and the shell show.
+ * The producer is the same sequential FAT reader either way. */
+static uint8_t fw_count_only;
+
+void fw_update_set_count_only(uint8_t on) {
+    if (fw_status.state == FW_UPDATE_STATE_APPLYING || fw_stage_started) {
+        return;
+    }
+    fw_count_only = on ? 1u : 0u;
+}
+#endif
 static uint8_t fw_stage_pages[FW_STAGE_PAGE_BYTES];
 /* Bytes written contiguously from offset 0 of the staged file. */
 static uint32_t fw_covered;
+#if FW_STAGING
 static uint8_t fw_page_buffer[FW_PAGE_SIZE];
+#endif
 
 /*
  * The 1 MB AT32F403A splits its flash into two banks with two independent
@@ -249,6 +294,7 @@ uint8_t fw_cal_restore(const uint8_t *data, uint32_t len) {
     return cal_restore_last_status;
 }
 
+#if FW_STAGING
 static uint32_t fw_dest_base(void) {
     return fw_blob_mode ? FPGA_BS_STORE_BASE : (uint32_t)FW_STAGE_BASE;
 }
@@ -256,6 +302,15 @@ static uint32_t fw_dest_base(void) {
 static uint32_t fw_dest_max(void) {
     return fw_blob_mode ? FPGA_BS_STORE_MAX : (uint32_t)FW_MAX_SIZE;
 }
+#else
+/* Bytes that only pass through for counting (an image bound for the cache)
+ * still have to be size-checked against where they are really going, and that
+ * is the app slot the installer will program. */
+static uint32_t fw_dest_base(void) { return FPGA_BS_STORE_BASE; }
+static uint32_t fw_dest_max(void) {
+    return fw_count_only ? (uint32_t)FW_MAX_SIZE : FPGA_BS_STORE_MAX;
+}
+#endif
 
 static uint8_t bit_get(uint8_t *bits, uint32_t bit) {
     return (bits[bit >> 3] & (uint8_t)(1u << (bit & 7u))) ? 1u : 0u;
@@ -358,6 +413,12 @@ static void fw_stage_reset(uint32_t base_lba) {
 static uint8_t fw_flash_matches(uint32_t offset, const uint8_t *data, uint16_t len) {
     const uint8_t *flash = (const uint8_t *)(fw_dest_base() + offset);
 
+#if !FW_STAGING
+    if (fw_count_only) {
+        return 1; /* nothing of ours is in flash to disagree with */
+    }
+#endif
+
     for (uint16_t i = 0; i < len; ++i) {
         if (flash[i] != data[i]) {
             return 0;
@@ -368,6 +429,12 @@ static uint8_t fw_flash_matches(uint32_t offset, const uint8_t *data, uint16_t l
 
 static void fw_stage_program(uint32_t offset, const uint8_t *data, uint16_t len) {
     uint32_t addr = fw_dest_base() + offset;
+
+#if !FW_STAGING
+    if (fw_count_only) {
+        return;
+    }
+#endif
 
     flash_unlock(addr);
     for (uint16_t i = 0; i < len; i = (uint16_t)(i + 2u)) {
@@ -465,6 +532,20 @@ uint8_t fw_update_request_apply(void) {
         fw_expected_size >= 8192u &&
         fw_expected_size <= fw_dest_max() &&
         fw_status.bytes >= fw_expected_size) {
+#if !FW_STAGING
+        if (!fw_count_only) {
+            /* The store is written as the file is read, so "apply" is only an
+             * acknowledgement: report success so the caller deletes the file. */
+            fw_status.state = FW_UPDATE_STATE_IDLE;
+            ++fw_status.sequence;
+            return 1;
+        }
+        /* An image: the bytes are in a W25Q slot and fw_cache.c installs them.
+         * Say FLASHING on the screen and let the caller pull the trigger. */
+        fw_status.state = FW_UPDATE_STATE_APPLYING;
+        ++fw_status.sequence;
+        return 1;
+#else
         if (fw_blob_mode) {
             /* Blob transfers land in their final place as they stream, so
              * "apply" is only an acknowledgement: report success so the
@@ -478,6 +559,7 @@ uint8_t fw_update_request_apply(void) {
         fw_status.state = FW_UPDATE_STATE_APPLYING;
         ++fw_status.sequence;
         return 1;
+#endif
     }
     return 0;
 }
@@ -502,7 +584,7 @@ static void fw_update_note_file_size(uint32_t size) {
  * fw_update_clear() (which resets it) and before the first byte arrives —
  * the destination is baked into fw_stage_reset()'s bookkeeping. */
 void fw_update_set_blob_mode(uint8_t blob) {
-#if FW_STORE_WRITER
+#if FW_STORE_WRITER && FW_STAGING
     if (fw_status.state == FW_UPDATE_STATE_APPLYING || fw_stage_started) {
         return;
     }
@@ -537,8 +619,11 @@ void fw_update_clear(void) {
     fw_expected_size = 0;
     fw_stage_started = 0;
     fw_stage_base_lba = 0;
-#if FW_STORE_WRITER
+#if FW_STORE_WRITER && FW_STAGING
     fw_blob_mode = 0;
+#endif
+#if !FW_STAGING
+    fw_count_only = 0;
 #endif
     fw_status.state = FW_UPDATE_STATE_IDLE;
     fw_status.error = FW_UPDATE_ERR_NONE;
@@ -548,6 +633,7 @@ void fw_update_clear(void) {
     ++fw_status.sequence;
 }
 
+#if FW_STAGING
 __attribute__((section(".data.ramfunc"), noinline, used))
 static void fw_ram_install(uint32_t src, uint32_t dst, uint32_t size) {
     volatile uint32_t *flash_sts = (volatile uint32_t *)0x4002200Cu;
@@ -690,6 +776,11 @@ void fw_update_service(void) {
     ++fw_status.sequence;
     fw_ram_install(FW_STAGE_BASE, FW_APP_BASE, size);
 }
+#else
+/* No internal installer on 2C53T: fw_cache.c programs the app slot from RAM
+ * while reading the W25Q, and ends in SYSRESETREQ rather than a jump. */
+void fw_update_service(void) {}
+#endif
 
 void fw_update_status(fw_update_status_t *status) {
     if (!status) {

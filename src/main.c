@@ -1,5 +1,6 @@
 #include "board.h"
 #include "app_config.h"
+#include "cdc_shell.h"
 #include "dmm.h"
 #include "display.h"
 #include "fw_update.h"
@@ -221,10 +222,13 @@ int main(void) {
         uint32_t idle_start = load_counter_read();
         for (uint8_t i = 0; i < 20u; ++i) {
             usb_msc_poll();
+            cdc_shell_service();
+            usb_msc_cdc_pump();
             delay_ms(1);
             dmm_beep_service(1);
         }
         dmm_tick(20);
+        cdc_shell_tick(20);
         if (input_settle_ms > 20u) {
             input_settle_ms = (uint16_t)(input_settle_ms - 20u);
         } else {

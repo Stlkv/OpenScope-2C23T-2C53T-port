@@ -15,9 +15,22 @@ SCOPE_HW_CAPTURE ?= 1
 SCOPE_UI_SAFE_STUB ?= 0
 SCOPE_ANALOG_CONFIG ?= 1
 SCOPE_ATTENUATOR_CONFIG ?= 1
+# The CDC shell (live telemetry + fwload over the same cable). ON for 2C53T,
+# where the composite USB device is bench-verified; OFF by default, because the
+# 2C23T hardware cannot be tested here and an untested USB identity is not
+# something to ship blind. Also off in the 2C53T recovery image, which carries
+# the 113 KB bitstream and has no room for it.
+USB_CDC_SHELL ?= 0
+# 2C53T targets opt in; release-2c53t-embed overrides this back to 0.
+USB_CDC_SHELL_2C53T ?= 1
 
 CLANG ?= clang
-RUST_LLD := $(shell find $(HOME)/.rustup/toolchains -path '*/bin/rust-lld' | head -1)
+# rust-lld if a Rust toolchain is installed, otherwise any ld.lld on PATH
+# (Homebrew llvm provides one). Either links this project identically.
+RUST_LLD := $(shell find $(HOME)/.rustup/toolchains -path '*/bin/rust-lld' 2>/dev/null | head -1)
+ifeq ($(RUST_LLD),)
+RUST_LLD := $(shell command -v ld.lld 2>/dev/null)
+endif
 LLD_DIR := $(BUILD)/lld
 
 CFLAGS := \
@@ -46,6 +59,8 @@ CFLAGS := \
 	-DSCOPE_UI_SAFE_STUB=$(SCOPE_UI_SAFE_STUB) \
 	-DSCOPE_ANALOG_CONFIG=$(SCOPE_ANALOG_CONFIG) \
 	-DSCOPE_ATTENUATOR_CONFIG=$(SCOPE_ATTENUATOR_CONFIG) \
+	-DFW_VERSION_TEXT='"$(VERSION)"' \
+	-DUSB_CDC_SHELL=$(USB_CDC_SHELL) \
 	$(EXTRA_CFLAGS)
 
 LDFLAGS := \
@@ -59,7 +74,7 @@ LDFLAGS := \
 	-Wl,--gc-sections \
 	-Wl,-Map,$(BUILD)/$(PROJECT).map
 
-SRCS := src/startup.c src/board.c src/display.c src/font.c src/dmm.c src/dmm53.c src/meter_data.c src/settings.c src/fpga.c src/scope.c src/siggen.c src/fw_update.c src/fw_cache.c src/screenshot.c src/dbgdump.c src/w25q.c src/usb_msc.c src/ui.c src/main.c src/fft.c src/arb_csv.c
+SRCS := src/startup.c src/board.c src/display.c src/font.c src/dmm.c src/dmm53.c src/meter_data.c src/settings.c src/fpga.c src/scope.c src/siggen.c src/fw_update.c src/fw_cache.c src/screenshot.c src/dbgdump.c src/w25q.c src/usb_msc.c src/usb_cdc.c src/cdc_shell.c src/ui.c src/main.c src/fft.c src/arb_csv.c
 ifeq ($(HW_TARGET_HW40),1)
 SRCS += src/fpga_bitstream_hw4.c
 else
@@ -118,8 +133,12 @@ release-hw4:
 # NOTE: this target carries NO FPGA flags, so it builds a meter-only image of
 # ~106-110 KB. For anything involving a trace use release-2c53t-scope below;
 # an image under ~220 KB has no bitstream in it and the scope is dead.
+# APP_FLASH_SIZE: the app slot runs to the bitstream store (0x08007000..
+# 0x080C0000). The old 0x38000 ceiling was our own staging base, and staging
+# is gone on this target - docs/plans/drop-internal-staging-2026-08-22.md
+# in the workspace.
 release-2c53t:
-	$(MAKE) BUILD=$(BUILD_ROOT)/2c53t APP_BASE=0x08007000 HW_TARGET=2c53t HW_TARGET_HW40=1 HW_TARGET_2C53T=1 SCOPE_HW_CAPTURE=1 SCOPE_ANALOG_CONFIG=0 SCOPE_ATTENUATOR_CONFIG=0 EXTRA_CFLAGS="-Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-unused-but-set-variable $(SCOPE53_EXTRA)" all
+	$(MAKE) BUILD=$(BUILD_ROOT)/2c53t APP_BASE=0x08007000 APP_FLASH_SIZE=0x000B9000 USB_CDC_SHELL=$(USB_CDC_SHELL_2C53T) HW_TARGET=2c53t HW_TARGET_HW40=1 HW_TARGET_2C53T=1 SCOPE_HW_CAPTURE=1 SCOPE_ANALOG_CONFIG=0 SCOPE_ATTENUATOR_CONFIG=0 EXTRA_CFLAGS="-Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-unused-but-set-variable $(SCOPE53_EXTRA)" all
 	@mkdir -p $(DIST)
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-08007000.bin
 
@@ -159,7 +178,7 @@ bitstream-bin:
 # way back if a store ever turns out to be bad.
 release-2c53t-embed:
 	rm -rf $(BUILD_ROOT)/2c53t
-	$(MAKE) release-2c53t SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_BITSTREAM_EXTERN=0 $(SCOPE53_EXTRA)"
+	$(MAKE) release-2c53t USB_CDC_SHELL_2C53T=0 SCOPE53_EXTRA="$(SCOPE53_FLAGS) -DFPGA53_BITSTREAM_EXTERN=0 $(SCOPE53_EXTRA)"
 	@mkdir -p $(DIST)
 	cp $(BUILD_ROOT)/2c53t/$(PROJECT).bin $(DIST)/F2C23T-$(VERSION)-2C53T-EMBED-08007000.bin
 	@ls -l $(DIST)/F2C23T-$(VERSION)-2C53T-EMBED-08007000.bin

@@ -64,4 +64,12 @@ uint8_t  fw_cache_swap_status(void);
 uint32_t fw_cache_slot_size(uint8_t slot);
 uint32_t fw_cache_slot_crc(uint8_t slot);
 
+/* Progress of the intake in flight, for a streaming caller (cdc_shell.c):
+ * the CRC is final once bytes == the size passed to begin(), and comparing it
+ * against the host's figure BEFORE finish() is the only end-to-end check on
+ * the transfer — the manifest CRC is computed over the received bytes and so
+ * matches a corrupted image too. */
+uint32_t fw_cache_intake_crc(void);
+uint32_t fw_cache_intake_bytes(void);
+
 #endif /* FW_CACHE_H */

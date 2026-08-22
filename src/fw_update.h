@@ -51,6 +51,14 @@ uint8_t  fw_cal_restore_status(void);
 uint8_t  fw_cal_restore_runs(void);
 uint32_t fw_cal_restore_crc(void);
 
+#if HW_TARGET_2C53T
+/* 2C53T only. 1 = the bytes of the transfer about to start are being written by
+ * fw_cache.c into a W25Q slot, not by this file into flash; track the status
+ * only. Must be set before the first byte, like the blob mode it replaces.
+ * See docs/plans/drop-internal-staging-2026-08-22.md in the workspace. */
+void fw_update_set_count_only(uint8_t on);
+#endif
+
 void fw_update_usb_data(uint32_t lba, uint16_t sector_offset, const uint8_t *data, uint16_t len);
 void fw_update_note_file(uint32_t base_lba, uint32_t size);
 /* Route the next staged file: 0 = firmware image (staged, then installed over

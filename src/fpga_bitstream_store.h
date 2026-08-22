@@ -21,12 +21,17 @@
  *                                                        is installed; the
  *                                                        upstream image is
  *                                                        595 KB and GROWING
- *   0x08040000  self-update staging (ours)              transient; only used
- *                                                        while THIS port runs,
- *                                                        whose image is small,
- *                                                        so the overlap with
- *                                                        app-slot growth room
- *                                                        is harmless
+ *                                                        (there is no staging
+ *                                                        region any more: a
+ *                                                        dropped image is read
+ *                                                        back into a W25Q cache
+ *                                                        slot and installed
+ *                                                        from there, so the app
+ *                                                        slot owns everything
+ *                                                        up to the store —
+ *                                                        docs/plans/drop-
+ *                                                        internal-staging-
+ *                                                        2026-08-22.md)
  *   0x080C0000  FPGA bitstream store            128 KB   <- this region
  *   0x080E0000  reserve                          126 KB
  *   0x080FF800  settings (ours)                   2 KB

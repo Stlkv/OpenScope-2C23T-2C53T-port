@@ -7,6 +7,7 @@
 #include "fw_update.h"
 #include "hw.h"
 #include "screenshot.h"
+#include "usb_cdc.h"
 #include "w25q.h"
 
 #include <stddef.h>
@@ -20,10 +21,18 @@
 enum {
     USB_EP0_SIZE = 64,
     USB_EP1_SIZE = 64,
+    USB_EP2_SIZE = 64,
+    USB_EP3_SIZE = 16,
     USB_EP0_TX = 0x0040,
     USB_EP0_RX = 0x0080,
     USB_EP1_TX = 0x00C0,
     USB_EP1_RX = 0x0100,
+    /* The packet buffer is 512 bytes and the descriptor table takes the first
+     * 64. EP0/EP1 end at 0x140, so the CDC function fits with 48 to spare:
+     *   0x140 EP2 IN 64 | 0x180 EP2 OUT 64 | 0x1C0 EP3 IN 16 | end 0x1D0 */
+    USB_EP2_TX = 0x0140,
+    USB_EP2_RX = 0x0180,
+    USB_EP3_TX = 0x01C0,
 
     USB_ISTR_CTR = 0x8000,
     USB_ISTR_RESET = 0x0400,
@@ -54,6 +63,7 @@ enum {
 
     USB_EP_TYPE_BULK = 0x0000,
     USB_EP_TYPE_CONTROL = 0x0200,
+    USB_EP_TYPE_INTERRUPT = 0x0600,
     USB_STAT_DISABLED = 0,
     USB_STAT_STALL = 1,
     USB_STAT_NAK = 2,
@@ -85,6 +95,45 @@ enum MscState {
     MSC_DISCARD_OUT_DATA,
 };
 
+/* Composite device: MSC (interface 0) + CDC-ACM (interfaces 1-2).
+ *
+ * The MSC half is byte-for-byte what it was — it is the firmware-update path,
+ * and a change there is a change to the only way an image reaches this device
+ * short of IAP. What is new is the class triple (0xEF/0x02/0x01, "misc /
+ * common / interface association"), which is what makes a host honour the IAD
+ * below and bind its CDC driver to the pair rather than to the whole device,
+ * and bcdDevice 3.00, so a host that cached the MSC-only descriptors can be
+ * told apart from one that saw these. */
+#if USB_CDC_SHELL
+static const uint8_t usb_device_desc[] = {
+    18, 1, 0x00, 0x02, 0xEF, 0x02, 0x01, USB_EP0_SIZE,
+    0x3C, 0x2E, 0x20, 0x57, 0x00, 0x03, 1, 2, 3, 1,
+};
+
+static const uint8_t usb_config_desc[] = {
+    9, 2, 93, 0, 3, 1, 0, 0x80, 50,
+
+    /* interface 0: mass storage, bulk-only transport (unchanged) */
+    9, 4, 0, 0, 2, 0x08, 0x06, 0x50, 0,
+    7, 5, 0x81, 0x02, USB_EP1_SIZE, 0, 0,
+    7, 5, 0x01, 0x02, USB_EP1_SIZE, 0, 0,
+
+    /* interfaces 1-2 belong to one CDC-ACM function */
+    8, 11, 1, 2, 0x02, 0x02, 0x01, 0,
+
+    /* interface 1: CDC communication + its notification endpoint */
+    9, 4, 1, 0, 1, 0x02, 0x02, 0x01, 0,
+    5, 0x24, 0x00, 0x10, 0x01,              /* header, CDC 1.10           */
+    4, 0x24, 0x02, 0x02,                    /* ACM: line coding requests  */
+    5, 0x24, 0x06, 1, 2,                    /* union: master 1, slave 2   */
+    7, 5, 0x83, 0x03, USB_EP3_SIZE, 0, 255,
+
+    /* interface 2: CDC data, the byte stream the shell lives on */
+    9, 4, 2, 0, 2, 0x0A, 0x00, 0x00, 0,
+    7, 5, 0x82, 0x02, USB_EP2_SIZE, 0, 0,
+    7, 5, 0x02, 0x02, USB_EP2_SIZE, 0, 0,
+};
+#else  /* USB_CDC_SHELL == 0: mass storage alone, as before the shell */
 static const uint8_t usb_device_desc[] = {
     18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, USB_EP0_SIZE,
     0x3C, 0x2E, 0x20, 0x57, 0x00, 0x02, 1, 2, 3, 1,
@@ -96,6 +145,7 @@ static const uint8_t usb_config_desc[] = {
     7, 5, 0x81, 0x02, USB_EP1_SIZE, 0, 0,
     7, 5, 0x01, 0x02, USB_EP1_SIZE, 0, 0,
 };
+#endif
 
 static const uint8_t usb_lang_desc[] = {4, 3, 0x09, 0x04};
 static const char usb_manufacturer[] = "F2C23T";
@@ -109,6 +159,17 @@ static uint8_t ep0_pending_address;
 static uint8_t ep0_address_pending;
 static uint8_t usb_configured;
 static uint8_t usb_ready;
+/* Bytes still expected in a control OUT data stage (SET_LINE_CODING is the
+ * only one this device has). They are read and dropped: the shell does not
+ * care about baud on a virtual port, but STALLing the request makes some
+ * hosts refuse to open the port at all. */
+#if USB_CDC_SHELL
+static uint8_t ep0_out_expect;
+/* 115200 8N1, echoed back verbatim on GET_LINE_CODING. */
+static uint8_t cdc_line_coding[7] = { 0x00, 0xC2, 0x01, 0x00, 0, 0, 8 };
+static volatile uint8_t cdc_tx_busy;   /* an EP2 IN packet is in flight */
+static volatile uint8_t cdc_rx_armed;  /* EP2 OUT is VALID, host may send  */
+#endif
 
 static enum MscState msc_state;
 static uint8_t msc_small[64];
@@ -153,6 +214,11 @@ static void msc_dbg_fail(uint8_t site) {
     }
 }
 static uint8_t raw_update_streaming;
+#if HW_TARGET_2C53T
+/* The staged file was an image and now sits in cache slot A: the apply step
+ * installs it with fw_cache_swap() instead of an internal installer. */
+static uint8_t msc_update_to_cache;
+#endif
 static uint32_t raw_update_dir_byte_addr;
 static uint32_t raw_screenshot_clusters[SCREENSHOT_CLUSTER_COUNT];
 
@@ -742,6 +808,7 @@ static uint8_t raw_fat_stage_update_file(const raw_fat_volume_t *fat, const raw_
     uint32_t offset = 0;
     uint16_t guard = 0;
     fw_update_status_t status;
+    uint8_t is_blob = 0;   /* GWBS bitstream, not a firmware image */
 
     fw_update_clear();
 #if FW_STORE_WRITER
@@ -751,8 +818,26 @@ static uint8_t raw_fat_stage_update_file(const raw_fat_volume_t *fat, const raw_
      * encode the destination in a filename macOS is free to mangle. */
     if (raw_fat_read_sector(fat, raw_fat_cluster_lba(fat, cluster), sector) &&
         le32_at(sector) == FPGA_BS_MAGIC) {
+        is_blob = 1;
         fw_update_set_blob_mode(1);
     }
+#endif
+#if HW_TARGET_2C53T
+    /* An image goes to cache slot A, and fw_cache.c installs it from there:
+     * one path, shared with upstream, ending in a reset rather than a jump.
+     * fw_update keeps reporting the transfer so the screen, DBG.TXT and the
+     * CDC shell are unchanged. Plan: docs/plans/drop-internal-staging-*.md
+     * in the workspace. */
+    msc_update_to_cache = 0;
+    if (!is_blob) {
+        if (!fw_cache_intake_begin(FW_CACHE_SLOT_A, file->size)) {
+            return 0;
+        }
+        msc_update_to_cache = 1;
+        fw_update_set_count_only(1);
+    }
+#else
+    (void)is_blob;   /* 2C23T stages internally; the sniff only sets blob mode */
 #endif
     fw_update_note_file(RAW_UPDATE_STAGE_BASE_LBA, file->size);
     while (remaining && cluster >= 2u && !raw_fat_cluster_is_eoc(fat, cluster) && guard++ < 4096u) {
@@ -762,6 +847,11 @@ static uint8_t raw_fat_stage_update_file(const raw_fat_volume_t *fat, const raw_
             if (!raw_fat_read_sector(fat, lba + i, sector)) {
                 return 0;
             }
+#if HW_TARGET_2C53T
+            if (msc_update_to_cache && !fw_cache_intake_data(sector, chunk)) {
+                return 0;
+            }
+#endif
             fw_update_usb_data(RAW_UPDATE_STAGE_BASE_LBA + offset / 512u,
                                (uint16_t)(offset & 511u),
                                sector,
@@ -778,6 +868,13 @@ static uint8_t raw_fat_stage_update_file(const raw_fat_volume_t *fat, const raw_
         }
     }
 
+#if HW_TARGET_2C53T
+    /* Manifest last, as always: a torn copy leaves the slot unswappable
+     * instead of installable. */
+    if (msc_update_to_cache && !remaining && !fw_cache_intake_finish()) {
+        return 0;
+    }
+#endif
     fw_update_status(&status);
     return status.state == FW_UPDATE_STATE_READY && !remaining;
 }
@@ -2015,6 +2112,92 @@ static void ep1_in(void) {
     }
 }
 
+#if USB_CDC_SHELL
+/* ─── CDC endpoints ──────────────────────────────────────────────────────
+ * EP2 carries the shell's byte stream, EP3 the notifications no host on this
+ * bench asks for (it exists because the descriptor promises it).
+ *
+ * The OUT side is flow-controlled rather than lossy: a full ring leaves the
+ * endpoint NAK'd and the host retries. Dropping bytes would be invisible in a
+ * telemetry line and fatal in a firmware image. */
+
+static void cdc_open_endpoints(void) {
+    ep_set_type(2, USB_EP_TYPE_BULK);
+    pma_set_tx(2, USB_EP2_TX, 0);
+    pma_set_rx(2, USB_EP2_RX, USB_EP2_SIZE);
+    ep_set_tx_stat(2, USB_STAT_NAK);
+    ep_set_rx_stat(2, USB_STAT_VALID);
+
+    ep_set_type(3, USB_EP_TYPE_INTERRUPT);
+    pma_set_tx(3, USB_EP3_TX, 0);
+    ep_set_tx_stat(3, USB_STAT_NAK);
+    ep_set_rx_stat(3, USB_STAT_DISABLED);
+
+    cdc_tx_busy = 0;
+    cdc_rx_armed = 1;
+}
+
+static void cdc_start_tx(void) {
+    uint8_t chunk[USB_EP2_SIZE];
+    uint16_t n;
+
+    if (cdc_tx_busy || !usb_configured) {
+        return;
+    }
+    n = usb_cdc_tx_pull(chunk, (uint16_t)sizeof(chunk));
+    if (!n) {
+        return;
+    }
+    pma_write(USB_EP2_TX, chunk, n);
+    pma_set_tx(2, USB_EP2_TX, n);
+    cdc_tx_busy = 1;
+    ep_set_tx_stat(2, USB_STAT_VALID);
+}
+
+static void cdc_arm_rx(void) {
+    if (cdc_rx_armed || !usb_configured) {
+        return;
+    }
+    if (usb_cdc_rx_free() < USB_EP2_SIZE) {
+        return;
+    }
+    cdc_rx_armed = 1;
+    ep_set_rx_stat(2, USB_STAT_VALID);
+}
+
+static void ep2_out(void) {
+    uint8_t chunk[USB_EP2_SIZE];
+    uint16_t len = pma_get_rx_count(2);
+
+    if (len > sizeof(chunk)) {
+        len = sizeof(chunk);
+    }
+    pma_read(USB_EP2_RX, chunk, len);
+    ep_clear_rx_ctr(2);
+    usb_cdc_rx_push(chunk, len);
+    cdc_rx_armed = 0;
+    cdc_arm_rx();   /* stays NAK'd while the shell is behind */
+}
+
+static void ep2_in(void) {
+    ep_clear_tx_ctr(2);
+    cdc_tx_busy = 0;
+    cdc_start_tx();
+}
+
+void usb_msc_cdc_pump(void) {
+    if (!usb_ready || !usb_configured) {
+        return;
+    }
+    REG32(0xE000E180u) = 1u << 20; /* mask USB_LP_CAN1_RX0 while we touch EP2 */
+    cdc_start_tx();
+    cdc_arm_rx();
+    REG32(NVIC_ISER0) = 1u << 20;
+}
+#else
+void usb_msc_cdc_pump(void) {}
+#endif
+
 static void usb_handle_setup(const uint8_t *setup) {
     uint8_t bm = setup[0];
     uint8_t req = setup[1];
@@ -2024,6 +2207,35 @@ static void usb_handle_setup(const uint8_t *setup) {
     uint16_t n;
 
     if ((bm & 0x60u) == 0x20u) {
+        /* Class requests are per interface: 0 is the MSC bulk-only transport,
+         * 1 is the CDC communication interface. */
+#if USB_CDC_SHELL
+        if (index == 1u) {
+            switch (req) {
+            case 0x20:                      /* SET_LINE_CODING  */
+                ep0_out_expect = len > sizeof(cdc_line_coding)
+                                     ? (uint8_t)sizeof(cdc_line_coding)
+                                     : (uint8_t)len;
+                ep_set_rx_stat(0, USB_STAT_VALID);
+                break;
+            case 0x21:                      /* GET_LINE_CODING  */
+                ep0_send(cdc_line_coding, (uint16_t)sizeof(cdc_line_coding), len);
+                break;
+            case 0x22:                      /* SET_CONTROL_LINE_STATE */
+                usb_cdc_set_open((uint8_t)(value & 1u));
+                ep0_send_zlp();
+                break;
+            case 0x23:                      /* SEND_BREAK */
+                ep0_send_zlp();
+                break;
+            default:
+                ep0_stall();
+                break;
+            }
+            return;
+        }
+#endif
+        (void)index;   /* only the CDC branch above reads it */
         if (req == 0xFE && len == 1u) {
             msc_small[0] = 0;
             ep0_send(msc_small, 1, len);
@@ -2033,7 +2245,6 @@ static void usb_handle_setup(const uint8_t *setup) {
         } else {
             ep0_stall();
         }
-        (void)index;
         return;
     }
 
@@ -2072,6 +2283,11 @@ static void usb_handle_setup(const uint8_t *setup) {
         ep_set_tx_stat(1, USB_STAT_NAK);
         ep_set_rx_stat(1, USB_STAT_VALID);
         msc_state = MSC_IDLE;
+#if USB_CDC_SHELL
+        if (usb_configured) {
+            cdc_open_endpoints();
+        }
+#endif
         ep0_send_zlp();
         break;
     case 0x08:
@@ -2083,8 +2299,13 @@ static void usb_handle_setup(const uint8_t *setup) {
         msc_small[1] = 0;
         ep0_send(msc_small, 2, len);
         break;
+    case 0x0A:              /* GET_INTERFACE — three interfaces now, all alt 0 */
+        msc_small[0] = 0;
+        ep0_send(msc_small, 1, len);
+        break;
     case 0x01:
     case 0x03:
+    case 0x0B:              /* SET_INTERFACE */
         ep0_send_zlp();
         break;
     default:
@@ -2102,6 +2323,19 @@ static void ep0_rx(void) {
         ep_set_tx_stat(0, USB_STAT_NAK);
         ep_set_rx_stat(0, USB_STAT_NAK);
         usb_handle_setup(setup);
+#if USB_CDC_SHELL
+    } else if (ep0_out_expect) {
+        /* The only control OUT data stage here: take the line coding so
+         * GET_LINE_CODING can echo it, then acknowledge with a ZLP status. */
+        uint16_t count = pma_get_rx_count(0);
+        if (count > ep0_out_expect) {
+            count = ep0_out_expect;
+        }
+        pma_read(USB_EP0_RX, cdc_line_coding, count);
+        ep0_out_expect = 0;
+        ep_clear_rx_ctr(0);
+        ep0_send_zlp();
+#endif
     } else {
         ep_clear_rx_ctr(0);
         ep_set_rx_stat(0, USB_STAT_VALID);
@@ -2138,11 +2372,29 @@ static void usb_reset_core(void) {
     ep_set_tx_stat(1, USB_STAT_NAK);
     ep_set_rx_stat(1, USB_STAT_NAK);
 
+#if USB_CDC_SHELL
+    /* Claim the endpoint addresses before disabling them: the STAT bits are a
+     * read-modify-write of the same register that carries EA, and leaving EA
+     * at its reset value of 0 would put two registers on address 0. */
+    ep_set_type(2, USB_EP_TYPE_BULK);
+    ep_set_tx_stat(2, USB_STAT_DISABLED);
+    ep_set_rx_stat(2, USB_STAT_DISABLED);
+    ep_set_type(3, USB_EP_TYPE_INTERRUPT);
+    ep_set_tx_stat(3, USB_STAT_DISABLED);
+    ep_set_rx_stat(3, USB_STAT_DISABLED);
+#endif
+
     ep0_state = EP0_IDLE;
     ep0_address_pending = 0;
     usb_configured = 0;
     msc_state = MSC_IDLE;
     msc_set_sense(0, 0);
+#if USB_CDC_SHELL
+    ep0_out_expect = 0;
+    cdc_tx_busy = 0;
+    cdc_rx_armed = 0;
+    usb_cdc_reset();
+#endif
 }
 
 void usb_msc_init(void) {
@@ -2205,6 +2457,11 @@ void usb_msc_set_enabled(uint8_t enabled) {
     usb_ready = 0;
     usb_configured = 0;
     msc_state = MSC_IDLE;
+#if USB_CDC_SHELL
+    cdc_tx_busy = 0;
+    cdc_rx_armed = 0;
+    usb_cdc_reset();
+#endif
 }
 
 void usb_msc_poll(void) {
@@ -2243,6 +2500,16 @@ void usb_msc_poll(void) {
         status.bytes >= status.expected_size) {
         if (fw_update_request_apply()) {
             raw_fat_delete_update_file(raw_update_dir_byte_addr);
+#if HW_TARGET_2C53T
+            /* Trigger file deleted first, like SWAPA: fw_cache_swap() only
+             * returns on refusal, and a surviving trigger would reflash on the
+             * next scan. On success the device resets into the new image. */
+            if (msc_update_to_cache) {
+                msc_update_to_cache = 0;
+                fw_cache_swap(FW_CACHE_SLOT_A);
+                fw_update_clear();
+            }
+#endif
         } else {
             raw_fat_delete_update_file(raw_update_dir_byte_addr);
             fw_update_clear();
@@ -2285,6 +2552,15 @@ void USB_LP_CAN1_RX0_IRQHandler(void) {
                 if (USB_EPR(1) & USB_EP_CTR_TX) {
                     ep1_in();
                 }
+#if USB_CDC_SHELL
+            } else if (ep == 2) {
+                if (reg & USB_EP_CTR_RX) {
+                    ep2_out();
+                }
+                if (USB_EPR(2) & USB_EP_CTR_TX) {
+                    ep2_in();
+                }
+#endif
             } else {
                 if (reg & USB_EP_CTR_RX) {
                     ep_clear_rx_ctr(ep);

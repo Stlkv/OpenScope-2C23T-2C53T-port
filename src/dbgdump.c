@@ -27,6 +27,7 @@ static uint16_t put_str(char *dst, uint16_t cap, uint16_t p, const char *s) {
     return p;
 }
 
+#if HW_TARGET_2C53T
 static uint16_t put_hex(char *dst, uint16_t cap, uint16_t p, uint32_t v, uint8_t digits) {
     while (digits--) {
         if (p < cap) {
@@ -55,6 +56,8 @@ static uint16_t put_dec(char *dst, uint16_t cap, uint16_t p, uint32_t v) {
 #define CALDUMP_BASE ((const uint8_t *)0x08006000u)
 #define CALDUMP_LEN  4096u
 
+#endif /* HW_TARGET_2C53T */
+
 uint32_t dbgdump_crc32(const uint8_t *p, uint32_t len) {
     uint32_t crc = 0xFFFFFFFFu;
     for (uint32_t i = 0; i < len; ++i) {
@@ -66,6 +69,7 @@ uint32_t dbgdump_crc32(const uint8_t *p, uint32_t len) {
     return crc ^ 0xFFFFFFFFu;
 }
 
+#if HW_TARGET_2C53T
 static uint32_t dbgdump_cal_crc32(void) {
     return dbgdump_crc32(CALDUMP_BASE, CALDUMP_LEN);
 }
@@ -80,6 +84,9 @@ static uint32_t dbgdump_cal_ff_count(void) {
     return n;
 }
 
+#endif /* HW_TARGET_2C53T */
+
+#if HW_TARGET_2C53T
 uint16_t dbgdump_render(char *dst, uint16_t cap) {
     fpga53_diag_t dg;
     uint16_t p = 0;
@@ -620,3 +627,10 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
 
     return p;
 }
+#else
+/* 2C23T: no fpga53_* diagnostics exist, so there is nothing to dump.
+ * Say so in the file rather than writing a stale or empty one. */
+uint16_t dbgdump_render(char *dst, uint16_t cap) {
+    return put_str(dst, cap, 0, "no debug telemetry on this target\n");
+}
+#endif
