@@ -128,7 +128,14 @@ $(HOSTTEST_DIR)/test_meter_plan: tests/test_meter_plan.c src/meter_plan.c src/me
 test-meter-plan: $(HOSTTEST_DIR)/test_meter_plan
 	$<
 
-test: test-meter-plan
+$(HOSTTEST_DIR)/test_meter_data: tests/test_meter_data.c src/meter_data.c src/meter_data.h src/meter_plan.c src/meter_plan.h
+	@mkdir -p $(HOSTTEST_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -DHW_TARGET_2C53T=1 -Isrc tests/test_meter_data.c src/meter_data.c src/meter_plan.c -lm -o $@
+
+test-meter-data: $(HOSTTEST_DIR)/test_meter_data
+	$<
+
+test: test-meter-plan test-meter-data
 
 release: clean-dist
 	$(MAKE) release-lt-hw4
