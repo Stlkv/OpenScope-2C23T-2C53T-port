@@ -2,7 +2,7 @@
  * Host-side tests for the meter frame decoder (meter_data.c).
  *
  * Ported from upstream DavidClawson/OpenScope-2C53T
- * firmware/tests/test_meter_data.c (69 cases). Upstream's meter_data.c has
+ * firmware/tests/test_meter_data.c (68 cases). Upstream's meter_data.c has
  * grown far past this port's fork point (736 -> 1624 lines), so the suite is
  * carried WHOLE, with every case whose functionality this port does not have
  * compiled out behind a feature macro and reported as an explicit SKIP on
