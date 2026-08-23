@@ -1,7 +1,8 @@
 /*
  * meter_plan.[ch] -- ported from upstream OpenScope 2C53T (GPL-3.0),
  * drivers/fpga_meter_plan.[ch] at commit 344c801, taken verbatim apart from
- * this header, the include-guard rename and the HW_TARGET_2C53T guard.
+ * this header, the include-guard rename, the HW_TARGET_2C53T guard and one
+ * freestanding-build shim (meter_mux_state_copy, marked at its definition).
  *
  * It is pure data and pure logic: the reverse-engineered stock selector low
  * bytes, the PortC/PortE (PC12/PE4/PE5/PE6) and PortA/PortB (PA15/PA10/PB10/
@@ -107,6 +108,25 @@ static const fpga_meter_portc_porte_state_t stock_portc_porte_mux[10] = {
     { 0, 1, 0, 0 },
     { 0, 1, 1, 0 },
 };
+
+/* Freestanding-build shim, same reason meter_data.c carries md_memset: this
+ * build links no libc, and upstream's `*out = meter_mux_baseline` — a 10-byte
+ * struct assignment — lowers to __aeabi_memcpy. Field-wise copy, identical
+ * effect, no libc dependency. */
+static void meter_mux_state_copy(fpga_meter_mux_gpio_state_t *dst,
+                                 const fpga_meter_mux_gpio_state_t *src)
+{
+    dst->pc12 = src->pc12;
+    dst->pe4 = src->pe4;
+    dst->pe5 = src->pe5;
+    dst->pe6 = src->pe6;
+    dst->pa15 = src->pa15;
+    dst->pa10 = src->pa10;
+    dst->pb10 = src->pb10;
+    dst->pb11 = src->pb11;
+    dst->pb9 = src->pb9;
+    dst->pa6 = src->pa6;
+}
 
 static const fpga_meter_porta_portb_state_t stock_porta_portb_mux[10] = {
     { 1, 1, 0, 1 },
@@ -403,7 +423,7 @@ bool fpga_meter_mux_gpio_state_for_stock_mux_arms(
     if (out == 0) {
         return false;
     }
-    *out = meter_mux_baseline;
+    meter_mux_state_copy(out, &meter_mux_baseline);
 
     if (portc_porte_mux >= 10 || porta_portb_mux >= 10) {
         return false;

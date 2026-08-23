@@ -21,5 +21,10 @@ uint8_t dmm_diode_continuity_active(void);
 void dmm_uart_irq_handler(void);
 
 /* 2C53T only (dmm53.c): small-font debug overlay lines for the meter
- * screen, scope-telemetry style. idx 0..2. */
+ * screen, scope-telemetry style.
+ *   0 — baud candidate, transition queue position, frame counters
+ *   1 — last 12-byte data frame, raw
+ *   2 — decoder state: submode, raw BCD, decimal, class, frame[6] rotation
+ *   3 — transition plan: selector/apply words, planned vs live frontend mask
+ *   4 — firmware-update path state (not drawn; CDC `fwstat` covers it) */
 const char *dmm53_debug_line(uint8_t idx);

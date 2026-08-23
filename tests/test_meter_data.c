@@ -48,8 +48,8 @@
 #define METER_HAS_AC_EVIDENCE_GATE 0
 
 /* meter_data_invalidate() + submode/display_update_count fields on the
- * reading. This port resets by hand from dmm53.c (the meter-session
- * refactor replaces that with meter_session_begin). */
+ * reading. This port's reset is meter_session_begin(); the upstream
+ * invalidate cases also assert stock/family fields it does not have. */
 #define METER_HAS_INVALIDATE 0
 
 /* Stock format FSM: stock_mode/stock_variant/stock_format/stock_display_cmd/
@@ -110,6 +110,20 @@ static int tests_skipped = 0;
     } \
 } while (0)
 
+/* The decoder state lives in a meter_session_t (the firmware's single
+ * session is owned by dmm53.c; the tests own this one). Two shims keep the
+ * upstream case bodies nearly verbatim: `meter_reading` maps onto the
+ * session's reading, and process_frame() begins a fresh session whenever a
+ * case switches submode — the same reset dmm53_begin_transition() performs
+ * on a mode change. */
+static meter_session_t session;
+#define meter_reading (session.reading)
+
+static void meter_data_init(void)
+{
+    meter_session_begin(&session, 0);
+}
+
 static int close_to(float actual, float expected, float tolerance)
 {
     float delta = actual - expected;
@@ -132,7 +146,10 @@ static int expect_normal_reading(const char *display,
 
 static void process_frame(const uint8_t frame[12], uint8_t submode)
 {
-    meter_data_process_frame((const volatile uint8_t *)frame, submode);
+    if (session.submode != submode) {
+        meter_session_begin(&session, submode);
+    }
+    meter_session_frame(&session, (const volatile uint8_t *)frame);
 }
 
 static uint8_t segment_nibble_for_code(uint8_t code)
@@ -899,14 +916,14 @@ static int test_port_resistance_band_calibration_override(void)
     return 1;
 }
 
-/* Band-latch behaviour, pinned before the meter-session refactor:
+/* Band-latch behaviour under the session API:
  * (a) a recognized resistance band frame latches dp/unit, and a following
- *     unknown-band frame reuses the latch instead of the static default;
- * (b) the latch resets ONLY on a submode change seen by the decoder — there
- *     is no reset API, so a re-entry into the SAME mode inherits the
- *     previous session's latch. (b) is the defect the session refactor
- *     removes; when meter_session_begin lands, this test changes with it. */
-static int test_port_band_latch_reuses_last_band_within_mode(void)
+ *     unknown-band frame in the SAME session reuses the latch instead of
+ *     the static default;
+ * (b) meter_session_begin() is the latch's reset — a re-entry into the
+ *     same mode starts clean instead of inheriting the previous session's
+ *     dp/unit, which is what the old function-local statics did. */
+static int test_port_band_latch_reuses_last_band_within_session(void)
 {
     uint8_t kohm_frame[12];
     uint8_t unknown_band_frame[12];
@@ -915,20 +932,47 @@ static int test_port_band_latch_reuses_last_band_within_mode(void)
     /* Upper nibble 2 is a band the decoder does not recognize. */
     build_segment_frame(unknown_band_frame, 3, 3, 0, 0, 0x20, 0x00, 0x00, 0x00, 0);
 
-    /* Enter mode 7 first so the decoder sees a submode change into 6 and
-     * starts mode 6 with a clean latch. */
-    meter_data_init();
-    process_frame(unknown_band_frame, 7);
-
-    process_frame(kohm_frame, 6);
+    meter_session_begin(&session, 6);
+    meter_session_frame(&session, kohm_frame);
     ASSERT_STR_EQ(meter_reading.unit_suffix, "kOhm");
     ASSERT(close_to(meter_reading.value, 3.300f, 0.001f));
 
-    process_frame(unknown_band_frame, 6);
+    meter_session_frame(&session, unknown_band_frame);
     /* Latch reused: still kOhm at dp 1, not the mode-6 static default. */
     ASSERT_STR_EQ(meter_reading.unit_suffix, "kOhm");
     ASSERT(meter_reading.decimal_pos == 1);
     ASSERT(close_to(meter_reading.value, 3.3f, 0.001f));
+    return 1;
+}
+
+static int test_session_begin_resets_band_latch_on_same_mode_reentry(void)
+{
+    uint8_t kohm_frame[12];
+    uint8_t unknown_band_frame[12];
+
+    build_segment_frame(kohm_frame, 3, 3, 0, 0, 0x40, 0x00, 0x00, 0x00, 0);
+    build_segment_frame(unknown_band_frame, 3, 3, 0, 0, 0x20, 0x00, 0x00, 0x00, 0);
+
+    meter_session_begin(&session, 6);
+    meter_session_frame(&session, kohm_frame);
+    ASSERT_STR_EQ(meter_reading.unit_suffix, "kOhm");
+
+    /* Re-enter the SAME mode: dmm_reenter() -> begin_transition() starts a
+     * fresh session. The reading is dropped... */
+    meter_session_begin(&session, 6);
+    ASSERT(!meter_reading.valid);
+    ASSERT(meter_reading.result_class == METER_RESULT_NONE);
+    ASSERT_STR_EQ(meter_reading.display_str, "---");
+    ASSERT_STR_EQ(meter_reading.unit_suffix, "");
+
+    /* ...and so is the latch: an unknown-band frame now falls back to the
+     * mode-6 static default (dp 2, Ohm) instead of the previous session's
+     * kOhm decision. */
+    meter_session_frame(&session, unknown_band_frame);
+    ASSERT_STR_EQ(meter_reading.unit_suffix, "Ohm");
+    ASSERT(meter_reading.decimal_pos == 2);
+    ASSERT_STR_EQ(meter_reading.display_str, "33.00");
+    ASSERT(close_to(meter_reading.value, 33.0f, 0.001f));
     return 1;
 }
 
@@ -991,7 +1035,7 @@ int main(void)
     SKIP(resistance_low_ohm_fails_closed_without_factory_cal,
          "divergence: upstream withdrew the 0.0304 low-ohm cal and fails closed; port still applies it (see PLAN.md)");
     SKIP(invalidate_clears_stale_reading_before_mode_transition,
-         "meter_data_invalidate not ported (reset is hand-rolled in dmm53.c)");
+         "meter_data_invalidate not ported (this port resets via meter_session_begin; case also needs stock/family fields)");
     SKIP(invalidate_clears_stale_reading_for_every_submode,
          "meter_data_invalidate not ported");
     SKIP(parser_stock_mode_tracks_transition_plan_for_every_submode,
@@ -1075,7 +1119,8 @@ int main(void)
     TEST(plan_dcv_exponent_fixture_table);
     TEST(port_formatting_defaults_per_submode);
     TEST(port_resistance_band_calibration_override);
-    TEST(port_band_latch_reuses_last_band_within_mode);
+    TEST(port_band_latch_reuses_last_band_within_session);
+    TEST(session_begin_resets_band_latch_on_same_mode_reentry);
 
     printf("\n%d/%d passed, %d skipped (unported upstream features)\n",
            tests_passed, tests_run - tests_skipped, tests_skipped);

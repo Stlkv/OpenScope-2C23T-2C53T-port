@@ -14,6 +14,17 @@
  * Stage 1 scope (EXPERIMENT-LOG / METER-PLAN): transport + wake preamble +
  * poll + raw on-screen telemetry through the standard dmm.h API. Value
  * decode (BCD + band overrides) is stage 3.
+ *
+ * Stage 4 (METER-PLAN, "modes and ranges") lives here too, and it is driven
+ * by meter_plan.[ch] — upstream's reverse-engineered selector/mux tables,
+ * ported verbatim. Everything below the tables is ours: one transition path
+ * that projects the plan onto the analog frontend pins, queues the plan's
+ * 0x05xx selector words on USART2, drains the transport across the switch,
+ * and drops the frames the SoC produces mid-transition. It replaces the two
+ * things the August bench run recorded as open holes: a frontend frozen in the
+ * DCV pose no matter which mode the UI showed, and a hand-written per-submode
+ * command switch that never fired for AUTO DETECT and mislabelled submode 5 as
+ * a frequency mode.
  */
 
 #include "dmm.h"
@@ -22,6 +33,7 @@
 #include "fw_update.h"
 #include "hw.h"
 #include "meter_data.h"
+#include "meter_plan.h"
 #include "usb_msc.h"
 #include "w25q.h"
 
@@ -50,10 +62,29 @@ enum {
     DMM53_DATA_LEN = 12,
     DMM53_ECHO_LEN = 10,
 
-    DMM53_POLL_MS = 250,      /* ~4 Hz, matches upstream meter_poll */
-    DMM53_BAUD_RETRY_MS = 700, /* per-candidate window (wake takes ~60ms) */
-    DMM53_WAKE_STEP_MS = 10,
+    DMM53_POLL_MS = 250,       /* ~4 Hz, matches upstream meter_poll */
+    DMM53_BAUD_RETRY_MS = 1500, /* per-candidate window; one wake transition
+                                 * now costs ~250ms of queued words */
+    /* Longest queue: frontend + 4 wake words + frontend + 2 bank words +
+     * selector + apply + probe + start = 12. */
+    DMM53_SEQ_MAX = 14,
+    /* Pseudo-opcode in the step queue: apply the analog frontend for the
+     * submode in .lo instead of sending a word. */
+    DMM53_STEP_FRONTEND = 0xFFu,
 };
+
+/* Auxiliary AFE pins PB9/PA6.
+ *
+ * meter_plan's baseline keeps both LOW: upstream's note is that the recovered
+ * stock sites prove output-low setup for these two and nothing mode-specific.
+ * Our own stage-1 pose (2026-08-13) drove them HIGH, taken from an earlier
+ * reading of fpga_set_meter_frontend_baseline, and that pose is what the one
+ * successful resistance decode ran under. The table wins by default because it
+ * is the evidence we can cite; the flag exists so the bench can A/B the two
+ * poses in a single rebuild instead of a code edit. */
+#ifndef DMM53_AUX_AFE_HIGH
+#define DMM53_AUX_AFE_HIGH 0
+#endif
 
 /* PCLK1 candidates: the port never reprograms the PLL, so the effective
  * APB1 clock depends on what the factory bootloader left behind. Cycle
@@ -74,8 +105,29 @@ static uint8_t dmm53_baud_index;
 static uint8_t dmm53_baud_locked;
 static uint16_t dmm53_retry_ms;
 static uint16_t dmm53_poll_timer_ms;
-static uint8_t dmm53_wake_step;
-static uint16_t dmm53_wake_timer_ms;
+
+/* Transition state. The queue is stepped from dmm_tick: each 10-byte word
+ * already blocks ~10.4ms on the wire at 9600, and the plan asks for 20ms
+ * settle gaps on top, so running a whole transition inline would stall the
+ * render loop for a quarter of a second. */
+typedef struct {
+    uint8_t hi; /* DMM53_STEP_FRONTEND = apply frontend for .lo */
+    uint8_t lo;
+    uint16_t delay_ms; /* quiet time after this step */
+} dmm53_step_t;
+
+static dmm53_step_t dmm53_seq[DMM53_SEQ_MAX];
+static uint8_t dmm53_seq_len;
+static uint8_t dmm53_seq_pos;
+static uint16_t dmm53_seq_timer_ms;
+static uint16_t dmm53_seq_wait_ms;
+
+static fpga_meter_transition_plan_t dmm53_plan;
+static uint8_t dmm53_transition_busy;
+static volatile uint8_t dmm53_discard_frames;
+static volatile uint32_t dmm53_skip_count;
+static uint16_t dmm53_gpio_planned;
+static uint16_t dmm53_gpio_live;
 
 /* RX ISR state */
 static volatile uint8_t rx_buf[DMM53_DATA_LEN];
@@ -90,6 +142,11 @@ static volatile uint16_t rx_err_count;
 
 static uint8_t dmm53_frame[DMM53_DATA_LEN]; /* last data frame, main-loop copy */
 static uint8_t dmm53_frame_valid;
+
+/* The decoder session. Owns the reading, the band latch and the f6 history;
+ * dmm53_begin_transition() starts a fresh one for every mode (re-)entry, so
+ * nothing decoded under the previous mode can leak into the next. */
+static meter_session_t dmm53_session;
 
 static char dmm53_value[28];
 static char dmm53_unit[8];
@@ -160,105 +217,212 @@ static uint8_t dmm53_probe_cmd(void) {
     return (GPIO_IDR(GPIOC_BASE) & (1u << 7)) ? 0x07u : 0x0Au;
 }
 
-static void dmm53_send_mode_sequence(void);
+static uint8_t dmm53_plan_submode(void);
 
-/* Meter analog posture, mirrored from upstream fpga_set_meter_frontend_baseline:
- * PB11/PC6 kept HIGH, PC11 = meter MUX on, PC12 = probe routed to meter,
- * PE4 H / PE5 L / PE6 H relays, PB9/PA6/PA15/PA10 H + PB10 L gain keys. */
-static void dmm53_frontend_baseline(void) {
-    gpio_set(GPIOB_BASE, (1u << 11) | (1u << 9));
-    gpio_set(GPIOC_BASE, (1u << 6) | (1u << 11) | (1u << 12));
-    gpio_set(GPIOE_BASE, (1u << 4) | (1u << 6));
-    gpio_clear(GPIOE_BASE, 1u << 5);
-    gpio_set(GPIOA_BASE, (1u << 6) | (1u << 15) | (1u << 10));
-    gpio_clear(GPIOB_BASE, 1u << 10);
-
-    gpio_config_mask(GPIOB_BASE, (1u << 11) | (1u << 9) | (1u << 10), 0x1u);
+/* Claim the frontend pins as push-pull outputs. Called on meter-mode entry,
+ * not per transition: PA6 arrives from scope mode as the TMR13 PWM output and
+ * has to be taken back before any level write means anything, while the rest
+ * only need claiming once. Levels are the transition's business below. */
+static void dmm53_frontend_configure_pins(void) {
+    gpio_config_mask(GPIOB_BASE, (1u << 11) | (1u << 10) | (1u << 9), 0x1u);
     gpio_config_mask(GPIOC_BASE, (1u << 6) | (1u << 11) | (1u << 12), 0x1u);
     gpio_config_mask(GPIOE_BASE, (1u << 4) | (1u << 5) | (1u << 6), 0x1u);
-    gpio_config_mask(GPIOA_BASE, (1u << 6) | (1u << 15) | (1u << 10), 0x1u);
+    gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10) | (1u << 6), 0x1u);
 }
 
-/* Wake preamble, mirrored from upstream fpga_send_meter_wake_preamble:
- * (0x05,0x08) -> (0x05,0x09 START) -> (0x05,probe) -> (0x05,0x14 VAR),
- * 10-20ms apart. Driven as steps from dmm_tick. */
-static void dmm53_wake_send_step(uint8_t step) {
-    switch (step) {
-    case 0:
-        dmm53_send_cmd(0x05u, 0x08u);
-        break;
-    case 1:
-        dmm53_send_cmd(0x05u, 0x09u);
-        break;
-    case 2:
-        dmm53_send_cmd(0x05u, dmm53_probe_cmd());
-        break;
-    case 3:
-        dmm53_send_cmd(0x05u, 0x14u);
-        break;
-    case 4:
-        /* Wake done — switch the SoC into the selected meter mode. */
-        dmm53_send_mode_sequence();
-        break;
-    default:
-        break;
+/* Bit order copied from upstream fpga_meter_mux_gpio_mask_from_state so a mask
+ * printed here and a mask printed by their `meter frontend` mean the same. */
+static uint16_t dmm53_mux_mask_from_state(const fpga_meter_mux_gpio_state_t *s) {
+    uint16_t mask = 0;
+    if (s->pc12) mask |= 1u << 0;
+    if (s->pe4)  mask |= 1u << 1;
+    if (s->pe5)  mask |= 1u << 2;
+    if (s->pe6)  mask |= 1u << 3;
+    if (s->pa15) mask |= 1u << 4;
+    if (s->pa10) mask |= 1u << 5;
+    if (s->pb10) mask |= 1u << 6;
+    if (s->pb11) mask |= 1u << 7;
+    if (s->pb9)  mask |= 1u << 8;
+    if (s->pa6)  mask |= 1u << 9;
+    return mask;
+}
+
+static uint16_t dmm53_mux_mask_live(void) {
+    uint16_t mask = 0;
+    if (GPIO_IDR(GPIOC_BASE) & (1u << 12)) mask |= 1u << 0;
+    if (GPIO_IDR(GPIOE_BASE) & (1u << 4))  mask |= 1u << 1;
+    if (GPIO_IDR(GPIOE_BASE) & (1u << 5))  mask |= 1u << 2;
+    if (GPIO_IDR(GPIOE_BASE) & (1u << 6))  mask |= 1u << 3;
+    if (GPIO_IDR(GPIOA_BASE) & (1u << 15)) mask |= 1u << 4;
+    if (GPIO_IDR(GPIOA_BASE) & (1u << 10)) mask |= 1u << 5;
+    if (GPIO_IDR(GPIOB_BASE) & (1u << 10)) mask |= 1u << 6;
+    if (GPIO_IDR(GPIOB_BASE) & (1u << 11)) mask |= 1u << 7;
+    if (GPIO_IDR(GPIOB_BASE) & (1u << 9))  mask |= 1u << 8;
+    if (GPIO_IDR(GPIOA_BASE) & (1u << 6))  mask |= 1u << 9;
+    return mask;
+}
+
+static void dmm53_write_level(uint32_t base, uint32_t mask, uint8_t high) {
+    if (high) {
+        gpio_set(base, mask);
+    } else {
+        gpio_clear(base, mask);
     }
 }
 
-static uint8_t dmm53_submode(void);
+/* Project one submode's mux arms onto the pins, mirroring upstream
+ * fpga_set_meter_frontend_for_submode: PB11/PC6 and the PC11 meter MUX gate go
+ * HIGH first, then the plan's projection of the stock ms[0x02]/ms[0x03] writers
+ * (PC12/PE4/PE5/PE6 and PA15/PA10/PB10/PB11) lands on top — so a slot that
+ * wants PB11 LOW, such as diode, still gets it.
+ *
+ * An invalid submode still applies the baseline the model hands back and then
+ * emits no selector word at all: fail closed, never a fabricated pose. */
+static void dmm53_apply_frontend(uint8_t submode) {
+    fpga_meter_mux_gpio_state_t mux;
 
-/* Mode-specific command sequence, mirrored from upstream
- * fpga_send_meter_mode_sequence (RE: mode init dispatcher FUN_0800b908).
- * Blocking sends (~10ms each) provide the stock-like pacing. */
-static void dmm53_send_mode_sequence(void) { /* fwd-declared above */
-    uint8_t submode = dmm53_submode();
-    dmm53_send_cmd(0x00u, 0x00u); /* RESET */
-    switch (submode) {
-    case 5: /* Frequency */
-        dmm53_send_cmd(0x00u, 0x1Fu);
-        dmm53_send_cmd(0x00u, 0x09u);
-        dmm53_send_cmd(0x00u, 0x20u);
-        dmm53_send_cmd(0x00u, 0x21u);
-        break;
-    case 6: /* Resistance */
-        dmm53_send_cmd(0x00u, 0x12u);
-        dmm53_send_cmd(0x00u, 0x13u);
-        dmm53_send_cmd(0x00u, 0x14u);
-        dmm53_send_cmd(0x00u, 0x09u);
-        dmm53_send_cmd(0x00u, dmm53_probe_cmd());
-        break;
-    case 7: /* Continuity */
-    case 8: /* Diode */
-        dmm53_send_cmd(0x00u, 0x2Cu);
-        break;
-    case 9: /* Capacitance */
-        dmm53_send_cmd(0x00u, 0x08u);
-        dmm53_send_cmd(0x00u, 0x09u);
-        dmm53_send_cmd(0x00u, dmm53_probe_cmd());
-        dmm53_send_cmd(0x00u, 0x16u);
-        dmm53_send_cmd(0x00u, 0x17u);
-        dmm53_send_cmd(0x00u, 0x18u);
-        dmm53_send_cmd(0x00u, 0x19u);
-        break;
-    default: /* DCV/ACV/DCA/ACA: basic meter */
-        dmm53_send_cmd(0x00u, 0x09u);
-        dmm53_send_cmd(0x00u, dmm53_probe_cmd());
-        dmm53_send_cmd(0x00u, 0x1Au);
-        dmm53_send_cmd(0x00u, 0x1Bu);
-        dmm53_send_cmd(0x00u, 0x1Cu);
-        dmm53_send_cmd(0x00u, 0x1Du);
-        dmm53_send_cmd(0x00u, 0x1Eu);
-        break;
-    }
+    gpio_set(GPIOB_BASE, 1u << 11);
+    gpio_set(GPIOC_BASE, (1u << 6) | (1u << 11));
+
+    (void)fpga_meter_mux_gpio_state_for_submode(submode, &mux);
+#if DMM53_AUX_AFE_HIGH
+    mux.pb9 = 1u;
+    mux.pa6 = 1u;
+#endif
+    dmm53_gpio_planned = dmm53_mux_mask_from_state(&mux);
+
+    dmm53_write_level(GPIOC_BASE, 1u << 12, mux.pc12);
+    dmm53_write_level(GPIOE_BASE, 1u << 4, mux.pe4);
+    dmm53_write_level(GPIOE_BASE, 1u << 5, mux.pe5);
+    dmm53_write_level(GPIOE_BASE, 1u << 6, mux.pe6);
+    dmm53_write_level(GPIOA_BASE, 1u << 15, mux.pa15);
+    dmm53_write_level(GPIOA_BASE, 1u << 10, mux.pa10);
+    dmm53_write_level(GPIOB_BASE, 1u << 10, mux.pb10);
+    dmm53_write_level(GPIOB_BASE, 1u << 11, mux.pb11);
+    dmm53_write_level(GPIOB_BASE, 1u << 9, mux.pb9);
+    dmm53_write_level(GPIOA_BASE, 1u << 6, mux.pa6);
+
+    dmm53_gpio_live = dmm53_mux_mask_live();
 }
 
-static void dmm53_restart_wake(void) {
-    dmm53_wake_step = 0;
-    dmm53_wake_timer_ms = 0;
+/* Transport drain across a mode switch, the small local half of what stock
+ * does at 0x0800741A: clear UEN, drop the meter MUX gate, reset the RX frame
+ * index and any frame the ISR had ready, then bring USART2 back. The frontend
+ * projection re-asserts PC11 on the next step. Stock also suspends its two
+ * DVOM tasks — we have no tasks, the ISR plus this reset is the whole thing. */
+static void dmm53_reset_transport(void) {
+    USART_CTRL1(USART2_BASE) &= ~USART_CTRL1_UE;
+    gpio_clear(GPIOC_BASE, 1u << 11);
+    __asm__ volatile("cpsid i" ::: "memory");
+    rx_index = 0;
+    rx_data_ready = 0;
+    __asm__ volatile("cpsie i" ::: "memory");
+    (void)USART_STS(USART2_BASE);
+    (void)USART_DT(USART2_BASE);
+    USART_CTRL1(USART2_BASE) |= USART_CTRL1_UE;
+}
+
+static void dmm53_seq_push(uint8_t hi, uint8_t lo, uint16_t delay_ms) {
+    if (dmm53_seq_len >= DMM53_SEQ_MAX) {
+        return;
+    }
+    dmm53_seq[dmm53_seq_len].hi = hi;
+    dmm53_seq[dmm53_seq_len].lo = lo;
+    dmm53_seq[dmm53_seq_len].delay_ms = delay_ms;
+    ++dmm53_seq_len;
+}
+
+static void dmm53_seq_push_word(uint16_t word, uint16_t delay_ms) {
+    dmm53_seq_push((uint8_t)(word >> 8), (uint8_t)(word & 0xFFu), delay_ms);
+}
+
+/* Build one transition: the analog pose plus the plan's USART2 words, in
+ * upstream's order (fpga_apply_meter_transition -> wake preamble ->
+ * fpga_send_meter_mode_sequence). Nothing is sent from here; dmm_tick walks
+ * the queue so the wire pacing survives without blocking the UI. */
+static void dmm53_begin_transition(uint8_t wake_preamble) {
+    uint8_t submode = dmm53_plan_submode();
+    uint8_t probe = dmm53_probe_cmd();
+
+    dmm53_plan = fpga_meter_transition_plan_for_submode(submode);
+    dmm53_seq_len = 0;
+    dmm53_seq_pos = 0;
+    dmm53_seq_timer_ms = 0;
+    dmm53_seq_wait_ms = 0;
     dmm53_poll_timer_ms = 0;
-    /* Per-mode f6 capture: each mode's band bytes shouldn't be diluted
-     * by the previous mode's rotation. */
-    meter_f6_history_count = 0;
+    dmm53_transition_busy = 1u;
+    dmm53_discard_frames = 0;
+
+    /* The previous mode's reading is not this mode's reading. A fresh session
+     * drops it — plus the band latch and the f6 history — so the panel cannot
+     * show a settled number under a freshly switched label, and a re-entry
+     * into the same mode cannot inherit the previous session's dp/unit. */
+    meter_session_begin(&dmm53_session, dmm53_plan.submode);
+    dmm53_frame_valid = 0;
+
+    dmm53_reset_transport();
+
+    if (wake_preamble) {
+        /* Stock brings the meter up on the DCV pose before it names a mode. */
+        dmm53_seq_push(DMM53_STEP_FRONTEND, 0u, 20u);
+        dmm53_seq_push(0x05u, 0x08u, 10u);            /* configure */
+        dmm53_seq_push(0x05u, 0x09u, 10u);            /* start */
+        dmm53_seq_push(0x05u, probe, 10u);            /* PC7-gated probe tail */
+        dmm53_seq_push(0x05u, 0x14u, 20u);            /* variant setup */
+    }
+
+    dmm53_seq_push(DMM53_STEP_FRONTEND, submode, dmm53_plan.settle_ms);
+
+    if (dmm53_plan.has_command_bank_prefix) {
+        dmm53_seq_push(0x00u, dmm53_plan.command_bank_first,
+                       dmm53_plan.settle_ms);
+        dmm53_seq_push(0x00u, dmm53_plan.command_bank_second,
+                       dmm53_plan.settle_ms);
+    }
+    if (dmm53_plan.has_config_word) {
+        dmm53_seq_push_word(dmm53_plan.config_word, dmm53_plan.settle_ms);
+    }
+    if (dmm53_plan.selector_word != FPGA_METER_INVALID_SELECTOR_WORD) {
+        dmm53_seq_push_word(dmm53_plan.selector_word, dmm53_plan.settle_ms);
+    }
+    if (dmm53_plan.has_apply_word) {
+        dmm53_seq_push_word(dmm53_plan.apply_word, dmm53_plan.settle_ms);
+    }
+    if (dmm53_plan.has_probe_detect) {
+        dmm53_seq_push(0x05u, probe, 10u);
+    }
+    if (dmm53_plan.start_word) {
+        dmm53_seq_push_word(dmm53_plan.start_word, dmm53_plan.settle_ms);
+    }
+}
+
+/* Walk the queue. One step per tick at most: every word blocks ~10.4ms on the
+ * wire already, and the settle gaps are what the plan asks for between them. */
+static void dmm53_seq_tick(uint32_t elapsed_ms) {
+    const dmm53_step_t *step;
+
+    dmm53_seq_timer_ms = (uint16_t)(dmm53_seq_timer_ms + elapsed_ms);
+    if (dmm53_seq_timer_ms < dmm53_seq_wait_ms) {
+        return;
+    }
+    dmm53_seq_timer_ms = 0;
+    dmm53_seq_wait_ms = 0;
+
+    if (dmm53_seq_pos >= dmm53_seq_len) {
+        /* Last settle has elapsed: hand the SoC's first frames to the discard
+         * policy and let the poll cadence take over. */
+        dmm53_discard_frames = dmm53_plan.discard_frames;
+        dmm53_transition_busy = 0;
+        return;
+    }
+
+    step = &dmm53_seq[dmm53_seq_pos++];
+    if (step->hi == DMM53_STEP_FRONTEND) {
+        dmm53_apply_frontend(step->lo);
+    } else {
+        dmm53_send_cmd(step->hi, step->lo);
+    }
+    dmm53_seq_wait_ms = step->delay_ms;
 }
 
 static void dmm53_format_status(void) {
@@ -327,15 +491,21 @@ void dmm_init(void) {
     dmm53_unit[3] = '\0';
     dmm53_format_status();
 
-    meter_data_init();
+    meter_session_begin(&dmm53_session, dmm53_plan_submode());
     dmm53_started = 1u;
     dmm53_powered = 0; /* silent until meter mode is entered */
 }
 
 void dmm_pause(void) {
     dmm53_powered = 0;
-    /* Meter MUX off; the other relays keep their last state (stage 1 —
-     * scope re-entry re-applies its own settings). */
+    /* Drop any half-sent transition: whatever mode comes next rebuilds the
+     * whole queue, and a stale busy flag would gate the decoder shut. */
+    dmm53_seq_len = 0;
+    dmm53_seq_pos = 0;
+    dmm53_seq_wait_ms = 0;
+    dmm53_transition_busy = 0;
+    /* Meter MUX off; the other relays keep their last state (scope re-entry
+     * re-applies its own posture — fpga53_scope_pose_reapply). */
     gpio_clear(GPIOC_BASE, 1u << 11);
 }
 
@@ -346,8 +516,8 @@ void dmm_hw4_set_mode_gate(uint8_t active) {
 void dmm_reenter(uint8_t mode_index) {
     dmm53_mode = mode_index;
     dmm53_powered = 1u;
-    dmm53_frontend_baseline();
-    dmm53_restart_wake();
+    dmm53_frontend_configure_pins();
+    dmm53_begin_transition(1u);
 }
 
 void dmm_set_mode(uint8_t mode_index) {
@@ -360,36 +530,51 @@ void dmm_set_mode(uint8_t mode_index) {
      * other side and stopped reconfiguring the DMM mode on poll (komzpa,
      * 801e2dd in PR #13).
      *
-     * Only skip once the meter is powered and past the wake preamble: an
-     * unpowered or still-waking meter has nothing settled to protect, and
-     * dmm_reenter() stays the unconditional entry point for meter-mode entry. */
-    if (dmm53_powered && dmm53_wake_step >= 5u && mode_index == dmm53_mode) {
+     * A transition already in flight for this same mode is left alone: the
+     * queue ends in the mode being asked for, so restarting it can only push
+     * the settle further out. dmm_reenter() stays the unconditional entry
+     * point for meter-mode entry. */
+    if (dmm53_powered && mode_index == dmm53_mode) {
         return;
     }
 
     dmm53_mode = mode_index;
-    dmm53_restart_wake();
+    dmm53_begin_transition(0u);
 }
 
-/* Port UI meter modes (ui.c dmm_mode_names, 0-12) → upstream decode
- * submodes (meter_data.c, 0-9). AUTO/LIVE/TEMP fall back to DCV. */
-static uint8_t dmm53_submode(void) {
+/* Port UI meter modes (ui.c dmm_mode_names, 0-12) → meter_plan local submodes
+ * (0-10), which are also meter_data's decode submodes for 0-9 plus temperature
+ * at 10.
+ *
+ * The mapping goes through meter_plan's logical-function enum rather than a
+ * hand-written submode table, so an unresolved function (the microamp
+ * frontend, which stock V1.2.0 shows no selector for) arrives here as
+ * FPGA_METER_INVALID_LOCAL_SUBMODE and takes the fail-closed path instead of
+ * being quietly aimed at a neighbouring range.
+ *
+ * AUTO DETECT and LIVE WIRE have no logical function: the stock selector table
+ * has no slot that means "decide for me" and none that means "non-contact live
+ * wire". Both keep pointing at DCV, as they did in stage 1 — a placeholder we
+ * can name, not evidence. */
+static uint8_t dmm53_plan_submode(void) {
     static const uint8_t map[13] = {
-        0u, /* AUTO DETECT  -> DCV */
-        0u, /* DC VOLTAGE   -> DCV */
-        1u, /* AC VOLTAGE   -> ACV */
-        6u, /* RESISTANCE   -> Ohm */
-        8u, /* DIODE        -> Diode */
-        9u, /* CAPACITANCE  -> Cap */
-        0u, /* LIVE WIRE    -> DCV */
-        7u, /* CONTINUITY   -> Cont */
-        0u, /* TEMPERATURE  -> DCV (no upstream submode) */
-        5u, /* AC HIGH CURR -> ACA(A) */
-        3u, /* DC HIGH CURR -> DCA(A) */
-        4u, /* AC LOW CURR  -> ACA(mA) */
-        2u, /* DC LOW CURR  -> DCA(mA) */
+        FPGA_METER_FUNCTION_DCV,         /* AUTO DETECT  (placeholder) */
+        FPGA_METER_FUNCTION_DCV,         /* DC VOLTAGE */
+        FPGA_METER_FUNCTION_ACV,         /* AC VOLTAGE */
+        FPGA_METER_FUNCTION_RESISTANCE,  /* RESISTANCE */
+        FPGA_METER_FUNCTION_DIODE,       /* DIODE */
+        FPGA_METER_FUNCTION_CAPACITANCE, /* CAPACITANCE */
+        FPGA_METER_FUNCTION_DCV,         /* LIVE WIRE    (placeholder) */
+        FPGA_METER_FUNCTION_CONTINUITY,  /* CONTINUITY */
+        FPGA_METER_FUNCTION_TEMPERATURE, /* TEMPERATURE */
+        FPGA_METER_FUNCTION_AC_A,        /* AC HIGH CURR */
+        FPGA_METER_FUNCTION_DC_A,        /* DC HIGH CURR */
+        FPGA_METER_FUNCTION_AC_MA,       /* AC LOW CURR */
+        FPGA_METER_FUNCTION_DC_MA,       /* DC LOW CURR */
     };
-    return dmm53_mode < 13u ? map[dmm53_mode] : 0u;
+    uint8_t function =
+        dmm53_mode < 13u ? map[dmm53_mode] : (uint8_t)FPGA_METER_FUNCTION_DCV;
+    return fpga_meter_submode_for_logical_function(function);
 }
 
 uint8_t dmm_poll(void) {
@@ -402,11 +587,26 @@ uint8_t dmm_poll(void) {
     }
     rx_data_ready = 0;
     __asm__ volatile("cpsie i" ::: "memory");
-    dmm53_frame_valid = 1u;
     dmm53_baud_locked = 1u; /* real framed traffic = correct baud */
-    meter_data_process_frame(dmm53_frame, dmm53_submode());
+
+    /* Raw telemetry sees every frame, including the dropped ones — the whole
+     * point of the F-line is to show what actually arrived. The decoder does
+     * not: frames produced while the selector words and the relays are still
+     * moving belong to no mode in particular, and feeding them to the band
+     * latch is how a switch to resistance used to land on the old range. */
     dmm53_format_value();
     dmm53_format_status();
+    if (!fpga_meter_rx_frame_should_parse(dmm53_transition_busy != 0,
+                                          &dmm53_discard_frames,
+                                          &dmm53_skip_count)) {
+        return 0;
+    }
+
+    dmm53_frame_valid = 1u;
+    /* The session's submode was fixed by the last transition: the decoder
+     * reads the frame under the same submode whose selector words are on the
+     * wire, not under whatever the UI mode says right now. */
+    meter_session_frame(&dmm53_session, dmm53_frame);
     return 1u;
 }
 
@@ -415,17 +615,9 @@ void dmm_tick(uint32_t elapsed_ms) {
         return;
     }
 
-    /* Wake preamble steps (10/10/10/20ms apart) + mode sequence. */
-    if (dmm53_wake_step < 5u) {
-        dmm53_wake_timer_ms = (uint16_t)(dmm53_wake_timer_ms + elapsed_ms);
-        uint16_t need = (dmm53_wake_step == 0u)
-                            ? 0u
-                            : (dmm53_wake_step >= 3u ? 20u : DMM53_WAKE_STEP_MS);
-        if (dmm53_wake_timer_ms >= need) {
-            dmm53_wake_send_step(dmm53_wake_step);
-            ++dmm53_wake_step;
-            dmm53_wake_timer_ms = 0;
-        }
+    /* A transition owns the wire until its queue drains. */
+    if (dmm53_transition_busy) {
+        dmm53_seq_tick(elapsed_ms);
         dmm53_format_status();
         return;
     }
@@ -448,7 +640,7 @@ void dmm_tick(uint32_t elapsed_ms) {
                 dmm53_baud_index =
                     (uint8_t)((dmm53_baud_index + 1u) % DMM53_PCLK_COUNT);
                 dmm53_uart_apply();
-                dmm53_restart_wake();
+                dmm53_begin_transition(1u);
             }
         }
     }
@@ -456,29 +648,29 @@ void dmm_tick(uint32_t elapsed_ms) {
 }
 
 uint8_t dmm_has_reading(void) {
-    return dmm53_frame_valid && meter_reading.valid;
+    return dmm53_frame_valid && dmm53_session.reading.valid;
 }
 
 uint8_t dmm_value_is_numeric(void) {
-    return meter_reading.valid &&
-           meter_reading.result_class == METER_RESULT_NORMAL;
+    return dmm53_session.reading.valid &&
+           dmm53_session.reading.result_class == METER_RESULT_NORMAL;
 }
 
 int32_t dmm_value_milli_units(void) {
-    float v = meter_reading.value * 1000.0f;
+    float v = dmm53_session.reading.value * 1000.0f;
     return (int32_t)(v < 0 ? v - 0.5f : v + 0.5f);
 }
 
 const char *dmm_value_text(void) {
-    if (meter_reading.valid) {
-        return meter_reading.display_str;
+    if (dmm53_session.reading.valid) {
+        return dmm53_session.reading.display_str;
     }
     return dmm53_frame_valid ? dmm53_value : "----";
 }
 
 const char *dmm_unit_text(void) {
-    if (meter_reading.valid && meter_reading.unit_suffix) {
-        return meter_reading.unit_suffix;
+    if (dmm53_session.reading.valid && dmm53_session.reading.unit_suffix) {
+        return dmm53_session.reading.unit_suffix;
     }
     return dmm53_unit;
 }
@@ -488,9 +680,9 @@ const char *dmm_status_text(void) {
 }
 
 uint8_t dmm_reading_is_real(void) {
-    return meter_reading.valid &&
-           meter_reading.result_class != METER_RESULT_NONE &&
-           meter_reading.result_class != METER_RESULT_INVALID;
+    return dmm53_session.reading.valid &&
+           dmm53_session.reading.result_class != METER_RESULT_NONE &&
+           dmm53_session.reading.result_class != METER_RESULT_INVALID;
 }
 
 uint8_t dmm_live_wire_active(void) {
@@ -501,18 +693,40 @@ uint8_t dmm_diode_continuity_active(void) {
     return 0;
 }
 
+/* Fixed-width hex, most significant nibble first. */
+static char *hex_n(char *p, uint16_t v, uint8_t nibbles) {
+    while (nibbles--) {
+        *p++ = hex_digits[(v >> (nibbles * 4u)) & 0xFu];
+    }
+    return p;
+}
+
+static char *hex_word_or_dashes(char *p, uint8_t present, uint16_t v) {
+    if (!present) {
+        *p++ = '-';
+        *p++ = '-';
+        *p++ = '-';
+        *p++ = '-';
+        return p;
+    }
+    return hex_n(p, v, 4u);
+}
+
 const char *dmm53_debug_line(uint8_t idx) {
-    static char line[4][44];
+    static char line[5][56];
     char *p;
 
     switch (idx) {
-    case 3: /* firmware-update path state (USB self-update debugging) */
+    case 4: /* firmware-update path state (USB self-update debugging).
+             * Off the meter overlay since the CDC shell arrived — `version`
+             * and `fwstat` answer the same question over the cable, and the
+             * meter screen owes its fourth line to the meter. */
     {
         fw_update_status_t st;
         uint16_t mc[6];
         fw_update_status(&st);
         usb_msc_debug_counts(mc);
-        p = line[3];
+        p = line[4];
         /* Build tag: bump when proving a USB self-update took effect. */
         *p++ = '#';
         *p++ = '5';
@@ -543,16 +757,18 @@ const char *dmm53_debug_line(uint8_t idx) {
         *p++ = 'H';
         p += u16_to_dec(p, mc[4]);
         *p = '\0';
-        return line[3];
+        return line[4];
     }
-    case 0: /* baud candidate, wake step, counters */
+    case 0: /* baud candidate, transition queue position, counters */
         p = line[0];
         *p++ = 'B';
         *p++ = (char)('0' + dmm53_baud_index);
         *p++ = dmm53_baud_locked ? '!' : '?';
         *p++ = ' ';
-        *p++ = 'W';
-        *p++ = (char)('0' + dmm53_wake_step);
+        *p++ = 'Q';
+        p += u16_to_dec(p, dmm53_seq_pos);
+        *p++ = '/';
+        p += u16_to_dec(p, dmm53_seq_len);
         *p++ = ' ';
         *p++ = 'T';
         p += u16_to_dec(p, dmm53_tx_count);
@@ -589,32 +805,84 @@ const char *dmm53_debug_line(uint8_t idx) {
              * just the one frame the F-line happens to catch. */
         p = line[2];
         *p++ = 'S';
-        *p++ = (char)('0' + dmm53_submode());
+        p += u16_to_dec(p, dmm53_session.submode);
         *p++ = ' ';
         *p++ = 'R';
-        p += u16_to_dec(p, (uint16_t)meter_reading.raw_bcd);
+        p += u16_to_dec(p, (uint16_t)dmm53_session.reading.raw_bcd);
         *p++ = ' ';
         /* E = stock's frame[2].3 raw +10000 extension. Added to the value in
          * DCV only; on other submodes this tells us whether the bit ever
          * fires there (stock evidence covers DCV alone). */
         *p++ = 'E';
-        *p++ = meter_reading.raw_bcd_extended ? '1' : '0';
+        *p++ = dmm53_session.reading.raw_bcd_extended ? '1' : '0';
         *p++ = ' ';
         *p++ = 'P';
-        *p++ = (char)('0' + meter_reading.decimal_pos);
+        *p++ = (char)('0' + dmm53_session.reading.decimal_pos);
         *p++ = ' ';
         *p++ = 'C';
-        *p++ = (char)('0' + (meter_reading.result_class % 10u));
+        *p++ = (char)('0' + (dmm53_session.reading.result_class % 10u));
+        *p++ = ' ';
+        /* V = DCV exponent class from the stock status bits, '-' when the
+         * stock DCV path did not run for this frame. A wrong DCV number is
+         * only diagnosable next to the class the frame claimed. */
+        *p++ = 'V';
+        *p++ = (dmm53_session.reading.dcv_stock_class > 4u)
+                   ? '-'
+                   : (char)('0' + dmm53_session.reading.dcv_stock_class);
         *p++ = ' ';
         *p++ = 'H';
-        for (uint8_t i = 0; i < meter_f6_history_count && i < 6u; ++i) {
-            uint8_t b = meter_f6_history[i];
+        for (uint8_t i = 0; i < dmm53_session.f6_history_count && i < 6u; ++i) {
+            uint8_t b = dmm53_session.f6_history[i];
             *p++ = ' ';
             *p++ = hex_digits[b >> 4];
             *p++ = hex_digits[b & 0xFu];
         }
         *p = '\0';
         return line[2];
+    case 3: /* transition plan: what the tables asked for, and what the pins
+             * actually read back. G planned/live differing is the one thing
+             * that separates "the mode never reached the frontend" from "the
+             * frontend moved and the SoC still answers with the old range" —
+             * the ambiguity the August session had no way to resolve. */
+        p = line[3];
+        *p++ = 'P';
+        p += u16_to_dec(p, dmm53_mode);
+        *p++ = ' ';
+        *p++ = 'S';
+        p += u16_to_dec(p, dmm53_plan.submode);
+        *p++ = '/';
+        if (dmm53_plan.stock_mode == FPGA_METER_INVALID_STOCK_MODE) {
+            *p++ = '-';
+        } else {
+            p += u16_to_dec(p, dmm53_plan.stock_mode);
+        }
+        *p++ = ' ';
+        *p++ = 'C';
+        p = hex_word_or_dashes(p, dmm53_plan.has_config_word,
+                               dmm53_plan.config_word);
+        *p++ = ' ';
+        *p++ = 'W';
+        p = hex_word_or_dashes(
+            p, dmm53_plan.selector_word != FPGA_METER_INVALID_SELECTOR_WORD,
+            dmm53_plan.selector_word);
+        *p++ = ' ';
+        *p++ = 'A';
+        p = hex_word_or_dashes(p, dmm53_plan.has_apply_word,
+                               dmm53_plan.apply_word);
+        *p++ = ' ';
+        *p++ = 'G';
+        p = hex_n(p, dmm53_gpio_planned, 3u);
+        *p++ = '/';
+        p = hex_n(p, dmm53_gpio_live, 3u);
+        *p++ = ' ';
+        *p++ = 'X';
+        p += u16_to_dec(p, (uint16_t)(dmm53_skip_count > 0xFFFFu
+                                          ? 0xFFFFu
+                                          : dmm53_skip_count));
+        *p++ = '.';
+        p += u16_to_dec(p, dmm53_discard_frames);
+        *p = '\0';
+        return line[3];
     default:
         return "";
     }

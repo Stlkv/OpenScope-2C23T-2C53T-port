@@ -67,15 +67,10 @@ static void *md_memmove(void *dst, const void *src, unsigned long n) {
 #define strcpy md_strcpy
 #define memmove md_memmove
 
-/* ═══════════════════════════════════════════════════════════════════
- * Global State
- * ═══════════════════════════════════════════════════════════════════ */
-
-meter_reading_t meter_reading;
-
-/* Distinct frame[6] history — see meter_data.h for semantics. */
-uint8_t meter_f6_history[METER_F6_HISTORY_LEN];
-uint8_t meter_f6_history_count;
+/* No file-scope decoder state: everything the decoder accumulates lives in
+ * the caller's meter_session_t (see meter_data.h), so the owner of the mode
+ * transition — dmm53.c on the firmware side, the harness in host tests —
+ * also owns the reset. */
 
 /* ═══════════════════════════════════════════════════════════════════
  * BCD Nibble Lookup — extracted from stock firmware FUN_08033EF8
@@ -159,21 +154,23 @@ static uint8_t bcd_nibble_lookup(uint8_t combined)
  *   Diode (8): 2V range, raw 623 → 0.623 V, decimal after digit 1
  *   Capacitance (9): 200nF range, raw 1034 → 103.4 nF, decimal after digit 3
  */
-static const uint8_t default_decimal_pos[10] = {
+static const uint8_t default_decimal_pos[METER_SUBMODE_COUNT] = {
     1,  /* 0: DCV       — 9.899 V */
     2,  /* 1: ACV       — 98.99 V */
     2,  /* 2: DCA (mA)  — 98.99 mA */
     1,  /* 3: DCA (A)   — 9.899 A */
     2,  /* 4: ACA (mA)  — 98.99 mA */
-    1,  /* 5: ACA (A) or Frequency */
+    1,  /* 5: ACA (A)   — 9.899 A */
     2,  /* 6: Resistance— 98.99 kΩ */
     3,  /* 7: Continuity— 198.9 Ω */
     1,  /* 8: Diode     — 0.623 V */
     3,  /* 9: Capacitance— 198.9 nF */
+    1,  /* 10: Temperature — no bench reading yet; keeps the old out-of-range
+         * fallback so the row costs nothing it hasn't earned */
 };
 
 /* Full-scale values per sub-mode (for bar graph calculation) */
-static const float bar_full_scale[10] = {
+static const float bar_full_scale[METER_SUBMODE_COUNT] = {
     20.0f,    /* DC V: 20V */
     200.0f,   /* AC V: 200V */
     200.0f,   /* DC mA: 200mA */
@@ -184,6 +181,7 @@ static const float bar_full_scale[10] = {
     200.0f,   /* Cont: 200 Ohm */
     2.0f,     /* Diode: 2V */
     200.0f,   /* Cap: 200nF */
+    1000.0f,  /* Temp: same fallback the >=10 branch used */
 };
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -302,19 +300,206 @@ static void format_4digit_unsigned(float v, char *s)
  * mu/ohm glyphs.
  * ═══════════════════════════════════════════════════════════════════ */
 
-static const char * const unit_suffix_table[10][3] = {
+/* Rows 2/4/5/10 follow upstream meter_data.c as it stands after their August
+ * rework: submode 5 is the local AC-A slot, not a frequency mode — the "Hz"
+ * row this table used to carry came from an early guess and it is what made
+ * AC HIGH CURR read out in hertz. The uA variants are gone with it: stock
+ * V1.2.0 exposes no microamp selector (see meter_plan.c), so a uA suffix
+ * could only ever mislabel a mA reading. */
+static const char * const unit_suffix_table[METER_SUBMODE_COUNT][3] = {
     /*                v0       v1       v2    */
     /* 0 DCV      */ { "V",    "mV",    "mV"   },
     /* 1 ACV      */ { "V",    "mV",    "mV"   },
-    /* 2 DCA(mA)  */ { "mA",   "uA",    "mA"   },
+    /* 2 DCA(mA)  */ { "mA",   "mA",    "mA"   },
     /* 3 DCA(A)   */ { "A",    "A",     "A"    },
-    /* 4 ACA(mA)  */ { "mA",   "uA",    "mA"   },
-    /* 5 Freq/ACA */ { "Hz",   "kHz",   "MHz"  },
+    /* 4 ACA(mA)  */ { "mA",   "mA",    "mA"   },
+    /* 5 ACA(A)   */ { "A",    "A",     "A"    },
     /* 6 Ohm      */ { "Ohm",  "kOhm",  "MOhm" },
     /* 7 Cont     */ { "Ohm",  "Ohm",   "Ohm"  },
     /* 8 Diode    */ { "V",    "V",     "V"    },
     /* 9 Cap      */ { "nF",   "uF",    "uF"   },
+    /* 10 Temp    */ { "C",    "C",     "F"    },
 };
+
+/* ═══════════════════════════════════════════════════════════════════
+ * DCV decimal exponent from stock status bits
+ *
+ * Ported from upstream meter_data.c (GPL) as merged on 2026-08-13 —
+ * PR #13 (Komzpa) plus that day's hardening pass; the functions there are
+ * voltage_range_hint_from_stock_frame, dcv_stock_class_from_frame,
+ * apply_stock_dcv_voltage_range_hint, format_stock_decimal_value and
+ * apply_stock_dcv_decimal_exponent. Table and bit priority are theirs
+ * verbatim; the wiring below is adapted to this decoder's field names.
+ *
+ * WHY THIS REPLACES OUR frame[6] GUESS. Our DCV decimal point came from
+ * default_decimal_pos[0] = 1, confirmed only in the 1-10 V band, plus an
+ * empirical "frame[6] == 0x0F -> dp 1" case that said the same thing. That
+ * carried the bench failure recorded on 2026-04-04 (unit #1): at 11 V in,
+ * frame[6] rotates through {0x0A, 0x0F, 0x0B, 0x07} and raw 997 with a fixed
+ * dp of 1 renders 0.997 V. The exponent was never in frame[6]. Stock reads it
+ * out of four status bits, in priority order, and divides the extended raw
+ * value by 10^class:
+ *
+ *   frame[8].7 -> class 4,  frame[3].4 -> class 3,
+ *   frame[4].4 -> class 2,  frame[5].4 -> class 1,  otherwise class 0.
+ *
+ * Source for the priority: their analysis_v120/meter_math_pipeline_annotated.c
+ * (the annotated RX pass); the later DAT_2000102f/DAT_20001030 formatter is in
+ * the raw full_decompile.c. Bytes 10..11 are NOT part of this decision — in
+ * live voltage frames they are only an auxiliary/line-frequency hint.
+ *
+ * PREDICTIONS, fixed before the bench sees this (each one falsifies the port):
+ *   1. The band that already worked must be unchanged: 7 V in -> raw 7005 ->
+ *      class 3 (divisor 1000) -> 7.005 V, dp 1. Same number as today, by
+ *      construction — so a regression there means frame[3].4 is NOT set on
+ *      this unit's working frames, and the whole mechanism is wrong for us.
+ *      The failure is loud, not silent: class 0 would render raw 7005 as
+ *      "7005".
+ *   2. The band that failed must move: 11 V in -> raw 997 -> class 2
+ *      (divisor 100) -> 9.97 V, i.e. the saturated top of the 10 V band that
+ *      the 2026-04-04 note itself called the plausible right answer. If 11 V
+ *      still reads 0.997 V, the class came out 3 and the exponent bits are not
+ *      what drives this unit.
+ *   3. Above 9999 counts the +10000 extension and the class must compose:
+ *      raw 19999 at class 4 renders 1.9999.
+ *
+ * METER_DCV_STOCK_EXPONENT=0 falls back to the old empirical path in one
+ * rebuild, for A/B on the bench rather than a code edit.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#ifndef METER_DCV_STOCK_EXPONENT
+#define METER_DCV_STOCK_EXPONENT 1
+#endif
+
+#if METER_DCV_STOCK_EXPONENT
+
+typedef struct {
+    uint8_t class_id;
+    uint8_t display_decimal_pos;
+    float divisor;
+} dcv_stock_class_t;
+
+static const dcv_stock_class_t dcv_stock_classes[] = {
+    { 4, 1, 10000.0f },
+    { 3, 1, 1000.0f  },
+    { 2, 2, 100.0f   },
+    { 1, 3, 10.0f    },
+    { 0, 0, 1.0f     },
+};
+
+static uint8_t voltage_range_hint_from_stock_frame(const volatile uint8_t *frame)
+{
+    if (frame[8] & 0x80U) return 4;
+    if (frame[3] & 0x10U) return 3;
+    if (frame[4] & 0x10U) return 2;
+    if (frame[5] & 0x10U) return 1;
+    return 0;
+}
+
+static const dcv_stock_class_t *
+dcv_stock_class_from_frame(const volatile uint8_t *frame)
+{
+    uint8_t class_id = voltage_range_hint_from_stock_frame(frame);
+    unsigned n = sizeof(dcv_stock_classes) / sizeof(dcv_stock_classes[0]);
+
+    for (unsigned i = 0; i < n; i++) {
+        if (dcv_stock_classes[i].class_id == class_id) {
+            return &dcv_stock_classes[i];
+        }
+    }
+    return NULL;
+}
+
+/* Decimal position and unit, chosen from the frame's status bits alone —
+ * before anyone looks at the decoded digits. That ordering is the instrument
+ * contract: the meter IC declares its active range in the report, and the
+ * renderer converts by the matching exponent. It is not a recognition table
+ * for convenient bench values. */
+static bool apply_stock_dcv_voltage_range_hint(meter_reading_t *r,
+                                               uint8_t submode,
+                                               const volatile uint8_t *frame)
+{
+    const dcv_stock_class_t *stock_class;
+
+    if (submode != 0) return false;
+    stock_class = dcv_stock_class_from_frame(frame);
+    if (stock_class == NULL) return false;
+
+    r->decimal_pos = stock_class->display_decimal_pos;
+    r->unit_variant = 0;
+    r->unit_suffix = "V";
+    return true;
+}
+
+static void format_stock_decimal_value(int raw_value, uint8_t class_id,
+                                       bool negative, char *s)
+{
+    int pos = 0;
+    int divisor = 1;
+    uint8_t decimals = class_id;
+
+    if (negative) {
+        s[pos++] = '-';
+    }
+    for (uint8_t i = 0; i < decimals; i++) {
+        divisor *= 10;
+    }
+
+    int whole = raw_value / divisor;
+    int frac = raw_value % divisor;
+
+    if (whole >= 10000) s[pos++] = (char)('0' + (whole / 10000) % 10);
+    if (whole >= 1000)  s[pos++] = (char)('0' + (whole / 1000) % 10);
+    if (whole >= 100)   s[pos++] = (char)('0' + (whole / 100) % 10);
+    if (whole >= 10)    s[pos++] = (char)('0' + (whole / 10) % 10);
+    s[pos++] = (char)('0' + whole % 10);
+
+    if (decimals > 0) {
+        int place = divisor / 10;
+        s[pos++] = '.';
+        while (place > 0) {
+            s[pos++] = (char)('0' + (frac / place) % 10);
+            place /= 10;
+        }
+    }
+    s[pos] = '\0';
+}
+
+/* Value and display string for DCV. Stock does two separate things in
+ * FUN_08036AC0: build the four-digit raw and add 10000 when frame[2].3 is
+ * set (that half is already ours, above), then divide the extended raw by
+ * 10^class from the bits read here. No stock-only evidence supports a
+ * one-point low-voltage coefficient; factory calibration may still live in
+ * W25Q/SPI bulk data, but it is not this exponent table and must not be
+ * invented here. */
+static bool apply_stock_dcv_decimal_exponent(meter_reading_t *r,
+                                             uint8_t submode,
+                                             const volatile uint8_t *frame)
+{
+    const dcv_stock_class_t *stock_class;
+
+    if (submode != 0) return false;
+    stock_class = dcv_stock_class_from_frame(frame);
+    if (stock_class == NULL) return false;
+
+    float v = (float)r->raw_bcd / stock_class->divisor;
+    if (r->negative) v = -v;
+    r->value = v;
+    r->unit_variant = 0;
+    r->unit_suffix = "V";
+    r->dcv_stock_class = stock_class->class_id;
+    format_stock_decimal_value(r->raw_bcd, stock_class->class_id,
+                               r->negative, r->display_str);
+
+    float abs_v = v < 0.0f ? -v : v;
+    float full_scale = (submode < METER_SUBMODE_COUNT)
+                       ? bar_full_scale[submode] : 1000.0f;
+    r->bar_fraction = abs_v / full_scale;
+    if (r->bar_fraction > 1.0f) r->bar_fraction = 1.0f;
+    return true;
+}
+
+#endif /* METER_DCV_STOCK_EXPONENT */
 
 /* ═══════════════════════════════════════════════════════════════════
  * Format value into display string
@@ -372,7 +557,7 @@ static void format_reading(meter_reading_t *r, uint8_t submode)
 
     /* Bar graph fraction */
     float abs_val = r->value < 0 ? -r->value : r->value;
-    float full_scale = (submode < 10) ? bar_full_scale[submode] : 1000.0f;
+    float full_scale = (submode < METER_SUBMODE_COUNT) ? bar_full_scale[submode] : 1000.0f;
     r->bar_fraction = abs_val / full_scale;
     if (r->bar_fraction > 1.0f) r->bar_fraction = 1.0f;
 }
@@ -381,23 +566,31 @@ static void format_reading(meter_reading_t *r, uint8_t submode)
  * Public API
  * ═══════════════════════════════════════════════════════════════════ */
 
-void meter_data_init(void)
+void meter_session_begin(meter_session_t *s, uint8_t submode)
 {
-    memset(&meter_reading, 0, sizeof(meter_reading));
-    strcpy(meter_reading.display_str, "---");
-    meter_reading.unit_suffix = "";  /* Never NULL — UI can render directly. */
-    meter_reading.unit_variant = 0;
+    memset(s, 0, sizeof(*s));
+    s->submode = submode;
+    strcpy(s->reading.display_str, "---");
+    s->reading.unit_suffix = "";  /* Never NULL — UI can render directly. */
+    s->reading.unit_variant = 0;
+    /* memset already cleared the band latch and the f6 history — the whole
+     * point of a session: a re-entry into the same mode starts clean. */
 }
 
-void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
+void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
 {
-    meter_reading_t *r = &meter_reading;
+    meter_reading_t *r = &s->reading;
+    uint8_t submode = s->submode;
 
     /* Validate header */
     if (frame[0] != 0x5A || frame[1] != 0xA5) return;
 
     /* Save raw frame for debug display */
     for (int i = 0; i < 12; i++) r->dbg_frame[i] = frame[i];
+
+    /* Reset before any early return so the field always describes THIS frame:
+     * 0xFF = the stock DCV exponent path did not run. */
+    r->dcv_stock_class = 0xFFu;
 
     /* Extract cross-byte nibble pairs */
     uint8_t b2 = frame[2], b3 = frame[3], b4 = frame[4];
@@ -443,23 +636,23 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
     uint8_t flags = frame[6];
     r->is_hold = (flags & (1 << 6)) != 0;
 
-    /* Record distinct frame[6] values for Phase 1 diagnostic.
+    /* Record distinct frame[6] values for the session diagnostic.
      * Push-front with dedup: if the current value is already in the
      * history, leave it alone. Otherwise insert at slot 0 and shift
      * older entries down, dropping the oldest. */
     {
         bool seen = false;
-        for (int k = 0; k < meter_f6_history_count; k++) {
-            if (meter_f6_history[k] == flags) { seen = true; break; }
+        for (int k = 0; k < s->f6_history_count; k++) {
+            if (s->f6_history[k] == flags) { seen = true; break; }
         }
         if (!seen) {
-            int n = meter_f6_history_count;
+            int n = s->f6_history_count;
             if (n < METER_F6_HISTORY_LEN) n++;
             for (int k = n - 1; k > 0; k--) {
-                meter_f6_history[k] = meter_f6_history[k - 1];
+                s->f6_history[k] = s->f6_history[k - 1];
             }
-            meter_f6_history[0] = flags;
-            meter_f6_history_count = (uint8_t)n;
+            s->f6_history[0] = flags;
+            s->f6_history_count = (uint8_t)n;
         }
     }
 
@@ -619,9 +812,9 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
      *
      * See reverse_engineering/analysis_v120/meter_frame_capture_log.md
      * for the 7 captured frames this table is derived from. */
-    r->decimal_pos = (submode < 10) ? default_decimal_pos[submode] : 1;
+    r->decimal_pos = (submode < METER_SUBMODE_COUNT) ? default_decimal_pos[submode] : 1;
     r->unit_variant = 0;
-    r->unit_suffix = (submode < 10)
+    r->unit_suffix = (submode < METER_SUBMODE_COUNT)
                      ? unit_suffix_table[submode][0]
                      : "";
 
@@ -642,18 +835,11 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
      * from a range frame) and "32.80 Ohm" (wrong, from a non-range
      * frame applying the static default), we latch the last known
      * good decode and reuse it when an unknown frame arrives. The
-     * latch resets on submode change. */
-    static uint8_t  latched_dp         = 0xFF;  /* 0xFF = no latch */
-    static const char *latched_unit    = NULL;
-    static uint8_t  latched_for_mode   = 0xFF;
-
-    if (latched_for_mode != submode) {
-        /* Mode changed — invalidate the latch so the new mode's
-         * defaults take effect until we see a range frame for it. */
-        latched_dp = 0xFF;
-        latched_unit = NULL;
-        latched_for_mode = submode;
-    }
+     * latch lives in the session, so meter_session_begin() is its
+     * reset — the old function-local statics survived a re-entry into
+     * the same mode and carried the previous session's decision into
+     * the new one (and their 0xFF "no latch" sentinel collided with
+     * FPGA_METER_INVALID_LOCAL_SUBMODE). */
 
     uint8_t f6 = flags;  /* already holds frame[6] */
     bool decoded = false;
@@ -681,53 +867,78 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
         } else if (f6 == 0x4D) {
             new_dp = 2; new_unit = "kOhm"; decoded = true;
         }
-    } else if (submode == 0 && f6 == 0x0F) {
+    }
+#if !METER_DCV_STOCK_EXPONENT
+    else if (submode == 0 && f6 == 0x0F) {
+        /* Retired: frame[6] never carried the DCV exponent. This case said
+         * dp 1 — the same thing default_decimal_pos[0] already said — and it
+         * is what rendered 11 V as 0.997 V. Kept only under the A/B fallback
+         * so the old behaviour is reproducible in one rebuild. */
         new_dp = 1; new_unit = "V"; decoded = true;
     }
+#endif
 
-    /* TODO (known limitation, 2026-04-04 bench): DCV readings above
-     * ~9.999V are not decoded correctly. Bench captures on unit #1:
+    /* DCV above ~9.999 V: the 2026-04-04 bench limitation, and what replaced
+     * the diagnosis. Captures on unit #1 were:
      *   7V  input → f6 stable at 0x07, raw_bcd=7005, dp=1 → 7.005V ✓
      *   11V input → f6 ROTATES through {0x0A, 0x0F, 0x0B, 0x07},
-     *               raw_bcd=997, dp=1 → 0.997V ✗ (should be ~9.97V
-     *               saturated, or 11V if the IC auto-ranges)
+     *               raw_bcd=997, dp=1 → 0.997V ✗
      *
-     * Root cause is the same as the low-Ω bug fixed below: the FPGA
-     * meter IC can't auto-range properly without factory calibration
-     * data. Above ~9.999V it gets stuck rotating through unstable
-     * range states and emits incoherent raw_bcd + dp combinations.
+     * The note above these lines used to blame missing factory calibration for
+     * the IC's auto-range, and proposed cataloguing f6 → dp by hand. That was
+     * looking in the wrong byte: stock never reads the DCV exponent out of
+     * frame[6]. It reads four status bits (see the block above
+     * format_reading), and the rotating f6 was a symptom, not the range
+     * report. WITHDRAWN: "f6 → dp mapping by range" as a DCV plan.
      *
-     * Candidate fixes (future session):
-     *   1. Systematic bench capture across {0.1, 1, 3, 5, 7, 9, 9.5,
-     *      10, 11, 15, 50, 100}V to catalog f6 → dp mapping by range,
-     *      then extend the decoder with explicit cases.
-     *   2. Implement firmware-driven ranging via FPGA range-select
-     *      commands — requires RE'ing the DCV range command set.
-     *   3. Run the H2 SPI3 bulk cal replay experiment
-     *      (analysis_v120/spi3_bulk_cal_resolved.md) — this might
-     *      fix the IC's auto-range behavior wholesale, since the
-     *      same missing-factory-cal root cause drives both the
-     *      low-Ω and DCV-saturation symptoms.
+     * The exponent path is implemented now, with its predictions written down
+     * where it is defined. Still open, and NOT addressed by it:
+     *   1. Whether the IC's auto-range itself misbehaves above 10 V, i.e.
+     *      whether raw 997 at 11 V is a correct saturated report of the 10 V
+     *      band or a garbage frame. The exponent path renders whatever the
+     *      frame claims; it cannot fix a wrong claim.
+     *   2. The H2 SPI3 bulk cal replay (analysis_v120/spi3_bulk_cal_resolved.md)
+     *      as the wholesale answer to missing factory cal — this is still the
+     *      candidate for the low-Ω coefficient, which upstream has since
+     *      withdrawn rather than kept at one unit's 0.0304 (see the band
+     *      override below: ours still applies it, theirs fails closed).
      */
 
     if (decoded) {
         /* This frame carried range bits we recognize. Apply and latch. */
         r->decimal_pos = new_dp;
         r->unit_suffix = new_unit;
-        latched_dp = new_dp;
-        latched_unit = new_unit;
-    } else if (latched_dp != 0xFF) {
+        s->band_has_latch = true;
+        s->band_latch_dp = new_dp;
+        s->band_latch_unit = new_unit;
+    } else if (s->band_has_latch) {
         /* This frame's range byte is unknown, but we've seen a good
-         * range frame earlier in this submode — reuse its decision. */
-        r->decimal_pos = latched_dp;
-        r->unit_suffix = latched_unit;
+         * range frame earlier in this session — reuse its decision. */
+        r->decimal_pos = s->band_latch_dp;
+        r->unit_suffix = s->band_latch_unit;
     }
     /* else: no latch yet, keep the static default set above. */
+
+#if METER_DCV_STOCK_EXPONENT
+    /* DCV: the status bits decide the decimal position, not frame[6] and not
+     * the per-submode default. Applied after the frame[6] block so the stock
+     * evidence wins over the empirical latch on submode 0; resistance and
+     * continuity are untouched. */
+    (void)apply_stock_dcv_voltage_range_hint(r, submode, frame);
+#endif
 
     /* Format the display string and compute float value */
     r->result_class = METER_RESULT_NORMAL;
     r->continuity_beep = false;
     format_reading(r, submode);
+
+#if METER_DCV_STOCK_EXPONENT
+    /* ...and the value/string come from the class divisor, which is what makes
+     * the over-9999 band composable with the +10000 raw extension. Runs after
+     * format_reading for the same reason upstream does it: the generic path
+     * fills in everything else the reading carries. */
+    (void)apply_stock_dcv_decimal_exponent(r, submode, frame);
+#endif
 
     /* ── Resistance band factory calibration override ──
      *
@@ -787,7 +998,7 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
 
             /* Recompute bar graph fraction from the corrected value. */
             float abs_v = v < 0.0f ? -v : v;
-            float full_scale = (submode < 10) ? bar_full_scale[submode] : 1000.0f;
+            float full_scale = (submode < METER_SUBMODE_COUNT) ? bar_full_scale[submode] : 1000.0f;
             r->bar_fraction = abs_v / full_scale;
             if (r->bar_fraction > 1.0f) r->bar_fraction = 1.0f;
         }
@@ -795,26 +1006,6 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
 
     r->valid = true;
     r->update_count++;
-}
-
-bool meter_data_valid(void)
-{
-    return meter_reading.valid;
-}
-
-float meter_data_get_value(void)
-{
-    return meter_reading.value;
-}
-
-const char *meter_data_get_display_str(void)
-{
-    return meter_reading.display_str;
-}
-
-float meter_data_get_bar_fraction(void)
-{
-    return meter_reading.bar_fraction;
 }
 
 #endif /* HW_TARGET_2C53T */

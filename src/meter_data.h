@@ -17,6 +17,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "meter_plan.h"
+
+/* Decode submodes, and the width of every per-submode table in meter_data.c.
+ * 0..9 are the eight stock meter families as the decoder sees them (DCV, ACV,
+ * DC mA, DC A, AC mA, AC A, Ohm, continuity, diode, capacitance); 10 is the
+ * local temperature split on the extended slot. This IS meter_plan's local
+ * submode numbering — one definition, so the two cannot drift. */
+#define METER_SUBMODE_COUNT FPGA_METER_LOCAL_SUBMODE_COUNT
+
 /* ═══════════════════════════════════════════════════════════════════
  * Result Classification
  * ═══════════════════════════════════════════════════════════════════ */
@@ -79,6 +88,13 @@ typedef struct {
     bool     is_auto_range;      /* Auto-range enabled */
     bool     is_hold;            /* Hold mode active */
 
+    /* DCV exponent class taken from the stock status bits
+     * (frame[8].7 / frame[3].4 / frame[4].4 / frame[5].4, in that priority):
+     * 0..4, or 0xFF when the stock DCV path did not run for this frame.
+     * Reported on the meter debug line — a wrong DCV reading is only
+     * diagnosable if we can see which class the frame claimed. */
+    uint8_t  dcv_stock_class;
+
     /* Meter mode handler state (from frame[6]/[7] status bits) */
     uint8_t  probe_type;         /* 0, 1, or 2 — from frame[7] bit pattern */
     uint8_t  range_indicator;    /* from frame[6] bits 4-5: range band */
@@ -98,59 +114,67 @@ typedef struct {
 
 } meter_reading_t;
 
-/* Global meter reading (defined in meter_data.c) */
-extern meter_reading_t meter_reading;
-
-/* Debug: distinct values of frame[6] seen since boot.
+/* Debug: distinct values of frame[6] seen within the current session.
  * Up to 8 unique byte values stored; new values push out the oldest.
- * Used by the Phase 1 meter UI debug strip to visualize how many
- * different frame types the FPGA is sending per measurement. */
+ * Used by the meter UI debug strip to visualize how many different
+ * frame types the FPGA is sending per measurement. */
 #define METER_F6_HISTORY_LEN 8
-extern uint8_t meter_f6_history[METER_F6_HISTORY_LEN];
-extern uint8_t meter_f6_history_count;
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Meter session
+ *
+ * One session = the decoder's life between mode transitions. It owns
+ * everything the decoder accumulates: the reading, the sticky band
+ * latch (dp/unit decided from a recognized frame[6] band and reused
+ * for unrecognized frames of the same session), and the f6 history.
+ * meter_session_begin() is the only reset — the submode is fixed for
+ * the whole session, so a re-entry into the same mode starts clean
+ * instead of inheriting the previous session's latch (which is what
+ * the old function-local statics did).
+ *
+ * The owner is dmm53.c (one static session on the firmware side);
+ * host tests hold their own on the stack.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    uint8_t         submode;         /* fixed at begin(); meter_plan local
+                                      * submode numbering */
+    meter_reading_t reading;
+
+    /* Sticky band latch (resistance/continuity frame[6] bands). */
+    bool            band_has_latch;
+    uint8_t         band_latch_dp;
+    const char     *band_latch_unit;
+
+    /* Distinct frame[6] values seen this session. */
+    uint8_t         f6_history[METER_F6_HISTORY_LEN];
+    uint8_t         f6_history_count;
+} meter_session_t;
 
 /* ═══════════════════════════════════════════════════════════════════
  * API
  * ═══════════════════════════════════════════════════════════════════ */
 
 /*
- * Initialize meter data parser state.
- * Call once at startup.
+ * Start a decoder session for one meter submode. Clears the reading
+ * (display "---", unit ""), the band latch and the f6 history. Call on
+ * every mode transition (and re-entry), before the first frame.
+ *
+ * submode: meter sub-mode (0..METER_SUBMODE_COUNT-1) for decimal point
+ *          placement; out-of-range values fall back to dp=1, no unit
  */
-void meter_data_init(void);
+void meter_session_begin(meter_session_t *s, uint8_t submode);
 
 /*
- * Process a complete FPGA USART2 RX data frame (12 bytes).
- * Extracts BCD digits, detects special codes (OL, continuity, blank),
- * assembles the measurement value, and updates meter_reading.
+ * Process a complete FPGA USART2 RX data frame (12 bytes) under the
+ * session's submode. Extracts BCD digits, detects special codes (OL,
+ * continuity, blank), assembles the measurement value, and updates
+ * s->reading.
  *
  * Call this from the USART RX task when a valid data frame arrives.
  *
  * frame: pointer to 12-byte RX frame (0x5A 0xA5 + 10 data bytes)
- * submode: current meter sub-mode (0-9) for decimal point placement
  */
-void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode);
-
-/*
- * Check if valid meter data is available.
- */
-bool meter_data_valid(void);
-
-/*
- * Get the current meter reading value.
- * Returns 0.0 if no valid data.
- */
-float meter_data_get_value(void);
-
-/*
- * Get the display string for the current reading.
- * Returns pointer to internal buffer (e.g., "13.82", "OL", "---").
- */
-const char *meter_data_get_display_str(void);
-
-/*
- * Get the bar graph fraction (0.0 - 1.0).
- */
-float meter_data_get_bar_fraction(void);
+void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame);
 
 #endif /* METER_DATA_H */

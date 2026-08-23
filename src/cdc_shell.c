@@ -443,13 +443,14 @@ static void swap_run(void) {
 #if HW_TARGET_2C53T
 /* The meter track was parked in August for want of exactly this: the raw frame
  * that is on screen at the moment the reading misbehaves. The overlay lines
- * are the same ones dmm53.c draws (frame bytes, counters, baud/BRR), so the
- * screen and the cable can never disagree about what arrived. */
+ * are the same ones dmm53.c draws (frame bytes, counters, decoder state and
+ * the transition plan), so the screen and the cable can never disagree about
+ * what arrived or about which selector words produced it. */
 static void cmd_meter(const char *args) {
     uint8_t i;
     (void)args;
 
-    for (i = 0; i < 3u; ++i) {
+    for (i = 0; i < 4u; ++i) {
         const char *line = dmm53_debug_line(i);
         if (line) {
             sh_out(line);
