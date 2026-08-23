@@ -74,7 +74,7 @@ LDFLAGS := \
 	-Wl,--gc-sections \
 	-Wl,-Map,$(BUILD)/$(PROJECT).map
 
-SRCS := src/startup.c src/board.c src/display.c src/font.c src/dmm.c src/dmm53.c src/meter_data.c src/settings.c src/fpga.c src/scope.c src/siggen.c src/fw_update.c src/fw_cache.c src/screenshot.c src/dbgdump.c src/w25q.c src/usb_msc.c src/usb_cdc.c src/cdc_shell.c src/ui.c src/main.c src/fft.c src/arb_csv.c
+SRCS := src/startup.c src/board.c src/display.c src/font.c src/dmm.c src/dmm53.c src/meter_data.c src/settings.c src/fpga.c src/scope.c src/siggen.c src/fw_update.c src/fw_cache.c src/screenshot.c src/dbgdump.c src/w25q.c src/usb_msc.c src/usb_cdc.c src/cdc_shell.c src/meter_plan.c src/ui.c src/main.c src/fft.c src/arb_csv.c
 ifeq ($(HW_TARGET_HW40),1)
 SRCS += src/fpga_bitstream_hw4.c
 else
