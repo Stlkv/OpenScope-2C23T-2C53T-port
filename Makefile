@@ -82,7 +82,7 @@ SRCS += src/fpga_bitstream.c
 endif
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 
-.PHONY: all clean clean-dist release release-lt-hw4 release-hw4
+.PHONY: all clean clean-dist release release-lt-hw4 release-hw4 test test-meter-plan test-meter-data
 
 all: $(BUILD)/$(PROJECT).bin
 
@@ -113,6 +113,22 @@ clean:
 
 clean-dist:
 	rm -rf $(DIST)
+
+# ─── Host-side tests ───────────────────────────────────────────────────────
+# Native-compiler runs over the REAL src/ files (not copies): the second
+# adapter on the meter_plan/meter_data seam. Recipes mirror upstream's
+# firmware/Makefile test rules so their tests port mechanically.
+HOST_CC ?= cc
+HOSTTEST_DIR := $(BUILD_ROOT)/hosttest
+
+$(HOSTTEST_DIR)/test_meter_plan: tests/test_meter_plan.c src/meter_plan.c src/meter_plan.h
+	@mkdir -p $(HOSTTEST_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -DHW_TARGET_2C53T=1 -Isrc tests/test_meter_plan.c src/meter_plan.c -o $@
+
+test-meter-plan: $(HOSTTEST_DIR)/test_meter_plan
+	$<
+
+test: test-meter-plan
 
 release: clean-dist
 	$(MAKE) release-lt-hw4
