@@ -56,6 +56,7 @@ static uint32_t intake_expected;
 static uint32_t intake_written;
 static uint32_t intake_crc;      /* running, pre-xorout */
 static uint8_t  intake_status;
+static uint8_t  intake_manifest_live;  /* slot still advertises its old image */
 static uint8_t  swap_status;
 
 /* One sector accumulates here before each w25q_write_sector. Also reused
@@ -92,6 +93,7 @@ uint8_t fw_cache_intake_begin(uint8_t slot, uint32_t size)
         intake_status = 0xE1;
         return 0;
     }
+    intake_manifest_live = 1;
     intake_slot = slot;
     intake_expected = size;
     intake_crc = 0xFFFFFFFFu;
@@ -105,6 +107,20 @@ static uint8_t intake_flush_sector(void)
     uint32_t fill = cache_buf_fill;
     uint8_t verify[64];
 
+    /* The manifest dies with the first byte of data, not at fwload time: an
+     * armed-but-silent transfer must leave the cached image installable (that
+     * is the fallback the bench rule rests on), while a transfer that has
+     * begun overwriting data must stop advertising what used to be here.
+     * Upstream's fw_loader.c gets the same effect from its erase watermark,
+     * which starts at the slot base and so takes the manifest sector with the
+     * first commit. */
+    if (intake_manifest_live) {
+        if (!w25q_erase_sector(slot_base(intake_slot))) {
+            intake_status = 0xE2;
+            return 0;
+        }
+        intake_manifest_live = 0;
+    }
     /* Pad the tail of a final partial sector with 0xFF (erased look). */
     for (uint32_t i = fill; i < CACHE_SECTOR; ++i) {
         cache_buf[i] = 0xFFu;
@@ -170,8 +186,9 @@ uint8_t fw_cache_intake_finish(void)
         }
         return 0;
     }
-    /* Manifest LAST: a torn intake leaves the old manifest (or none), and
-     * the slot fails its swap-time CRC rather than installing garbage. */
+    /* Manifest LAST, and the first data sector already took the old one with
+     * it: a torn intake leaves no manifest at all, so the slot reads empty
+     * and cannot install. */
     cache_manifest_t *m = (cache_manifest_t *)cache_buf;
     for (uint32_t i = 0; i < CACHE_SECTOR; ++i) {
         cache_buf[i] = 0xFFu;

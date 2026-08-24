@@ -101,7 +101,11 @@ static uint8_t w25q_write_enable(void) {
     return 1;
 }
 
-static uint8_t w25q_erase_sector(uint32_t addr) {
+uint8_t w25q_erase_sector(uint32_t addr) {
+    if (!w25q_capacity || (addr & (W25Q_SECTOR_SIZE - 1u)) != 0 ||
+        addr > w25q_capacity - W25Q_SECTOR_SIZE) {
+        return 0;
+    }
     if (!w25q_wait_ready() || !w25q_write_enable()) {
         return 0;
     }

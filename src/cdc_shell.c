@@ -50,6 +50,14 @@ static uint8_t raw_slot;
 static uint8_t raw_active;
 static uint8_t raw_staged;   /* the last fwload verified; fwapply may install it */
 
+/* A torn transfer has to hand the shell back by itself, exactly as upstream's
+ * fw_loader.c does after FWL_TIMEOUT_POLLS of silence: without this a host that
+ * dies mid-stream (or an operator who types a command into an armed intake)
+ * leaves the port mute until the next power cycle. The tick is nominally 20 ms
+ * and never faster, so this is a floor of 3 s, not a ceiling. */
+#define RAW_SILENCE_MS 3000u
+static uint16_t raw_silence_ms;
+
 /* A swap reflashes the app slot and resets, so the verdict line has to reach
  * the host first: the request waits for the TX ring to drain, with a deadline
  * in case nobody is reading. */
@@ -334,10 +342,19 @@ static void cmd_fwload(const char *args) {
                "       then stream exactly that many raw bytes\r\n");
         return;
     }
-    (void)parse_slot(&p, &slot);   /* absent = slot b, as upstream */
+    /* Absent = slot b, as upstream. PRESENT BUT NOT a|b = refuse: upstream's
+     * parser (and this one, until 2026-08-24) quietly fell back to the default
+     * instead, so `fwload <size> <crc> c` armed slot b and put the shell in
+     * raw mode while the operator was still reading the reply. The next line
+     * typed then goes into the image, not the parser. Proposed upstream too. */
+    p = skip_spaces(p);
+    if (*p != '\0' && (!parse_slot(&p, &slot) || *skip_spaces(p) != '\0')) {
+        sh_out("fwload: ERROR bad slot, expected a or b\r\n");
+        return;
+    }
 
     if (!fw_cache_intake_begin(slot, size)) {
-        sh_out("fwload: ERROR refused (size or slot), in=0x");
+        sh_out("fwload: ERROR refused, in=0x");
         sh_hex(fw_cache_intake_status(), 2);
         sh_out("\r\n");
         return;
@@ -348,6 +365,7 @@ static void cmd_fwload(const char *args) {
     raw_have_crc = 1;
     raw_staged = 0;
     raw_active = 1;
+    raw_silence_ms = 0;
     mon_period_ms = 0;      /* a telemetry dump mid-transfer is noise */
     sh_dbg_len = 0;
     sh_dbg_pos = 0;
@@ -390,6 +408,22 @@ static void raw_finish(void) {
     sh_out(" crc=");
     sh_hex(fw_cache_slot_crc(raw_slot), 8);
     sh_out("\r\n");
+}
+
+/* Silence on an armed intake: drop it, say so in the tokens the host greps for
+ * (`fwload:` for the verdict line, `ERROR` to abort the stream) and let the
+ * line editor have the port back. Nothing is installed and no manifest was
+ * written, so the slot keeps whatever it held before the transfer began. */
+static void raw_timeout(void) {
+    uint8_t was_active = raw_active;
+
+    raw_active = 0;
+    raw_drain = 0;
+    raw_remaining = 0;
+    if (was_active) {
+        fw_cache_intake_abort();
+    }
+    sh_out("fwload: ERROR rx went silent; run fwload again\r\n");
 }
 
 /* Both installers end here. The goodbye carries the word `recovery` because
@@ -571,6 +605,9 @@ void cdc_shell_service(void) {
     /* Drain the RX ring; in raw mode everything is payload. */
     while ((n = usb_cdc_read(buf, (uint16_t)sizeof(buf))) != 0u) {
         i = 0;
+        if (raw_active || raw_drain) {
+            raw_silence_ms = 0;   /* the host is still there */
+        }
         if (raw_drain) {
             /* The transfer is dead but the host is still sending the image;
              * swallow the rest instead of reading it as commands. */
@@ -589,7 +626,7 @@ void cdc_shell_service(void) {
                 raw_active = 0;
                 raw_drain = raw_remaining - take;
                 raw_remaining = 0;
-                sh_out("fwload: write failed in=0x");
+                sh_out("fwload: ERROR write failed in=0x");
                 sh_hex(fw_cache_intake_status(), 2);
                 sh_out("\r\n");
                 continue;
@@ -631,7 +668,15 @@ void cdc_shell_tick(uint16_t ms) {
         return;
     }
 
-    if (!mon_period_ms || raw_active) {
+    if (raw_active || raw_drain) {
+        raw_silence_ms = (uint16_t)(raw_silence_ms + ms);
+        if (raw_silence_ms >= RAW_SILENCE_MS) {
+            raw_timeout();
+        }
+        return;
+    }
+
+    if (!mon_period_ms) {
         return;
     }
     mon_elapsed_ms += ms;
