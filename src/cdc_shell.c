@@ -413,17 +413,27 @@ static void raw_finish(void) {
 /* Silence on an armed intake: drop it, say so in the tokens the host greps for
  * (`fwload:` for the verdict line, `ERROR` to abort the stream) and let the
  * line editor have the port back. Nothing is installed and no manifest was
- * written, so the slot keeps whatever it held before the transfer began. */
+ * written, so the slot keeps whatever it held before the transfer began.
+ *
+ * The dead transfer arms the drain rather than clearing it: a host that only
+ * stalled (>3 s mid-image) may resume, and without the drain the rest of the
+ * image would be parsed as command lines. The drain then ages against the
+ * same silence limit, so this function is also its expiry: a host that is
+ * truly gone costs one more timeout, which reports itself and frees the
+ * shell. */
 static void raw_timeout(void) {
-    uint8_t was_active = raw_active;
-
-    raw_active = 0;
-    raw_drain = 0;
-    raw_remaining = 0;
-    if (was_active) {
+    if (raw_active) {
+        raw_active = 0;
+        raw_drain = raw_remaining;
+        raw_remaining = 0;
+        raw_silence_ms = 0;
         fw_cache_intake_abort();
+        sh_out("fwload: ERROR rx went silent; run fwload again\r\n");
+        return;
     }
-    sh_out("fwload: ERROR rx went silent; run fwload again\r\n");
+    raw_drain = 0;
+    sh_out("fwload: stopped waiting for the aborted image; "
+           "shell is listening again\r\n");
 }
 
 /* Both installers end here. The goodbye carries the word `recovery` because
