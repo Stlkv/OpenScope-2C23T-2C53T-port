@@ -339,6 +339,15 @@ void fpga53_fe_cycle_b(void);
  * and the TMR13 CH2 trigger reference. Call on scope-mode entry: the meter
  * leaves its own posture behind and takes PA6 back as a GPIO. */
 void fpga53_scope_pose_reapply(void);
+/* CH2 vertical-offset reference: TMR13 CH1 PWM on PA6 through the board's RC
+ * filter, NOT DAC2 — this board's CH2 comparator does not sit on a DAC at all.
+ * `set` clamps to 12 bits and arms TMR13 if the boot path has not; `armed`
+ * says whether the timer is actually running (false on builds without
+ * FPGA53_TMR13_REF, where `set` is a no-op and `get` only reports the default).
+ * The centering code is a measured quantity — see FPGA53_TMR13_REF_CODE. */
+void fpga53_ch2_ref_set(uint16_t code);
+uint16_t fpga53_ch2_ref_get(void);
+uint8_t fpga53_ch2_ref_armed(void);
 /* Slow-point read length. Short reads (0) release CS after a few samples;
  * full reads (1) clock out the whole 1023-sample window, which is what a
  * normal capture read does — the open question is whether the engine only

@@ -406,6 +406,20 @@ void fpga53_get_diag(fpga53_diag_t *d) {
  * 2C53T pins: PB3=CLK, PB4=MISO, PB5=MOSI, CS=PB6. No reset pulse (the
  * 2C53T stock boot capture shows none; the V0.4 reset pin maps to the
  * 2C53T POWER button, so it must not be driven).
+ *
+ * DO NOT convert this to hardware SPI to make boot faster. It is not a
+ * placeholder for a "proper" driver — the GPIO drive is the load-bearing part.
+ * Upstream spent 2026-08-26/27 narrowing exactly this (EXP-31..37 on
+ * DavidClawson/OpenScope-2C53T `main`): a logic-analyzer view proved their
+ * hardware-SPI config frames are byte-perfect and the 0x15 frames from AF and
+ * from bit-bang are DIGITALLY IDENTICAL; the write rate was excluded in both
+ * directions at a matched 470 kHz; what is left as the differentiator is
+ * GPIO-driven pins versus alternate-function-driven pins, with the mechanism
+ * below the analyzer's 24 MHz resolution and the line parked there. Their
+ * hardware-SPI path still walls; this bit-bang path configures the part. Until
+ * somebody explains the mechanism, treat "slow and gapped through GPIO" as a
+ * requirement — and for the same reason the settle delay and the unhurried
+ * bitstream upload are not optimization targets either.
  */
 /*
  * Where the payload comes from.
@@ -653,18 +667,66 @@ static uint8_t fpga53_xfer(uint8_t tx) {
  * TMR13 after an MCU reset, so CH2's comparator reference is dead without it —
  * and the meter reclaims PA6 as a plain GPIO gain key, so scope-mode entry has
  * to take it back (see fpga53_scope_pose_reapply). */
+/* The code TMR13 is armed with at boot. NOT mid-scale: DAC1 centers CH1 at
+ * 2048 because it is a true 12-bit DAC, but TMR13 drives an RC filter, so its
+ * centering code has to be measured. Upstream measured it on bench unit #1,
+ * range 5, generator on CH2 (DavidClawson, 0b7f9d09, 2026-08-27): code 2048 ->
+ * window mean 65, code 3072 -> mean 195, which interpolates to ADC 128 at 2544.
+ * That is ONE unit, ONE range, ONE generator, so the number is theirs and not
+ * ours — what we take from it is the mechanism, not the constant. On this unit
+ * measure it with `ch2ref <code>` from the CDC shell and read the CH2 envelope
+ * out of `dbg` (em/ex per channel); when it is known, set it here. Our previous
+ * value was 2048, i.e. the DAC assumption, which is what their bench recorded
+ * as CH2 sitting near mean 65 and reading like railed noise. */
+#ifndef FPGA53_TMR13_REF_CODE
+#define FPGA53_TMR13_REF_CODE 2544u
+#endif
+
+static uint16_t fpga53_ch2_ref_code = FPGA53_TMR13_REF_CODE;
+static uint8_t fpga53_tmr13_armed;
+
 static void fpga53_tmr13_ref_apply(void) {
 #if FPGA53_TMR13_REF
     RCC_APB1ENR |= 1u << 7; // TMR13
     gpio_config_mask(GPIOA_BASE, 1u << 6, 0xBu); // PA6 AF push-pull
     REG32(0x40001C28u) = 0u;      // PSC
     REG32(0x40001C2Cu) = 4095u;   // ARR: 12-bit scale like the DAC
-    REG32(0x40001C34u) = 2048u;   // CCR1 (C1DT): mid-scale
+    REG32(0x40001C34u) = fpga53_ch2_ref_code;  // CCR1 (C1DT)
     REG32(0x40001C18u) = 0x68u;   // CCMR1: OC1M=PWM1, OC1PE
     REG32(0x40001C20u) = 0x1u;    // CCER: CC1E
     REG32(0x40001C14u) = 0x1u;    // EGR: UG (latch PSC/ARR/CCR)
     REG32(0x40001C00u) = 0x81u;   // CR1: ARPE | CEN
+    fpga53_tmr13_armed = 1u;
 #endif
+}
+
+/* Runtime CH2 reference. Two callers: the scope's vertical-offset path (which
+ * on this board must reach TMR13, not DAC2 — see scope_dac_set_offsets) and the
+ * shell's `ch2ref`, which exists so the centering code above can be measured
+ * without a rebuild per candidate value. Arms TMR13 first if the boot path was
+ * compiled out or has not run yet, so a shell probe works on any build. */
+void fpga53_ch2_ref_set(uint16_t code) {
+#if FPGA53_TMR13_REF
+    if (code > 4095u) {
+        code = 4095u;
+    }
+    fpga53_ch2_ref_code = code;
+    if (!fpga53_tmr13_armed) {
+        fpga53_tmr13_ref_apply();
+    } else {
+        REG32(0x40001C34u) = code;
+    }
+#else
+    (void)code;
+#endif
+}
+
+uint16_t fpga53_ch2_ref_get(void) {
+    return fpga53_ch2_ref_code;
+}
+
+uint8_t fpga53_ch2_ref_armed(void) {
+    return fpga53_tmr13_armed;
 }
 
 /* Stock's coarse relay/attenuator ladder, ONE table shared by both channels

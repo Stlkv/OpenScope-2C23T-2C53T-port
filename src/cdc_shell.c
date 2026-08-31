@@ -2,6 +2,7 @@
 
 #include "dbgdump.h"
 #include "dmm.h"
+#include "fpga.h"
 #include "fw_cache.h"
 #include "fw_update.h"
 #include "usb_cdc.h"
@@ -210,6 +211,7 @@ static void cmd_help(const char *args) {
            "    then stream exactly <size> raw bytes (cdc_flash.py does both)\r\n"
            "  fwapply                      install what fwload just staged\r\n"
            "  fwswap a|b                   install a cached image, no transfer\r\n"
+           "  ch2ref [0-4095]              CH2 offset reference (TMR13 PWM, PA6)\r\n"
            "  uptime                       ms since boot\r\n");
 }
 
@@ -511,6 +513,30 @@ static void cmd_meter(const char *args) {
 }
 #endif
 
+#if HW_TARGET_2C53T
+/* The CH2 vertical-offset reference is a TMR13 PWM through an RC filter, so the
+ * code that centers CH2 is measured, not derived — see FPGA53_TMR13_REF_CODE.
+ * This exists so it can be measured in one session: set a code here, read the
+ * CH2 envelope back out of `dbg` (`em`/`ex`), repeat. Without it the only way
+ * to try a value is a rebuild and a reflash per candidate. */
+static void cmd_ch2ref(const char *args) {
+    const char *p = skip_spaces(args);
+    uint32_t code;
+
+    if (*p != '\0') {
+        if (!parse_u32(&p, &code) || code > 4095u) {
+            sh_out("usage: ch2ref [0-4095]\r\n");
+            return;
+        }
+        fpga53_ch2_ref_set((uint16_t)code);
+    }
+    sh_out("ch2ref code=");
+    sh_u32(fpga53_ch2_ref_get());
+    sh_out(fpga53_ch2_ref_armed() ? " tmr13=armed\r\n"
+                                  : " tmr13=off (build has no FPGA53_TMR13_REF)\r\n");
+}
+#endif
+
 static void cmd_uptime(const char *args) {
     (void)args;
     sh_u32(sh_uptime_ms);
@@ -538,6 +564,7 @@ static const sh_cmd_t sh_cmds[] = {
     { "fw", cmd_fwstat },          /* alias for the impatient */
 #if HW_TARGET_2C53T
     { "meter", cmd_meter },
+    { "ch2ref", cmd_ch2ref },
 #endif
     { "uptime", cmd_uptime },
     { 0, 0 },

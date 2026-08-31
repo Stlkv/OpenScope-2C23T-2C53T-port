@@ -24,12 +24,37 @@ static uint8_t w25q_ready;
 static uint16_t w25q_id;
 static uint32_t w25q_capacity;
 
+/* Minimum CS-high between two transactions (tSHSL, ~30-50 ns on a W25Q/ZB25Q;
+ * this is far more, and costs nothing at our command rates). Upstream spent a
+ * session on this: their flash_fs issued WREN and the next command as two
+ * back-to-back transactions with only a function call's worth of CS-high, the
+ * chip never registered the deselect, treated the second command as a
+ * continuation of the WREN frame and left MISO undriven — every erase and
+ * program aborted (DavidClawson, 479d120, 2026-08-25).
+ *
+ * Our writer survived the same chip, but by accident, not by design:
+ * w25q_write_enable() below issues WREN and returns WITHOUT reading status
+ * back, so the read that exposed their bug never happens here, and the only
+ * gap between our deselect and the next select is whatever the compiler
+ * emits. Make the gap deliberate so a refactor cannot quietly remove it.
+ *
+ * noinline on purpose: the loop is volatile, so an inlined copy at each of the
+ * ~16 deselect sites cannot be folded and costs real flash — measured at +646 B
+ * on the 2C23T image, which has about 1.5 KB of headroom left. One copy, one
+ * call. */
+__attribute__((noinline))
+static void w25q_cs_settle(void) {
+    for (volatile uint8_t i = 0; i < 8u; ++i) {
+    }
+}
+
 static void w25q_select(void) {
     gpio_clear(GPIOB_BASE, W25Q_CS_PIN);
 }
 
 static void w25q_deselect(void) {
     gpio_set(GPIOB_BASE, W25Q_CS_PIN);
+    w25q_cs_settle();
 }
 
 static uint8_t spi2_transfer(uint8_t value, uint8_t *out) {
@@ -91,14 +116,26 @@ static uint8_t w25q_wait_ready(void) {
     return 0;
 }
 
+/* WREN, then read the latch back. We used not to: a WREN that did not take was
+ * invisible here and surfaced later as an erase or program that silently did
+ * nothing, which is the same symptom class upstream chased for three days. The
+ * read is what their bug hid behind, so it only became safe to add together
+ * with the deliberate CS-high above — and it is the check that would catch the
+ * failure if the gap were ever lost again. SR1 bit1 = WEL. */
 static uint8_t w25q_write_enable(void) {
+    uint8_t status = 0;
+
     w25q_select();
     if (!spi2_write(0x06u)) {
         w25q_deselect();
         return 0;
     }
     w25q_deselect();
-    return 1;
+
+    if (!w25q_read_status(&status)) {
+        return 0;
+    }
+    return (status & 2u) ? 1u : 0u;
 }
 
 uint8_t w25q_erase_sector(uint32_t addr) {

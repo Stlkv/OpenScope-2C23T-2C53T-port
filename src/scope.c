@@ -120,9 +120,17 @@ static uint16_t scope_clamp_dac(uint16_t value) {
     return value > 4095u ? 4095u : value;
 }
 
+/* CH1's offset is DAC1 on both boards. CH2's is NOT DAC2 on the 2C53T: its
+ * comparator reference is a TMR13 CH1 PWM on PA6 behind an RC filter (stock
+ * V1.2.0, upstream's decode of gpio_mux_porta_portb; C1DT @ 0x40001C34).
+ * Writing DHR12RD here moved DAC2/PA5, which is in nothing's path on this
+ * board, so the CH2 offset control was inert while the real reference sat at
+ * whatever the boot arm left it — the knob turned and nothing followed it.
+ * Route CH2 to the timer on 2C53T builds; the 2C23T path is unchanged. */
 static void scope_dac_set_offsets(uint16_t ch1_dac, uint16_t ch2_dac) {
     enum {
         DAC_DHR12RD_ADDR = 0x40007420u,
+        DAC_DHR12R1_ADDR = 0x40007408u,
     };
 
     ch1_dac = scope_clamp_dac(ch1_dac);
@@ -130,7 +138,12 @@ static void scope_dac_set_offsets(uint16_t ch1_dac, uint16_t ch2_dac) {
     if (ch1_dac == last_scope_dac[0] && ch2_dac == last_scope_dac[1]) {
         return;
     }
+#if HW_TARGET_2C53T
+    REG32(DAC_DHR12R1_ADDR) = (uint32_t)ch1_dac;
+    fpga53_ch2_ref_set(ch2_dac);
+#else
     REG32(DAC_DHR12RD_ADDR) = (uint32_t)ch1_dac | ((uint32_t)ch2_dac << 16);
+#endif
     last_scope_dac[0] = ch1_dac;
     last_scope_dac[1] = ch2_dac;
 }
@@ -252,7 +265,14 @@ static void scope_analog_begin(void) {
 
     gpio_set(GPIOA_BASE, 1u << 10); // CH1 DC coupling
     gpio_set(GPIOE_BASE, 1u << 0);  // CH2 DC coupling
+    /* 2048 centers CH1 because DAC1 is a real DAC; CH2's centering code is a
+     * measured property of the TMR13 PWM + RC and lives with the timer, so ask
+     * for it rather than assuming the two are the same number. */
+#if HW_TARGET_2C53T
+    scope_dac_init(2048u, fpga53_ch2_ref_get());
+#else
     scope_dac_init(2048u, 2048u);
+#endif
     scope_analog_ready = 1;
 }
 #endif
