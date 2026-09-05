@@ -31,13 +31,14 @@ enum {
     SETTINGS_SIGGEN_SWEEP_MODE_COUNT = 3, // 0 = OFF, 1 = LINEAR, 2 = LOG
     SETTINGS_SIGGEN_FM_MODE_COUNT = 2, // 0 = OFF, 1 = ON
     SETTINGS_SIGGEN_FM_SOURCE_COUNT = 3, // 0 = SINE, 1 = TRIANGLE, 2 = SQUARE
-    /* CH2 vertical-offset reference (2C53T): the TMR13 PWM code that centers
-     * the channel. Per-unit calibration — measured, not derived — so it is
-     * stored rather than compiled. Anything above 12 bits means "never
-     * measured on this unit", and the firmware falls back to its build-time
-     * default. */
-    SETTINGS_CH2_REF_MAX = 4095,
-    SETTINGS_CH2_REF_UNSET = 0xFFFF,
+    /* CH2's vertical-offset reference on the 2C53T is a TMR13 PWM code, not a
+     * DAC code, so its centering value is nothing like CH1's and nothing like
+     * the 2C23T default below. Measured on bench unit #2, 2026-09-05: 2501
+     * centers the channel (2048 -> ADC 70.5, 3072 -> 201.0, slope 0.1274 per
+     * code). It is per-unit — upstream's unit #1 wants 2544 — so it is only a
+     * default here; the calibrated value lives in scope_bias[1][range] like
+     * every other per-unit offset. */
+    SETTINGS_SCOPE_BIAS_CH2_2C53T_DEFAULT = 2501,
 };
 
 typedef struct {
@@ -92,7 +93,6 @@ typedef struct {
     uint32_t bode_start_hz;
     uint32_t bode_stop_hz;
     uint8_t bode_steps;
-    uint16_t scope_ch2_ref;      // TMR13 centering code, or SETTINGS_CH2_REF_UNSET
 
 } settings_state_t;
 

@@ -438,6 +438,17 @@ void scope_hw_configure_channels(uint8_t timebase,
     (void)ch2_vdiv;
 #endif
     scope_dac_set_offsets(ch1_dac, ch2_dac);
+#elif HW_TARGET_2C53T
+    /* Same reasoning as scope_hw_set_offsets(): the analog block is off here,
+     * but CH2's reference is a timer and is ours to drive. A range change
+     * arrives through this call, which is what makes the bias table per-range
+     * for CH2 on this board. */
+    (void)ch1_dc;
+    (void)ch2_dc;
+    (void)ch1_vdiv;
+    (void)ch2_vdiv;
+    (void)ch1_dac;
+    fpga53_ch2_ref_set(ch2_dac);
 #else
     (void)ch1_dc;
     (void)ch2_dc;
@@ -688,10 +699,19 @@ void TMR1_UP_IRQHandler(void) {
     scope_hw_slow_irq_handler();
 }
 
+/* CH2's offset reaches the hardware on the 2C53T even though the analog block
+ * is compiled out there: its reference is not part of that block at all, it is
+ * a TMR13 PWM on PA6. So the bias row the UI computed — scope_bias[1][range]
+ * through scope_bias_dac_for_channel() — lands on the timer, and CH2 follows
+ * its per-range calibration like CH1 does on the 2C23T. CH1 is untouched on
+ * this board: its DAC1 arm lives in fpga.c and the analog path stays off. */
 void scope_hw_set_offsets(uint16_t ch1_dac, uint16_t ch2_dac) {
 #if SCOPE_HW_CAPTURE && SCOPE_ANALOG_CONFIG
     scope_analog_begin();
     scope_dac_set_offsets(ch1_dac, ch2_dac);
+#elif SCOPE_HW_CAPTURE && HW_TARGET_2C53T
+    (void)ch1_dac;
+    fpga53_ch2_ref_set(ch2_dac);
 #else
     (void)ch1_dac;
     (void)ch2_dac;

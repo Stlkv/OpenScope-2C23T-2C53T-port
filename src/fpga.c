@@ -1,3 +1,4 @@
+#include "settings.h"
 #include "fpga.h"
 
 #include "app_config.h"
@@ -688,13 +689,14 @@ static uint8_t fpga53_xfer(uint8_t tx) {
  * code here against their 0.127 — and the units differ only by a ~6 ADC offset,
  * which is why the codes differ by 43. So the mechanism transfers between units
  * and the constant does not: a unit that is not #2 should re-run the sweep.
- * Since 2026-09-06 this is only the FALLBACK: the measured code lives in the
- * settings store (SETTINGS_STATE_CH2_REF, pushed here by ui_init through
- * fpga53_ch2_ref_preset), and this constant is what a unit that has never been
- * measured — or one whose settings were wiped — comes up with. Which is why it
- * stays unit #2's number and not upstream's: this is unit #2's firmware. */
+ * Since 2026-09-06 the calibrated value lives in the settings page, in
+ * scope_bias[1][range] alongside every other per-unit offset: ui_init() presets
+ * it here and scope_hw_set_offsets()/scope_hw_configure_channels() keep it
+ * following the range. What remains here is the value the timer holds before
+ * any of that runs — the arm at fpga_init and the scope pose — so it tracks the
+ * settings default rather than being a second, independent number. */
 #ifndef FPGA53_TMR13_REF_CODE
-#define FPGA53_TMR13_REF_CODE 2501u
+#define FPGA53_TMR13_REF_CODE ((uint16_t)SETTINGS_SCOPE_BIAS_CH2_2C53T_DEFAULT)
 #endif
 
 static uint16_t fpga53_ch2_ref_code = FPGA53_TMR13_REF_CODE;

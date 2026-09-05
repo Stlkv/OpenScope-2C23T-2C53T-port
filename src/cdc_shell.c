@@ -529,8 +529,16 @@ static void cmd_ch2ref(const char *args) {
      * NOT persist it: this command is used as a sweep, and a settings write per
      * probe would burn the page for values nobody is keeping. */
     if (word_matches(p, "save", &rest) && *rest == '\0') {
-        sh_out(ui_save_ch2_ref() ? "ch2ref: saved\r\n"
-                                 : "ch2ref: nothing valid to save\r\n");
+        uint8_t range = ui_save_ch2_ref();
+        if (range == 0xFFu) {
+            sh_out("ch2ref: nothing valid to save\r\n");
+        } else {
+            /* Which row was written matters: the code is per (unit, range), and
+             * a sweep on one range says nothing about the others. */
+            sh_out("ch2ref: saved to scope_bias[ch2][range ");
+            sh_u32(range);
+            sh_out("]\r\n");
+        }
         return;
     }
 

@@ -1647,3 +1647,53 @@ against a prediction of 115.6 is the same slope this unit measured yesterday.
 erase-and-rewrite path) — the saves here landed in a page with room. The
 meter-mode guard in `ch2ref` still has not fired, for the same reason as before:
 TMR13 is armed at boot on this build.
+
+## CH2's centering code moved again — into scope_bias[1][range] (2026-09-06)
+
+Yesterday's dedicated settings record is gone. The store already had a per-unit
+offset mechanism — `scope_bias[channel][range]` with `scope_bias_rate`, read
+through `scope_bias_dac_for_channel()` — and CH2's centering code is exactly
+that kind of value, so it lives there now and the private record type is
+withdrawn.
+
+**What had to change to make an existing mechanism reach this board.** The bias
+path ends in `scope_hw_set_offsets()` / `scope_hw_configure_channels()`, both of
+which discard their DAC arguments on the 2C53T because the analog block is
+compiled out (`SCOPE_ANALOG_CONFIG=0`). CH2's reference is not part of that
+block — it is a timer — so both functions now push `ch2_dac` to TMR13 on this
+board while leaving CH1 alone. Because a range change arrives through
+`scope_hw_configure_channels()`, CH2 gets per-range calibration on the 2C53T for
+free, which is the reason for preferring this over a single stored code.
+
+**Two defaults, one number.** `SETTINGS_SCOPE_BIAS_CH2_2C53T_DEFAULT` = 2501
+(measured 2026-09-05) fills the CH2 rows, and `FPGA53_TMR13_REF_CODE` — the
+value the timer holds between the boot arm and the first UI push — is defined
+from it rather than being a second independent constant.
+
+**Migration.** A unit that ran an earlier build has CH2 bias rows holding 1861,
+the 2C23T DAC default, written when nothing on this board drove TMR13 with them.
+Loading one would arm the timer with a number nobody measured and put CH2 near
+ADC 46, so on 2C53T builds the legacy default is read as "not calibrated for
+this channel" and replaced by the measured one. The cost is that 1861 can never
+be a real CH2 code here — 81 ADC counts from centre, where no calibration lands.
+
+**Measured round trip, bench unit #2.**
+
+| step | reading |
+|---|---|
+| install, boot | `ch2ref code=2501`, CH2 `7F-82` = 127-130 |
+| `ch2ref 2400` + `ch2ref save` | `saved to scope_bias[ch2][range 6]` |
+| reset, re-read | `code=2400`, CH2 `72-75` = 114-117, midpoint 115.5 |
+| predicted from the 2026-09-05 slope | 128.5 − 101 × 0.1274 = 115.6 |
+| `ch2ref 2501` + save, reset | `code=2501`, CH2 `7F-82` = 127-130 |
+
+The reboot returning 2400 is what distinguishes the bias row from the compiled
+fallback: both are 2501, so only a value that is neither can tell them apart.
+
+**Not exercised.** Per-range behaviour: everything above ran on range 6, and
+changing CH2's range needs a button, so "the row follows the range" is code
+reasoning plus the `save` line naming the row it wrote — not a measurement. The
+migration path was not observed firing either: this unit came up centered, which
+is equally consistent with having no saved CH2 rows at all. A save into a full
+settings page and the meter-mode guard in `ch2ref` remain untested for the same
+reasons as yesterday.

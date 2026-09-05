@@ -454,7 +454,6 @@ static void ui_settings_copy(settings_state_t *dst, const settings_state_t *src)
     dst->bode_start_hz = src->bode_start_hz;
     dst->bode_stop_hz = src->bode_stop_hz;
     dst->bode_steps = src->bode_steps;
-    dst->scope_ch2_ref = src->scope_ch2_ref;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         dst->scope_ch_enabled[ch] = src->scope_ch_enabled[ch];
         dst->scope_probe_x10[ch] = src->scope_probe_x10[ch];
@@ -7839,11 +7838,15 @@ void ui_init(void) {
     (void)settings_load(&saved);
     ui_settings_copy(&ui_settings, &saved);
 #if HW_TARGET_2C53T
-    /* Per-unit CH2 centering code, measured with `ch2ref` and saved. Preset, not
-     * set: arming TMR13 here would take PA6 from the meter's gain key before the
-     * device has even chosen a start mode. UNSET leaves the build-time default,
-     * so a unit that has never been measured behaves exactly as before. */
-    fpga53_ch2_ref_preset(ui_settings.scope_ch2_ref);
+    /* CH2's centering code is per-unit calibration and lives where every other
+     * per-unit offset does: scope_bias[channel][range]. Take the row for the
+     * range the scope will come up on. Preset, not set: arming TMR13 here would
+     * take PA6 from the meter's gain key before the device has even chosen a
+     * start mode — the timer is armed later by whoever owns the pin. */
+    fpga53_ch2_ref_preset(ui_settings.scope_bias[1][ui_settings.scope_vdiv[1] <
+                                                    SETTINGS_SCOPE_RANGE_COUNT
+                                                        ? ui_settings.scope_vdiv[1]
+                                                        : 0u]);
 #endif
 
     start_in_menu = ui_settings.startup_screen == SETTINGS_START_MENU ? 1u : 0u;
@@ -8148,21 +8151,24 @@ static void dmm_apply_selected_mode(void) {
 }
 
 #if HW_TARGET_2C53T
-/* Persist the CH2 centering code the shell just measured. Explicit rather than
+/* Persist the CH2 centering code the shell just measured, into the bias row for
+ * the range CH2 is on right now — the code is a property of (unit, range), and
+ * a sweep run on one range says nothing about the others. Explicit rather than
  * automatic: `ch2ref <code>` is used as a sweep, and writing the settings page
- * on every probe would burn flash for values nobody is keeping. Takes the code
+ * on every probe would burn flash for values nobody is keeping. The value comes
  * from the fpga module rather than an argument, so what gets stored is exactly
- * what is driving the timer. */
+ * what is driving the timer. Returns the range it wrote, or 0xFF on refusal. */
 uint8_t ui_save_ch2_ref(void) {
     uint16_t code = fpga53_ch2_ref_get();
+    uint8_t range = scope_channel_range_index(1);
 
-    if (code > SETTINGS_CH2_REF_MAX) {
-        return 0;
+    if (code > 4095u) {
+        return 0xFFu;
     }
-    ui_settings.scope_ch2_ref = code;
+    ui_settings.scope_bias[1][range] = code;
     settings_note(&ui_settings);
     settings_flush();
-    return 1;
+    return range;
 }
 #endif
 
