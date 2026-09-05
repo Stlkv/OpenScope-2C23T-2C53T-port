@@ -1597,3 +1597,53 @@ idle by design.
 **Follow-up.** The centering code is per-unit calibration data living in a
 `#define`. It belongs in the settings store next to the other per-unit values,
 so a second unit does not need a rebuild.
+
+## The CH2 centering code moved into the settings page (2026-09-06)
+
+A per-unit calibration in a `#define` means a second unit needs a rebuild, so
+the measured code now lives in the settings store as its own record type,
+`SETTINGS_STATE_CH2_REF`. The compiled constant stays as the fallback for a
+unit that has never been measured or whose settings were wiped.
+
+**Shape of the change.** One 32-bit record, type byte `0xE2`, 16-bit payload,
+same checksum scheme as every other state record. `0xE1` was skipped on
+purpose: `SETTINGS_LEGACY_MAGIC` is `0xE1A6` in the top 16 bits, so a type-`0xE1`
+record whose payload happened to begin `0xA6` would be read back as a legacy
+settings record. Any payload above 12 bits means "never measured" and leaves the
+build-time default in force.
+
+Field-by-field is the tax this store charges: the value had to be added to
+`settings_defaults`, `settings_copy`, `settings_equal`, `settings_clamp`, the
+record parser, the record writer and `ui_settings_copy` in the UI. Missing any
+one of them loses the value silently — `settings_equal` in particular, because
+the dirty check is what decides whether a flush writes at all.
+
+**Boot path.** `ui_init()` pushes the stored code with `fpga53_ch2_ref_preset()`,
+which stores without touching hardware. Presetting rather than setting matters:
+arming TMR13 at that point would take PA6 away from the meter's gain key before
+the device has even chosen a start mode. The timer is armed later, by whoever
+legitimately owns the pin.
+
+**Saving is explicit** — `ch2ref save`, not a write on every `ch2ref <code>`.
+The command is used as a sweep, and a settings write per probe would burn the
+page for values nobody intends to keep.
+
+**Measured round trip, bench unit #2.**
+
+| step | reading |
+|---|---|
+| after install, nothing saved | `ch2ref code=2501` — the compiled fallback |
+| `ch2ref 2400` + `ch2ref save` | `ch2ref: saved` |
+| reset, re-read | `ch2ref code=2400` — the stored value, not the fallback |
+| CH2 envelope at the stored 2400 | `73-75` = 115-117, midpoint 116.0 |
+| predicted from the 2026-09-05 slope | 128.5 − 101 × 0.1274 = 115.6 |
+| `ch2ref 2501` + save, reset | `ch2ref code=2501`, CH2 `7F-82` = 127-130 |
+
+The envelope is the part that matters: it says the stored number reaches the
+timer and moves the channel, rather than merely being reported back. 116.0
+against a prediction of 115.6 is the same slope this unit measured yesterday.
+
+**Not exercised.** A settings page that is full at the moment of the save (the
+erase-and-rewrite path) — the saves here landed in a page with room. The
+meter-mode guard in `ch2ref` still has not fired, for the same reason as before:
+TMR13 is armed at boot on this build.

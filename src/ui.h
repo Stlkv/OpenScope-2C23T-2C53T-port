@@ -17,3 +17,6 @@ void ui_set_live_wire_detected(uint8_t detected);
  * (0=DMM, 1=SCOPE, 2=GEN), high nibble = overlay (0=none, 1=mode menu,
  * 2=settings). Without it a dump's GPIO state can't be attributed to a mode. */
 uint8_t ui_debug_mode_byte(void);
+/* Store the CH2 centering code currently driving TMR13 into the settings page.
+ * Returns 0 if there is nothing valid to store. 2C53T builds only. */
+uint8_t ui_save_ch2_ref(void);

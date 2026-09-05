@@ -42,10 +42,14 @@ enum {
     SETTINGS_STATE_SIGGEN_SWEEP_START_HI = 0xDEu,
     SETTINGS_STATE_SIGGEN_SWEEP_STOP_LO = 0xDFu,
     SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI = 0xE0u,
+    /* 0xE1 is deliberately skipped: SETTINGS_LEGACY_MAGIC is 0xE1A6 in the top
+     * 16 bits, so a state record of type 0xE1 whose payload happened to start
+     * 0xA6 would be read back as a legacy settings record. */
+    SETTINGS_STATE_CH2_REF = 0xE2u,
     SETTINGS_SCOPE_BIAS_DEFAULT = 1861u,
     SETTINGS_SCOPE_BIAS_RATE_DEFAULT = 505u,
     SETTINGS_SCOPE_CAL_WORDS = SETTINGS_SCOPE_CHANNEL_COUNT * SETTINGS_SCOPE_RANGE_COUNT * 2,
-    SETTINGS_STATE_WORDS = SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI -
+    SETTINGS_STATE_WORDS = SETTINGS_STATE_CH2_REF -
                            SETTINGS_STATE_SCOPE_CORE + 1u,
     SETTINGS_WRITE_BYTES = 4u * (1u + SETTINGS_SCOPE_CAL_WORDS + SETTINGS_STATE_WORDS),
     FLASH_BANK2_BASE = 0x08080000u,
@@ -99,6 +103,7 @@ static void settings_defaults(settings_state_t *settings) {
     settings->scope_measure_visible = 1;
     settings->scope_h_value_pos = 0;
     settings->scope_h_value_timebase = SETTINGS_SCOPE_TIMEBASE_DEFAULT;
+    settings->scope_ch2_ref = SETTINGS_CH2_REF_UNSET;
     settings->scope_math_mode = 0;
     settings->scope_math_op = 0;
     settings->scope_fft_src = 0;
@@ -178,6 +183,7 @@ static void settings_copy(settings_state_t *dst, const settings_state_t *src) {
     dst->bode_start_hz = src->bode_start_hz;
     dst->bode_stop_hz = src->bode_stop_hz;
     dst->bode_steps = src->bode_steps;
+    dst->scope_ch2_ref = src->scope_ch2_ref;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         dst->scope_ch_enabled[ch] = src->scope_ch_enabled[ch];
         dst->scope_probe_x10[ch] = src->scope_probe_x10[ch];
@@ -235,7 +241,8 @@ static uint8_t settings_equal(const settings_state_t *a, const settings_state_t 
         a->siggen_fm_freq_hz != b->siggen_fm_freq_hz ||
         a->bode_start_hz != b->bode_start_hz ||
         a->bode_stop_hz != b->bode_stop_hz ||
-        a->bode_steps != b->bode_steps) {
+        a->bode_steps != b->bode_steps ||
+        a->scope_ch2_ref != b->scope_ch2_ref) {
         return 0;
     }
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
@@ -258,6 +265,9 @@ static uint8_t settings_equal(const settings_state_t *a, const settings_state_t 
 }
 
 static void settings_clamp(settings_state_t *settings) {
+    if (settings->scope_ch2_ref > SETTINGS_CH2_REF_MAX) {
+        settings->scope_ch2_ref = SETTINGS_CH2_REF_UNSET;
+    }
     if (settings->beep_level >= SETTINGS_LEVEL_COUNT) {
         settings->beep_level = 3;
     }
@@ -616,6 +626,12 @@ static uint8_t settings_state_record_valid(uint32_t record, settings_state_t *se
         settings->siggen_sweep_stop_hz = (settings->siggen_sweep_stop_hz & 0xFFFF0000u) | payload;
     } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI) {
         settings->siggen_sweep_stop_hz = (settings->siggen_sweep_stop_hz & 0x0000FFFFu) | ((uint32_t)payload << 16);
+    } else if (type == SETTINGS_STATE_CH2_REF) {
+        /* A record written by an older build, or a payload out of range, leaves
+         * the field at its "never measured" default rather than arming the
+         * timer with a number nobody stands behind. */
+        settings->scope_ch2_ref = payload <= SETTINGS_CH2_REF_MAX
+                                      ? payload : (uint16_t)SETTINGS_CH2_REF_UNSET;
     } else {
         return 0;
     }
@@ -741,6 +757,9 @@ static void settings_write_state_records(uint32_t *addr, const settings_state_t 
     *addr += 4u;
     flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI,
                                                     (uint16_t)(settings->siggen_sweep_stop_hz >> 16)));
+    *addr += 4u;
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_CH2_REF,
+                                                    settings->scope_ch2_ref));
     *addr += 4u;
 }
 

@@ -31,6 +31,13 @@ enum {
     SETTINGS_SIGGEN_SWEEP_MODE_COUNT = 3, // 0 = OFF, 1 = LINEAR, 2 = LOG
     SETTINGS_SIGGEN_FM_MODE_COUNT = 2, // 0 = OFF, 1 = ON
     SETTINGS_SIGGEN_FM_SOURCE_COUNT = 3, // 0 = SINE, 1 = TRIANGLE, 2 = SQUARE
+    /* CH2 vertical-offset reference (2C53T): the TMR13 PWM code that centers
+     * the channel. Per-unit calibration — measured, not derived — so it is
+     * stored rather than compiled. Anything above 12 bits means "never
+     * measured on this unit", and the firmware falls back to its build-time
+     * default. */
+    SETTINGS_CH2_REF_MAX = 4095,
+    SETTINGS_CH2_REF_UNSET = 0xFFFF,
 };
 
 typedef struct {
@@ -85,6 +92,7 @@ typedef struct {
     uint32_t bode_start_hz;
     uint32_t bode_stop_hz;
     uint8_t bode_steps;
+    uint16_t scope_ch2_ref;      // TMR13 centering code, or SETTINGS_CH2_REF_UNSET
 
 } settings_state_t;
 

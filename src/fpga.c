@@ -688,8 +688,11 @@ static uint8_t fpga53_xfer(uint8_t tx) {
  * code here against their 0.127 — and the units differ only by a ~6 ADC offset,
  * which is why the codes differ by 43. So the mechanism transfers between units
  * and the constant does not: a unit that is not #2 should re-run the sweep.
- * This properly belongs in the settings store as a per-unit calibration rather
- * than in a #define; that is the follow-up, not this commit. */
+ * Since 2026-09-06 this is only the FALLBACK: the measured code lives in the
+ * settings store (SETTINGS_STATE_CH2_REF, pushed here by ui_init through
+ * fpga53_ch2_ref_preset), and this constant is what a unit that has never been
+ * measured — or one whose settings were wiped — comes up with. Which is why it
+ * stays unit #2's number and not upstream's: this is unit #2's firmware. */
 #ifndef FPGA53_TMR13_REF_CODE
 #define FPGA53_TMR13_REF_CODE 2501u
 #endif
@@ -731,6 +734,18 @@ void fpga53_ch2_ref_set(uint16_t code) {
 #else
     (void)code;
 #endif
+}
+
+/* Adopt a stored code WITHOUT touching hardware. The boot path calls this from
+ * ui_init(), where the settings record has just been read and the device may
+ * still be about to come up in meter mode — arming TMR13 there would take PA6
+ * away from the meter's gain key before the meter has even started. The value
+ * sits in the module until whoever legitimately owns PA6 arms the timer. */
+void fpga53_ch2_ref_preset(uint16_t code) {
+    if (code > 4095u) {
+        return;
+    }
+    fpga53_ch2_ref_code = code;
 }
 
 uint16_t fpga53_ch2_ref_get(void) {

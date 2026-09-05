@@ -212,7 +212,7 @@ static void cmd_help(const char *args) {
            "    then stream exactly <size> raw bytes (cdc_flash.py does both)\r\n"
            "  fwapply                      install what fwload just staged\r\n"
            "  fwswap a|b                   install a cached image, no transfer\r\n"
-           "  ch2ref [0-4095]              CH2 offset reference (TMR13 PWM, PA6)\r\n"
+           "  ch2ref [0-4095|save]         CH2 offset reference (TMR13 PWM, PA6)\r\n"
            "  uptime                       ms since boot\r\n");
 }
 
@@ -522,7 +522,17 @@ static void cmd_meter(const char *args) {
  * to try a value is a rebuild and a reflash per candidate. */
 static void cmd_ch2ref(const char *args) {
     const char *p = skip_spaces(args);
+    const char *rest;
     uint32_t code;
+
+    /* `save` persists what is driving the timer right now. Setting a code does
+     * NOT persist it: this command is used as a sweep, and a settings write per
+     * probe would burn the page for values nobody is keeping. */
+    if (word_matches(p, "save", &rest) && *rest == '\0') {
+        sh_out(ui_save_ch2_ref() ? "ch2ref: saved\r\n"
+                                 : "ch2ref: nothing valid to save\r\n");
+        return;
+    }
 
     if (*p != '\0') {
         /* Reject trailing junk rather than acting on the digits found so far:

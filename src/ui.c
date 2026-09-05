@@ -454,6 +454,7 @@ static void ui_settings_copy(settings_state_t *dst, const settings_state_t *src)
     dst->bode_start_hz = src->bode_start_hz;
     dst->bode_stop_hz = src->bode_stop_hz;
     dst->bode_steps = src->bode_steps;
+    dst->scope_ch2_ref = src->scope_ch2_ref;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         dst->scope_ch_enabled[ch] = src->scope_ch_enabled[ch];
         dst->scope_probe_x10[ch] = src->scope_probe_x10[ch];
@@ -7837,6 +7838,13 @@ void ui_init(void) {
     battery_update();
     (void)settings_load(&saved);
     ui_settings_copy(&ui_settings, &saved);
+#if HW_TARGET_2C53T
+    /* Per-unit CH2 centering code, measured with `ch2ref` and saved. Preset, not
+     * set: arming TMR13 here would take PA6 from the meter's gain key before the
+     * device has even chosen a start mode. UNSET leaves the build-time default,
+     * so a unit that has never been measured behaves exactly as before. */
+    fpga53_ch2_ref_preset(ui_settings.scope_ch2_ref);
+#endif
 
     start_in_menu = ui_settings.startup_screen == SETTINGS_START_MENU ? 1u : 0u;
 
@@ -8138,6 +8146,25 @@ static void dmm_apply_selected_mode(void) {
         dmm_set_mode(ui.dmm_mode);
     }
 }
+
+#if HW_TARGET_2C53T
+/* Persist the CH2 centering code the shell just measured. Explicit rather than
+ * automatic: `ch2ref <code>` is used as a sweep, and writing the settings page
+ * on every probe would burn flash for values nobody is keeping. Takes the code
+ * from the fpga module rather than an argument, so what gets stored is exactly
+ * what is driving the timer. */
+uint8_t ui_save_ch2_ref(void) {
+    uint16_t code = fpga53_ch2_ref_get();
+
+    if (code > SETTINGS_CH2_REF_MAX) {
+        return 0;
+    }
+    ui_settings.scope_ch2_ref = code;
+    settings_note(&ui_settings);
+    settings_flush();
+    return 1;
+}
+#endif
 
 void ui_note_runtime_settings(void) {
     scope_sanitize_state();

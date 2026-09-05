@@ -346,6 +346,10 @@ void fpga53_scope_pose_reapply(void);
  * FPGA53_TMR13_REF, where `set` is a no-op and `get` only reports the default).
  * The centering code is a measured quantity — see FPGA53_TMR13_REF_CODE. */
 void fpga53_ch2_ref_set(uint16_t code);
+/* Adopt a stored code without arming — for the boot path, before the owner of
+ * PA6 is decided. Values above 12 bits are ignored, which is how the settings
+ * store says "never measured on this unit". */
+void fpga53_ch2_ref_preset(uint16_t code);
 uint16_t fpga53_ch2_ref_get(void);
 uint8_t fpga53_ch2_ref_armed(void);
 /* Slow-point read length. Short reads (0) release CS after a few samples;
