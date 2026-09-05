@@ -5,6 +5,7 @@
 #include "fpga.h"
 #include "fw_cache.h"
 #include "fw_update.h"
+#include "ui.h"
 #include "usb_cdc.h"
 
 #if !defined(USB_CDC_SHELL) || USB_CDC_SHELL
@@ -524,8 +525,20 @@ static void cmd_ch2ref(const char *args) {
     uint32_t code;
 
     if (*p != '\0') {
-        if (!parse_u32(&p, &code) || code > 4095u) {
+        /* Reject trailing junk rather than acting on the digits found so far:
+         * "ch2ref 12abc" must not quietly arm 12. */
+        if (!parse_u32(&p, &code) || *skip_spaces(p) != '\0' || code > 4095u) {
             sh_out("usage: ch2ref [0-4095]\r\n");
+            return;
+        }
+        /* Arming reconfigures PA6 to alternate function, and in meter mode PA6
+         * is the meter's gain key — arming under a live measurement would move
+         * the reading and nothing on screen would say why. Once TMR13 is armed
+         * (scope mode has run), setting a code only writes C1DT and is safe
+         * from any mode. */
+        if (!fpga53_ch2_ref_armed() && (ui_debug_mode_byte() & 0x0Fu) == 0u) {
+            sh_out("ch2ref: refused, TMR13 not armed and the meter owns PA6"
+                   " (gain key) — enter scope mode first\r\n");
             return;
         }
         fpga53_ch2_ref_set((uint16_t)code);

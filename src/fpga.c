@@ -667,19 +667,31 @@ static uint8_t fpga53_xfer(uint8_t tx) {
  * TMR13 after an MCU reset, so CH2's comparator reference is dead without it —
  * and the meter reclaims PA6 as a plain GPIO gain key, so scope-mode entry has
  * to take it back (see fpga53_scope_pose_reapply). */
-/* The code TMR13 is armed with at boot. NOT mid-scale: DAC1 centers CH1 at
- * 2048 because it is a true 12-bit DAC, but TMR13 drives an RC filter, so its
- * centering code has to be measured. Upstream measured it on bench unit #1,
- * range 5, generator on CH2 (DavidClawson, 0b7f9d09, 2026-08-27): code 2048 ->
- * window mean 65, code 3072 -> mean 195, which interpolates to ADC 128 at 2544.
- * That is ONE unit, ONE range, ONE generator, so the number is theirs and not
- * ours — what we take from it is the mechanism, not the constant. On this unit
- * measure it with `ch2ref <code>` from the CDC shell and read the CH2 envelope
- * out of `dbg` (em/ex per channel); when it is known, set it here. Our previous
- * value was 2048, i.e. the DAC assumption, which is what their bench recorded
- * as CH2 sitting near mean 65 and reading like railed noise. */
+/* The code TMR13 is armed with at boot. NOT mid-scale: DAC1 centers CH1 at 2048
+ * because it is a true 12-bit DAC, but TMR13 drives an RC filter, so its
+ * centering code is a measured quantity. Our previous value was 2048 — the DAC
+ * assumption — which put CH2 near the bottom of the window.
+ *
+ * MEASURED on bench unit #2 (2026-09-05, `ch2ref <code>` then the CH2 envelope
+ * out of `dbg`, no signal on the probe, three dumps per point, envelope
+ * midpoint):
+ *
+ *   code 2048 -> 70.5    code 2501 -> 128.5    code 2544 -> 133.5
+ *   code 2480 -> 126.0   code 2520 -> 131.0    code 3072 -> 201.0
+ *
+ * so 2501 centers CH2 here, repeatable across two runs, bracketed by its
+ * neighbours. CH1 read 74-77 at every one of those codes, so the reference is
+ * channel-local — that is the control for this measurement.
+ *
+ * Upstream measured 2544 on THEIR unit #1 (DavidClawson, 0b7f9d09, 2026-08-27:
+ * 2048 -> 65, 3072 -> 195). The slopes agree to three digits — 0.1274 ADC per
+ * code here against their 0.127 — and the units differ only by a ~6 ADC offset,
+ * which is why the codes differ by 43. So the mechanism transfers between units
+ * and the constant does not: a unit that is not #2 should re-run the sweep.
+ * This properly belongs in the settings store as a per-unit calibration rather
+ * than in a #define; that is the follow-up, not this commit. */
 #ifndef FPGA53_TMR13_REF_CODE
-#define FPGA53_TMR13_REF_CODE 2544u
+#define FPGA53_TMR13_REF_CODE 2501u
 #endif
 
 static uint16_t fpga53_ch2_ref_code = FPGA53_TMR13_REF_CODE;

@@ -1541,3 +1541,59 @@ err=<code> b=<accepted>/<expected> seq=<counter>`. That line doubled as the
 unambiguous marker — `v2` in a dump means an image only the rewritten stager
 could have installed. Codes: st 0 idle, 1 staging, 2 ready, 3 error, 4 applying;
 err 1 range, 2 vector, 3 order.
+
+## CH2's reference is a timer, and its centering code is 2501 here (2026-09-05)
+
+Upstream fixed CH2's boot arm on their unit (DavidClawson, `0b7f9d09`): TMR13
+drives an RC filter, so unlike DAC1 it does not center at mid-scale, and 2048
+left CH2 near the bottom of the window. This port armed 2048 for the same wrong
+reason. Their measured code is 2544 on bench unit #1; this is the same
+measurement on unit #2, plus the two other changes that rode along.
+
+**Method.** No signal on either probe — the quantity being centered is the DC
+baseline itself. Set the code with the new `ch2ref <0-4095>` shell command, then
+read the CH2 envelope out of `dbg` (`chN=min-max`, hex). The first dump after a
+change is discarded: the envelope accumulates between dumps, so a fresh one is
+taken and only the second is used. Midpoint = (min+max)/2.
+
+| code | CH2 envelope | midpoint | CH1 envelope |
+|---|---|---|---|
+| 2048 | 69-72   | 70.5  | 74-77 |
+| 2480 | 124-128 | 126.0 | 74-77 |
+| 2501 | 127-130 | 128.5 | 74-77 |
+| 2501 | 127-130 | 128.5 | 74-77 |
+| 2520 | 130-132 | 131.0 | 74-77 |
+| 2544 | 132-135 | 133.5 | 74-77 |
+| 3072 | 200-202 | 201.0 | 74-77 |
+
+**Result: 2501 centers CH2 on this unit**, repeated twice and bracketed by its
+neighbours. CH1 read 74-77 at every code, which is the control: the reference is
+channel-local and nothing here moves CH1.
+
+**The mechanism transfers between units, the constant does not.** Slope here is
+(201.0-70.5)/1024 = **0.1274 ADC per code**; upstream's two points give 0.127.
+Three digits of agreement across two units, two chips and two generators — but
+the offsets differ by about 6 ADC counts, which is the whole reason their code
+is 2544 and ours is 2501. Any unit that is not #2 should re-run this sweep.
+
+**End-to-end, no shell intervention:** with 2501 compiled in as the boot arm, a
+cold install and boot leaves CH2 at `7F-81` = 127-129, midpoint 128.0.
+
+**Also verified in the same session.** The W25Q writer now takes an explicit
+CS-high settle between transactions and verifies WREN by reading WEL back — the
+tSHSL class of bug upstream hit in `flash_fs` could not reach us before only
+because we never read status after WREN, i.e. by accident. Both halves ran on
+hardware: a 131 808 B image staged into slot A under the new driver (33 sector
+erases, 515 page programs, at-rest CRC `709ec785` verified). `ch2ref` refuses
+`12abc`, `5000` and `-1` with a usage line rather than acting on the digits it
+found.
+
+**Not exercised.** The meter-mode guard in `ch2ref` (it refuses to arm TMR13
+while the meter owns PA6 as a gain key) never fired: TMR13 is armed at boot on
+this build, so the guard's condition was false all session — code-reviewed only.
+The meter itself was not read; the device sat in scope mode, where its frame is
+idle by design.
+
+**Follow-up.** The centering code is per-unit calibration data living in a
+`#define`. It belongs in the settings store next to the other per-unit values,
+so a second unit does not need a rebuild.
