@@ -21,3 +21,4 @@ uint8_t ui_debug_mode_byte(void);
  * CH2's current range. Returns that range index, or 0xFF if there was nothing
  * valid to store. 2C53T builds only. */
 uint8_t ui_save_ch2_ref(void);
+uint8_t ui_save_ch1_ref(void);

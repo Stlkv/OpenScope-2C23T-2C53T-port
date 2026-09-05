@@ -7843,6 +7843,10 @@ void ui_init(void) {
      * range the scope will come up on. Preset, not set: arming TMR13 here would
      * take PA6 from the meter's gain key before the device has even chosen a
      * start mode — the timer is armed later by whoever owns the pin. */
+    fpga53_ch1_ref_preset(ui_settings.scope_bias[0][ui_settings.scope_vdiv[0] <
+                                                    SETTINGS_SCOPE_RANGE_COUNT
+                                                        ? ui_settings.scope_vdiv[0]
+                                                        : 0u]);
     fpga53_ch2_ref_preset(ui_settings.scope_bias[1][ui_settings.scope_vdiv[1] <
                                                     SETTINGS_SCOPE_RANGE_COUNT
                                                         ? ui_settings.scope_vdiv[1]
@@ -8166,6 +8170,20 @@ uint8_t ui_save_ch2_ref(void) {
         return 0xFFu;
     }
     ui_settings.scope_bias[1][range] = code;
+    settings_note(&ui_settings);
+    settings_flush();
+    return range;
+}
+
+/* CH1's counterpart. Same contract, the other row. */
+uint8_t ui_save_ch1_ref(void) {
+    uint16_t code = fpga53_ch1_ref_get();
+    uint8_t range = scope_channel_range_index(0);
+
+    if (code > 4095u) {
+        return 0xFFu;
+    }
+    ui_settings.scope_bias[0][range] = code;
     settings_note(&ui_settings);
     settings_flush();
     return range;

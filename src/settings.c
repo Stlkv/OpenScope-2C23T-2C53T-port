@@ -74,9 +74,11 @@ static void settings_scope_cal_defaults(settings_state_t *settings) {
         }
     }
 #if HW_TARGET_2C53T
-    /* CH2's reference here is a TMR13 PWM code, so 1861 — a DAC code from the
-     * 2C23T — is meaningless for it and lands the channel near ADC 46. */
+    /* Neither channel's reference is the 2C23T's: CH2's is a TMR13 PWM code, so
+     * 1861 lands it near ADC 46, and CH1's DAC sits on a different front end
+     * than the board that number came from. */
     for (uint8_t range = 0; range < SETTINGS_SCOPE_RANGE_COUNT; ++range) {
+        settings->scope_bias[0][range] = SETTINGS_SCOPE_BIAS_CH1_2C53T_DEFAULT;
         settings->scope_bias[1][range] = SETTINGS_SCOPE_BIAS_CH2_2C53T_DEFAULT;
     }
 #endif
@@ -93,6 +95,9 @@ static void settings_scope_cal_defaults(settings_state_t *settings) {
  * would ever land on. */
 static void settings_scope_cal_migrate_ch2(settings_state_t *settings) {
     for (uint8_t range = 0; range < SETTINGS_SCOPE_RANGE_COUNT; ++range) {
+        if (settings->scope_bias[0][range] == SETTINGS_SCOPE_BIAS_DEFAULT) {
+            settings->scope_bias[0][range] = SETTINGS_SCOPE_BIAS_CH1_2C53T_DEFAULT;
+        }
         if (settings->scope_bias[1][range] == SETTINGS_SCOPE_BIAS_DEFAULT) {
             settings->scope_bias[1][range] = SETTINGS_SCOPE_BIAS_CH2_2C53T_DEFAULT;
         }

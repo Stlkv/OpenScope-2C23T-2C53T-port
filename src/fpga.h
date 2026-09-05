@@ -350,6 +350,18 @@ void fpga53_ch2_ref_set(uint16_t code);
  * PA6 is decided. Values above 12 bits are ignored, which is how the settings
  * store says "never measured on this unit". */
 void fpga53_ch2_ref_preset(uint16_t code);
+/* CH1's vertical-offset reference: DAC1 on PA4. Same contract as CH2's, and
+ * the same per-unit story — mid-scale is not centre. */
+void fpga53_ch1_ref_set(uint16_t code);
+void fpga53_ch1_ref_preset(uint16_t code);
+uint16_t fpga53_ch1_ref_get(void);
+uint8_t fpga53_ch1_ref_armed(void);
+/* Write one scope-engine register over SPI3, at the divider and framing the arm
+ * sequence uses. Returns 0 if the FPGA is not up. Register 0x08 is the
+ * candidate digital trigger level (arm value 0xAD); the effect of changing it
+ * has not been measured. */
+uint8_t fpga53_scope_reg_write(uint8_t reg, uint8_t value);
+uint8_t fpga53_trig_level_get(void);
 uint16_t fpga53_ch2_ref_get(void);
 uint8_t fpga53_ch2_ref_armed(void);
 /* Slow-point read length. Short reads (0) release CS after a few samples;

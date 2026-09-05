@@ -212,7 +212,9 @@ static void cmd_help(const char *args) {
            "    then stream exactly <size> raw bytes (cdc_flash.py does both)\r\n"
            "  fwapply                      install what fwload just staged\r\n"
            "  fwswap a|b                   install a cached image, no transfer\r\n"
+           "  ch1ref [0-4095|save]         CH1 offset reference (DAC1, PA4)\r\n"
            "  ch2ref [0-4095|save]         CH2 offset reference (TMR13 PWM, PA6)\r\n"
+           "  trigreg [0-255]              scope-engine reg 0x08 (trigger level?)\r\n"
            "  uptime                       ms since boot\r\n");
 }
 
@@ -520,22 +522,24 @@ static void cmd_meter(const char *args) {
  * This exists so it can be measured in one session: set a code here, read the
  * CH2 envelope back out of `dbg` (`em`/`ex`), repeat. Without it the only way
  * to try a value is a rebuild and a reflash per candidate. */
-static void cmd_ch2ref(const char *args) {
+/* One handler for both channels: the two references are different peripherals
+ * (DAC1 on PA4, TMR13 PWM on PA6) but the same job — the code that centers the
+ * channel — and the same measurement loop: set a code, read the envelope back
+ * out of `dbg` (`chN=min-max`), repeat. `save` writes the code currently
+ * driving the hardware into scope_bias[channel][range] for the range that
+ * channel is on. Setting does NOT save: this is used as a sweep, and a
+ * settings write per probe would burn the page for values nobody is keeping. */
+static void cmd_chref(const char *args, uint8_t ch) {
     const char *p = skip_spaces(args);
     const char *rest;
     uint32_t code;
 
-    /* `save` persists what is driving the timer right now. Setting a code does
-     * NOT persist it: this command is used as a sweep, and a settings write per
-     * probe would burn the page for values nobody is keeping. */
     if (word_matches(p, "save", &rest) && *rest == '\0') {
-        uint8_t range = ui_save_ch2_ref();
+        uint8_t range = ch ? ui_save_ch2_ref() : ui_save_ch1_ref();
         if (range == 0xFFu) {
-            sh_out("ch2ref: nothing valid to save\r\n");
+            sh_out("nothing valid to save\r\n");
         } else {
-            /* Which row was written matters: the code is per (unit, range), and
-             * a sweep on one range says nothing about the others. */
-            sh_out("ch2ref: saved to scope_bias[ch2][range ");
+            sh_out(ch ? "saved to scope_bias[ch2][range " : "saved to scope_bias[ch1][range ");
             sh_u32(range);
             sh_out("]\r\n");
         }
@@ -546,26 +550,64 @@ static void cmd_ch2ref(const char *args) {
         /* Reject trailing junk rather than acting on the digits found so far:
          * "ch2ref 12abc" must not quietly arm 12. */
         if (!parse_u32(&p, &code) || *skip_spaces(p) != '\0' || code > 4095u) {
-            sh_out("usage: ch2ref [0-4095]\r\n");
+            sh_out("usage: chNref [0-4095|save]\r\n");
             return;
         }
-        /* Arming reconfigures PA6 to alternate function, and in meter mode PA6
-         * is the meter's gain key — arming under a live measurement would move
-         * the reading and nothing on screen would say why. Once TMR13 is armed
-         * (scope mode has run), setting a code only writes C1DT and is safe
-         * from any mode. */
-        if (!fpga53_ch2_ref_armed() && (ui_debug_mode_byte() & 0x0Fu) == 0u) {
+        /* Arming TMR13 reconfigures PA6, and in meter mode PA6 is the meter's
+         * gain key — arming under a live measurement would move the reading
+         * with nothing on screen to say why. Once armed (scope mode has run)
+         * setting a code only writes C1DT and is safe from any mode. DAC1 has
+         * no such owner: PA4 is nobody else's pin. */
+        if (ch && !fpga53_ch2_ref_armed() && (ui_debug_mode_byte() & 0x0Fu) == 0u) {
             sh_out("ch2ref: refused, TMR13 not armed and the meter owns PA6"
                    " (gain key) — enter scope mode first\r\n");
             return;
         }
-        fpga53_ch2_ref_set((uint16_t)code);
+        if (ch) {
+            fpga53_ch2_ref_set((uint16_t)code);
+        } else {
+            fpga53_ch1_ref_set((uint16_t)code);
+        }
     }
-    sh_out("ch2ref code=");
-    sh_u32(fpga53_ch2_ref_get());
-    sh_out(fpga53_ch2_ref_armed() ? " tmr13=armed\r\n"
-                                  : " tmr13=off (build has no FPGA53_TMR13_REF)\r\n");
+    sh_out(ch ? "ch2ref code=" : "ch1ref code=");
+    sh_u32(ch ? fpga53_ch2_ref_get() : fpga53_ch1_ref_get());
+    if (ch) {
+        sh_out(fpga53_ch2_ref_armed() ? " tmr13=armed\r\n"
+                                      : " tmr13=off (build has no FPGA53_TMR13_REF)\r\n");
+    } else {
+        sh_out(fpga53_ch1_ref_armed() ? " dac1=armed\r\n" : " dac1=off\r\n");
+    }
 }
+
+/* Scope-engine register 0x08, the candidate digital trigger level. Exists to
+ * settle whether it does anything: the arm sequence writes 0xAD and nothing has
+ * ever changed it, so "0x08 carries the trigger level" is a reading of stock,
+ * not a measurement of this board. With no signal on the probe, an engine that
+ * really gates on a crossing should stall when the level is parked outside the
+ * baseline; one that ignores the register keeps producing frames. Read F/R/W in
+ * `dbg` on either side of the change. */
+static void cmd_trigreg(const char *args) {
+    const char *p = skip_spaces(args);
+    uint32_t value;
+
+    if (*p != '\0') {
+        if (!parse_u32(&p, &value) || *skip_spaces(p) != '\0' || value > 255u) {
+            sh_out("usage: trigreg [0-255]\r\n");
+            return;
+        }
+        if (!fpga53_scope_reg_write(0x08u, (uint8_t)value)) {
+            sh_out("trigreg: FPGA not up\r\n");
+            return;
+        }
+    }
+    sh_out("trigreg reg08=0x");
+    sh_hex(fpga53_trig_level_get(), 2);
+    sh_out("\r\n");
+}
+
+static void cmd_ch1ref(const char *args) { cmd_chref(args, 0u); }
+static void cmd_ch2ref(const char *args) { cmd_chref(args, 1u); }
+
 #endif
 
 static void cmd_uptime(const char *args) {
@@ -596,6 +638,8 @@ static const sh_cmd_t sh_cmds[] = {
 #if HW_TARGET_2C53T
     { "meter", cmd_meter },
     { "ch2ref", cmd_ch2ref },
+    { "ch1ref", cmd_ch1ref },
+    { "trigreg", cmd_trigreg },
 #endif
     { "uptime", cmd_uptime },
     { 0, 0 },

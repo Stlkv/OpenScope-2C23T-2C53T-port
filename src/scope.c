@@ -447,7 +447,7 @@ void scope_hw_configure_channels(uint8_t timebase,
     (void)ch2_dc;
     (void)ch1_vdiv;
     (void)ch2_vdiv;
-    (void)ch1_dac;
+    fpga53_ch1_ref_set(ch1_dac);
     fpga53_ch2_ref_set(ch2_dac);
 #else
     (void)ch1_dc;
@@ -710,7 +710,7 @@ void scope_hw_set_offsets(uint16_t ch1_dac, uint16_t ch2_dac) {
     scope_analog_begin();
     scope_dac_set_offsets(ch1_dac, ch2_dac);
 #elif SCOPE_HW_CAPTURE && HW_TARGET_2C53T
-    (void)ch1_dac;
+    fpga53_ch1_ref_set(ch1_dac);
     fpga53_ch2_ref_set(ch2_dac);
 #else
     (void)ch1_dac;

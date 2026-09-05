@@ -702,6 +702,22 @@ static uint8_t fpga53_xfer(uint8_t tx) {
 static uint16_t fpga53_ch2_ref_code = FPGA53_TMR13_REF_CODE;
 static uint8_t fpga53_tmr13_armed;
 
+/* CH1's opposite number. DAC1 is a true 12-bit DAC, so mid-scale is at least a
+ * defensible starting point — but "defensible" is not "measured", and on unit
+ * #2 mid-scale leaves CH1 at ADC 75, not 128. The centering code is per-unit
+ * exactly like CH2's and lives in scope_bias[0][range]; this is the value the
+ * DAC holds before the first UI push. */
+#ifndef FPGA53_DAC1_REF_CODE
+#define FPGA53_DAC1_REF_CODE ((uint16_t)SETTINGS_SCOPE_BIAS_CH1_2C53T_DEFAULT)
+#endif
+static uint16_t fpga53_ch1_ref_code = FPGA53_DAC1_REF_CODE;
+static uint8_t fpga53_dac1_armed;
+
+/* Last value written to scope-engine register 0x08. The arm sequence puts 0xAD
+ * there, so that is what the engine is running with until something changes
+ * it. */
+static uint8_t fpga53_trig_level = 0xADu;
+
 static void fpga53_tmr13_ref_apply(void) {
 #if FPGA53_TMR13_REF
     RCC_APB1ENR |= 1u << 7; // TMR13
@@ -756,6 +772,80 @@ uint16_t fpga53_ch2_ref_get(void) {
 
 uint8_t fpga53_ch2_ref_armed(void) {
     return fpga53_tmr13_armed;
+}
+
+/* CH1's three, mirroring CH2's. The DAC needs no pin negotiation — PA4 is
+ * nobody else's — so `set` can bring it up on any build without the ownership
+ * question TMR13 has with the meter's gain key. */
+void fpga53_ch1_ref_set(uint16_t code) {
+    if (code > 4095u) {
+        code = 4095u;
+    }
+    fpga53_ch1_ref_code = code;
+    if (!fpga53_dac1_armed) {
+        RCC_APB1ENR |= 1u << 29;
+        gpio_config_mask(GPIOA_BASE, 1u << 4, 0x0);
+        REG32(0x40007400u) |= 1u;
+        fpga53_dac1_armed = 1u;
+    }
+    REG32(0x40007408u) = code;
+}
+
+void fpga53_ch1_ref_preset(uint16_t code) {
+    if (code > 4095u) {
+        return;
+    }
+    fpga53_ch1_ref_code = code;
+}
+
+uint16_t fpga53_ch1_ref_get(void) {
+    return fpga53_ch1_ref_code;
+}
+
+uint8_t fpga53_ch1_ref_armed(void) {
+    return fpga53_dac1_armed;
+}
+
+/* Write one scope-engine register, in the shape the arm sequence uses: SPI3
+ * dropped to /256 (~470 kHz), one CS frame per register, the fast divider
+ * restored afterwards. The five arm writes went out this way and are the only
+ * evidence we have that these registers take at this clock; sending them at /8
+ * never armed anything (journal, 2026-08-13). These are SCOPE-ENGINE opcodes,
+ * not Gowin config-port opcodes, and writing them to a live design is
+ * bench-proven safe.
+ *
+ * Register 0x08 is believed to be the digital trigger level, offset-binary,
+ * with the arm sequence's 0xAD meaning level 0x2D. That reading came from this
+ * project and has never been tested by changing it — which is what the shell's
+ * `trigreg` exists for. */
+uint8_t fpga53_scope_reg_write(uint8_t reg, uint8_t value) {
+    uint32_t ctrl1_saved;
+
+    if (!fpga_loaded) {
+        return 0u;
+    }
+    ctrl1_saved = SPI_CTRL1(SPI3_BASE);
+    SPI_CTRL1(SPI3_BASE) &= ~(1u << 6);                                /* SPE=0 */
+    SPI_CTRL1(SPI3_BASE) = (SPI_CTRL1(SPI3_BASE) & ~(7u << 3)) | (7u << 3); /* /256 */
+    SPI_CTRL1(SPI3_BASE) |= 1u << 6;                                   /* SPE=1 */
+
+    gpio_clear(GPIOB_BASE, 1u << 6);
+    (void)fpga53_xfer(reg);
+    (void)fpga53_xfer(value);
+    gpio_set(GPIOB_BASE, 1u << 6);
+    delay_ms(2);
+
+    SPI_CTRL1(SPI3_BASE) &= ~(1u << 6);
+    SPI_CTRL1(SPI3_BASE) = ctrl1_saved;
+    SPI_CTRL1(SPI3_BASE) |= 1u << 6;
+    if (reg == 0x08u) {
+        fpga53_trig_level = value;
+    }
+    return 1u;
+}
+
+uint8_t fpga53_trig_level_get(void) {
+    return fpga53_trig_level;
 }
 
 /* Stock's coarse relay/attenuator ladder, ONE table shared by both channels
@@ -1102,14 +1192,19 @@ void fpga_init_once(void) {
                            (1u << 1) | (1u << 0);
     SPI_CTRL1(SPI3_BASE) |= 1u << 6; // SPE
 
-    /* Scope trigger comparator reference: stock programs DAC1 (PA4,
-     * DHR12R1 @ 0x40007408). The MCU reset during the warm handoff zeroed
-     * it, which would leave the FPGA trigger with a 0V reference. Restore
-     * a mid-scale level. */
+    /* CH1's vertical-offset reference: DAC1 (PA4, DHR12R1 @ 0x40007408). An
+     * MCU reset zeroes it, which leaves the channel without a reference and
+     * the frames empty — restoring it is what produced this port's first live
+     * trace (journal, 2026-08-12). That entry calls DAC1 "the trigger level";
+     * it is the OFFSET injector. Measured here 2026-09-06 the same way CH2's
+     * TMR13 code was: the code moves the CH1 baseline linearly and does not
+     * gate frames. The digital trigger level is a different thing, SPI3
+     * register 0x08. */
     RCC_APB1ENR |= 1u << 29; // DAC
     gpio_config_mask(GPIOA_BASE, 1u << 4, 0x0); // PA4 analog
     REG32(0x40007400u) |= 1u;                   // DAC_CR: EN1
-    REG32(0x40007408u) = 2048u;                 // DHR12R1 mid-scale
+    REG32(0x40007408u) = fpga53_ch1_ref_code;   // DHR12R1
+    fpga53_dac1_armed = 1u;
 
     fpga53_tmr13_ref_apply();
 

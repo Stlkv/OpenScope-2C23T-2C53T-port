@@ -1697,3 +1697,75 @@ migration path was not observed firing either: this unit came up centered, which
 is equally consistent with having no saved CH2 rows at all. A save into a full
 settings page and the meter-mode guard in `ch2ref` remain untested for the same
 reasons as yesterday.
+
+## CH1 centers at 2467, and register 0x08 shows nothing without a signal (2026-09-06)
+
+Two jobs from the same session: give CH1 the treatment CH2 got yesterday, and
+find out whether the digital trigger level this project has been attributing to
+scope-engine register 0x08 does anything.
+
+### CH1's centering code
+
+`ch1ref <0-4095>` was added beside `ch2ref` — one handler, two peripherals
+(DAC1 on PA4, TMR13 PWM on PA6) — and CH1 now flows through the same
+`scope_bias[0][range]` path, presets at boot and follows the range.
+
+Measured, no signal on the probe, three dumps per point, envelope midpoint:
+
+| code | CH1 envelope | midpoint | CH2 (control) |
+|---|---|---|---|
+| 2048 | 74-77   | 75.5  | 127-130 |
+| 2440 | 124-127 | 125.5 | 127-130 |
+| 2462 | 124-130 | 127.0 / 126.5 | 127-130 |
+| 2465 | 125-130 | 127.5 | 127-130 |
+| 2467 | 126-130 | 128.0 / 128.0 / 129.0 | 127-130 |
+| 2470 | 128-130 | 129.0 / 129.5 | 127-130 |
+| 2560 | 139-142 | 140.5 | 127-130 |
+| 3072 | 204-207 | 205.5 | 127-130 |
+
+**2467 centers CH1**, three runs reading 128.0/128.0/129.0. Slope over the wide
+span is (205.5-75.5)/1024 = **0.1270 ADC per code** against CH2's 0.1274 — the
+same front end, as expected, and a useful cross-check that nothing about the
+DAC-versus-PWM difference changes the vertical scale. CH2 sat at 127-130 through
+every CH1 code: the control.
+
+**Mid-scale was never centre on this channel either.** 2048 leaves CH1 at 75.5,
+which is where this port has been running since the first live trace — the
+journal entry from 2026-08-12 that calls DAC1 "the trigger level" was describing
+the offset injector, and restoring it to mid-scale was enough to make frames
+non-empty, so nobody looked further. Both channels are now centered by measured
+per-unit codes: CH1 2467, CH2 2501.
+
+### Register 0x08: no effect that a signal-free bench can see
+
+`trigreg [0-255]` writes scope-engine register 0x08 in the arm sequence's shape
+(SPI3 at /256, one CS frame, fast divider restored). The claim under test is
+this project's own, quoted back to us in upstream's `fpga.c`: that 0x08 carries
+the digital trigger level, offset-binary, the arm value 0xAD meaning level 0x2D.
+Nothing had ever changed it.
+
+Counters over 3 s per value, CH1 centered at 128 with nothing on the probe:
+
+| reg 0x08 | Δreads | Δframes | Δwaits | CH1 envelope |
+|---|---|---|---|---|
+| 0xAD (arm value) | 62 | 62 | 0 | 126-130 |
+| 0x00 | 63 | 63 | 0 | 126-130 |
+| 0xFF | 62 | 62 | 0 | 126-130 |
+| 0x80 | 62 | 62 | 0 | 126-130 |
+| 0xAD again | 62 | 62 | 0 | 126-130 |
+
+**Nothing moves** — not the frame rate, not the wait count, not the envelope,
+at either extreme of the register.
+
+**This is inconclusive, not negative, and the difference matters.** Three
+readings survive it: the engine free-runs and never gates on a trigger (this
+port reads windows unconditionally under `FPGA53_READ_PACED`, so a gate would
+have to show up as content, not availability); 0x08 is not the trigger level;
+or it is, and with a flat input there is nothing for a trigger to align. The
+test cannot separate them. What would: a signal on CH1 and a look at whether the
+window's alignment tracks the level — a stable waveform against a sliding one.
+Until then the UI's trigger knob stays unwired, because wiring it would ship a
+causal claim we have not earned.
+
+The dump has no `Q`/`SS` field in this build, so the engine's `0x03` status reply
+could not be used as a second witness.

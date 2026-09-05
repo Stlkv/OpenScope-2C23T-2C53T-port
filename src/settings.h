@@ -39,6 +39,12 @@ enum {
      * default here; the calibrated value lives in scope_bias[1][range] like
      * every other per-unit offset. */
     SETTINGS_SCOPE_BIAS_CH2_2C53T_DEFAULT = 2501,
+    /* CH1's reference IS a true 12-bit DAC, and mid-scale still is not centre:
+     * on bench unit #2, 2048 leaves the channel at ADC 75. Measured 2026-09-06
+     * the same way CH2's was — 2048 -> 75.5, 2560 -> 140.5, 3072 -> 205.5, a
+     * slope of 0.1270 ADC per code (CH2's is 0.1274, the same front end) — and
+     * 2467 reads 128.0/128.0/129.0 over three runs. Per-unit, like CH2's. */
+    SETTINGS_SCOPE_BIAS_CH1_2C53T_DEFAULT = 2467,
 };
 
 typedef struct {
