@@ -712,6 +712,22 @@ static char *hex_word_or_dashes(char *p, uint8_t present, uint16_t v) {
     return hex_n(p, v, 4u);
 }
 
+/* Queue one raw meter word from the shell, for bench work only.
+ *
+ * Stock's mode-init dispatcher walks a BANK of one-byte commands per state,
+ * not a single selector: state 9 (the extended slot capacitance shares with
+ * temperature) queues 0x00, 0x12, 0x13, 0x14, 0x09 and then the probe-detect
+ * command (upstream RE, meter_mode_command_table_2026_06_05.md, the TBH state
+ * map at 0x0800B926). This port sends the 0x0512 selector and nothing else,
+ * and on the bench 10 nF and 100 nF return the blank/OL frame family while
+ * 100 uF returns a value that ramps instead of settling. Whether the missing
+ * bank is the reason is what this command exists to find out — it pushes into
+ * the same sequence queue the transition uses, so the word goes out on a tick
+ * with the transport's own pacing rather than from the shell's stack. */
+void dmm53_debug_send(uint8_t hi, uint8_t lo) {
+    dmm53_seq_push(hi, lo, 20u);
+}
+
 const char *dmm53_debug_line(uint8_t idx) {
     static char line[5][56];
     char *p;

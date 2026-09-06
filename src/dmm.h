@@ -28,3 +28,5 @@ void dmm_uart_irq_handler(void);
  *   3 — transition plan: selector/apply words, planned vs live frontend mask
  *   4 — firmware-update path state (not drawn; CDC `fwstat` covers it) */
 const char *dmm53_debug_line(uint8_t idx);
+/* Bench only: queue one raw meter command word (see dmm53.c). */
+void dmm53_debug_send(uint8_t hi, uint8_t lo);

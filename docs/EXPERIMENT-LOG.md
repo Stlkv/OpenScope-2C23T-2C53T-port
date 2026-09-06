@@ -1828,3 +1828,53 @@ Two host fixtures failed on the change and deserved to: they encoded the band in
 Both now carry the measured range bits, the "unknown band" case moved to both
 range bits set at once (a pattern this bench has never seen), and a new case
 locks today's bug in place: raw 2981 with frame[7]=0x04 must read 298.1 kΩ.
+
+## Capacitance does not measure at all — and the number it shows is a free-running counter (2026-09-06)
+
+Bench report: 10 nF and 100 nF do not measure. They do not — and the modes that
+appear to work do not either.
+
+**What the meter actually returns, measured on unit #2** (submode 9, plan line
+`P5 S9/5 C---- W0512 A---- G0AA/0AA`, i.e. the port commands capacitance and the
+frontend pose it planned is the pose that is live):
+
+| connected | frames |
+|---|---|
+| 10 nF | blank/OL family `5A A5 E4 2E 63 25 07 00 …`, no value, indefinitely |
+| 100 nF | same |
+| 1 uF | same (user report) |
+| 10 uF | values that ramp continuously and wrap past 9999 |
+| 100 uF | same |
+
+**The ramp is not a measurement.** Timed on the wire: 10 uF ramps at **44
+counts/s**, 100 uF at **44.3 counts/s** (629 counts over 14.2 s). A charge-time
+measurement would scale with C; this does not scale at all. Whatever the SoC is
+reporting in capacitance mode, it is a free-running counter, and the reading a
+user sees ("437.4 nF" and climbing) is that counter formatted as nanofarads by
+our static per-submode decimal point.
+
+**Refuted here: the missing command bank.** Stock's mode-init dispatcher walks a
+bank per state, and state 9 — the extended slot capacitance shares with
+temperature — queues `0x00, 0x12, 0x13, 0x14, 0x09` plus the probe-detect
+command (upstream RE, `meter_mode_command_table_2026_06_05.md`, TBH table at
+`0x0800B926`). This port sends only the `0x0512` selector. A new bench command,
+`meterc <hi> <lo>`, queues a raw meter word through the same sequence the
+transition uses; sending `00 13`, `00 14` and `00 09` with 10 nF connected
+changed nothing — the blank frames continued. Control: the queue counter `Q`
+advanced on every send, so the words reached the wire.
+
+That refutes the bank as an after-the-fact fix. It does NOT refute the bank as
+part of mode entry — stock queues it while entering the state, and this port
+would have to put the words into the transition sequence to test that.
+
+**What is left, and what would decide it.** Capacitance and temperature share
+stock selector slot 5, and the RE notes say plainly that the split is not
+selector-proven and that no recovered writer splits them inside the slot. Two
+candidates survive: the analog pose is wrong for this function (the port
+projects one pose onto both), or the bank belongs in the transition. A pose
+sweep with a success criterion of "the ramp stops" is the cheap test; flashing
+stock and measuring the same 10 nF is the expensive one that would say whether
+this unit can measure small capacitance at all.
+
+Not claimed: which of those it is. The decoder side is not implicated — no
+decimal point or unit table can rescue a counter that ignores the capacitor.

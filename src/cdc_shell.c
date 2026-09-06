@@ -215,6 +215,7 @@ static void cmd_help(const char *args) {
            "  ch1ref [0-4095|save]         CH1 offset reference (DAC1, PA4)\r\n"
            "  ch2ref [0-4095|save]         CH2 offset reference (TMR13 PWM, PA6)\r\n"
            "  trigreg [0-255]              scope-engine reg 0x08 (trigger level?)\r\n"
+           "  meterc <hi> <lo>             queue one raw meter command word\r\n"
            "  uptime                       ms since boot\r\n");
 }
 
@@ -605,6 +606,26 @@ static void cmd_trigreg(const char *args) {
     sh_out("\r\n");
 }
 
+/* Bench probe for the meter's command bank: `meterc <hi> <lo>`, both decimal
+ * or 0x-prefixed. Stock's state-9 bank is 0x00 0x12 / 0x00 0x13 / 0x00 0x14 /
+ * 0x00 0x09; this port only ever sends the 0x0512 selector. */
+static void cmd_meterc(const char *args) {
+    const char *p = skip_spaces(args);
+    uint32_t hi, lo;
+
+    if (!parse_hex32(&p, &hi) || hi > 255u ||
+        !parse_hex32(&p, &lo) || lo > 255u || *skip_spaces(p) != '\0') {
+        sh_out("usage: meterc <hi> <lo>   (e.g. meterc 00 13)\r\n");
+        return;
+    }
+    dmm53_debug_send((uint8_t)hi, (uint8_t)lo);
+    sh_out("meterc queued ");
+    sh_hex(hi, 2);
+    sh_out(" ");
+    sh_hex(lo, 2);
+    sh_out("\r\n");
+}
+
 static void cmd_ch1ref(const char *args) { cmd_chref(args, 0u); }
 static void cmd_ch2ref(const char *args) { cmd_chref(args, 1u); }
 
@@ -640,6 +661,9 @@ static const sh_cmd_t sh_cmds[] = {
     { "ch2ref", cmd_ch2ref },
     { "ch1ref", cmd_ch1ref },
     { "trigreg", cmd_trigreg },
+#if HW_TARGET_2C53T
+    { "meterc", cmd_meterc },
+#endif
 #endif
     { "uptime", cmd_uptime },
     { 0, 0 },
