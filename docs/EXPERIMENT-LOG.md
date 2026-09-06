@@ -1769,3 +1769,62 @@ causal claim we have not earned.
 
 The dump has no `Q`/`SS` field in this build, so the engine's `0x03` status reply
 could not be used as a second witness.
+
+## The resistance range is in frame[7], not frame[6] (2026-09-06)
+
+Bench report: 2.2 kΩ and 10 kΩ read correctly, 300 kΩ read **90.62 Ω**. The
+number was not noise — it was raw 2981 multiplied by the low-Ω coefficient
+0.0304, i.e. a stable, plausible, wrong number of exactly the kind this project
+keeps producing when a band is decided by the wrong field.
+
+### What was wrong
+
+The decoder picked the resistance band from the upper nibble of `frame[6]`:
+nibble 0 → low-Ω (× 0.0304 Ω), nibble 4 → kΩ (× 0.001 kΩ). **That field cannot
+carry the band**: measured here, a shorted probe and a 300 kΩ resistor both
+report nibble 0, six orders of magnitude apart. The kΩ resistors happened to
+report nibble 4, which is why only the high range was visibly broken.
+
+### What actually carries it
+
+`frame[7]`, bits 3 and 2 — a clean three-way, measured across every state this
+bench could produce:
+
+| probe | frame[7] | raw | decoded | nominal | error |
+|---|---|---|---|---|---|
+| shorted | 0x28 (bit 3) | 15-17 | 0.456-0.517 Ω | 0 | — |
+| 2.2 kΩ | 0x20 (neither) | 2167-2175 | 2.167-2.175 kΩ | 2.2 kΩ | −1.5% |
+| 10 kΩ | 0x20 | 9932-9936 | 9.932-9.936 kΩ | 10 kΩ | −0.6% |
+| 300 kΩ | 0x24 (bit 2) | 2981-2982 | 298.1-298.2 kΩ | 300 kΩ | −0.6% |
+| 470 kΩ | 0x24 | 4666 | 466.6 kΩ | 470 kΩ | −0.7% |
+| 1 MΩ | 0x24 | 9729-9730 | 972.9-973.0 kΩ | 1 MΩ | −2.7% |
+| open | 0x00 | — | OL | — | — |
+
+So: bit 3 → low-Ω range, factory coefficient 0.0304 Ω per count; bit 2 → high
+range, **0.1 kΩ (100 Ω) per count**; neither → kΩ range, 1 Ω per count. The kΩ
+and high ranges sit exactly two decades apart, which is what a range switch
+should look like. The low-Ω range does not, and is not expected to.
+
+**Refuted along the way:** `frame[8].7` was the first candidate for the range
+marker — it is set at 300 kΩ. It is also set at 2.2 kΩ and clear at 10 kΩ, both
+of which decode correctly, so it marks something else entirely.
+
+**Weaknesses, stated:** the high-range multiplier rests on three points, all
+from 5%-tolerance resistors. Two of them agree at −0.6/−0.7%, the 1 MΩ point is
+−2.7% — either that resistor's own tolerance or nonlinearity near full scale
+(9730 of 9999 counts), and 5% parts cannot tell those apart. A reference
+resistor or a second meter would settle it. No fourth (MΩ) range appeared: at
+1 MΩ the SoC is still in the high range, so where it switches next is unknown.
+
+### Verified after the fix, on hardware
+
+Same probes, same session, firmware reflashed: 1 MΩ → 973.0 kΩ, 10 kΩ → 9.936,
+2.2 kΩ → 2.175, shorted → 0.486 Ω, open → OL. The three bands that already
+worked are unchanged; the high range now decodes instead of reading as tens of
+ohms.
+
+Two host fixtures failed on the change and deserved to: they encoded the band in
+`frame[6]` with `frame[7]` left at zero — a frame the hardware does not produce.
+Both now carry the measured range bits, the "unknown band" case moved to both
+range bits set at once (a pattern this bench has never seen), and a new case
+locks today's bug in place: raw 2981 with frame[7]=0x04 must read 298.1 kΩ.

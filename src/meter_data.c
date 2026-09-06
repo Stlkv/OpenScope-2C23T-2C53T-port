@@ -218,6 +218,7 @@ static const float bar_full_scale[METER_SUBMODE_COUNT] = {
 
 #define METER_CAL_LOW_OHM_FACTOR  0.0304f   /* raw_bcd × this = Ω, low band */
 #define METER_CAL_KOHM_FACTOR     0.001f    /* raw_bcd × this = kΩ, mid band */
+#define METER_CAL_HIGH_KOHM_FACTOR 0.1f      /* raw_bcd × this = kΩ, high band */
 
 /* ═══════════════════════════════════════════════════════════════════
  * 4-digit float → string formatter (newlib-nano has no %f support)
@@ -966,8 +967,38 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
      * identity (raw counts already expressed in Ω, shifted to kΩ) and
      * should be stable across units.
      *
-     * Higher bands (MΩ, autorange to 200 kΩ / 2 MΩ) are not yet
-     * characterized — those will need additional upper-nibble cases.
+     * ⚠ CORRECTED 2026-09-06 — frame[6] IS NOT THE BAND. Measured on bench
+     * unit #2 across five states, the upper nibble of frame[6] cannot separate
+     * the bands it was being asked to: a shorted probe and a 300 kΩ resistor
+     * both report nibble 0, six orders of magnitude apart. That is exactly the
+     * bug the bench hit — 300 kΩ came out as 90.62 Ω, because raw 2981 took
+     * the low-Ω coefficient.
+     *
+     * THE RANGE IS IN frame[7], bits 3 and 2, and it is a clean three-way:
+     *
+     *   f7 & 0x08  low-Ω range   raw × 0.0304 Ω   (per-device coefficient)
+     *   f7 & 0x04  high range    raw × 0.1 kΩ     (100 Ω per count)
+     *   neither    kΩ range      raw × 0.001 kΩ   (1 Ω per count)
+     *
+     * Measured, one session, probes swapped by hand (frame, raw -> reading):
+     *   short   f7=0x28  raw   15 -> 0.456 Ω
+     *   2.2 kΩ  f7=0x20  raw 2167 -> 2.167 kΩ
+     *   10 kΩ   f7=0x20  raw 9936 -> 9.936 kΩ
+     *   300 kΩ  f7=0x24  raw 2981 -> 298.1 kΩ   (nominal 300 kΩ, -0.6%)
+     *   470 kΩ  f7=0x24  raw 4666 -> 466.6 kΩ   (nominal 470 kΩ, -0.7%)
+     *   open    f7=0x00           -> OL, handled earlier
+     *
+     * The kΩ and high ranges sit exactly two decades apart, which is what a
+     * range switch should look like; the low-Ω range does not, and it is not
+     * expected to — it carries a factory coefficient rather than a decade.
+     * The two high-range points agree on the multiplier and are both ~0.65%
+     * low, which two 5%-tolerance resistors cannot resolve into a gain error.
+     *
+     * frame[8].7 was tested as the range marker first and REFUTED: it is set
+     * at 2.2 kΩ and clear at 10 kΩ, both of which decode correctly.
+     *
+     * Bands above this one (MΩ) remain uncharacterised — if a fourth range
+     * exists it will show up as a frame[7] pattern that is neither of these.
      *
      * We leave raw_bcd, decimal_pos, and digits[] untouched so the
      * debug overlay at meter_ui.c:948 still shows the FPGA's raw
@@ -977,12 +1008,17 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
     if (submode == 6 || submode == 7) {
         float       scale = 0.0f;
         const char *unit  = NULL;
+        uint8_t     range = frame[7] & 0x0Cu;
 
-        switch (f6 & 0xF0) {
-        case 0x00:  scale = METER_CAL_LOW_OHM_FACTOR; unit = "Ohm";  break;
-        case 0x40:  scale = METER_CAL_KOHM_FACTOR;    unit = "kOhm"; break;
-        default:    break;  /* Unknown band — leave format_reading's output */
+        if (range == 0x08u) {
+            scale = METER_CAL_LOW_OHM_FACTOR; unit = "Ohm";
+        } else if (range == 0x04u) {
+            scale = METER_CAL_HIGH_KOHM_FACTOR; unit = "kOhm";
+        } else if (range == 0x00u) {
+            scale = METER_CAL_KOHM_FACTOR; unit = "kOhm";
         }
+        /* 0x0C — both bits at once — is a pattern this bench has never seen.
+         * Leave format_reading's output rather than guess a fourth range. */
 
         if (scale != 0.0f) {
             float v = (float)r->raw_bcd * scale;

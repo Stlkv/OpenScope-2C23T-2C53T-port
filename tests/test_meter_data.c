@@ -899,13 +899,26 @@ static int test_port_resistance_band_calibration_override(void)
     uint8_t frame[12];
 
     meter_data_init();
-    build_segment_frame(frame, 4, 8, 2, 4, 0x00, 0x00, 0x00, 0x00, 0);
+    /* The range lives in frame[7] bits 3:2, not in frame[6] — measured on
+     * unit #2, 2026-09-06, where a shorted probe and a 300 kOhm resistor both
+     * report frame[6] upper nibble 0. Low-Ohm range: bit 3. */
+    build_segment_frame(frame, 4, 8, 2, 4, 0x00, 0x08, 0x00, 0x00, 0);
     process_frame(frame, 6);
     ASSERT(meter_reading.valid);
     ASSERT(meter_reading.result_class == METER_RESULT_NORMAL);
     ASSERT_STR_EQ(meter_reading.unit_suffix, "Ohm");
     /* 4824 * 0.0304 = 146.65 */
     ASSERT(close_to(meter_reading.value, 146.65f, 0.05f));
+
+    /* High range: bit 2, 100 Ohm per count. This is the bench failure of
+     * 2026-09-06 — a 300 kOhm resistor read 90.62 Ohm because raw 2981 took
+     * the low-Ohm coefficient. Measured on hardware: raw 2981 -> 298.1 kOhm,
+     * and 470 kOhm -> raw 4666 -> 466.6 kOhm. */
+    build_segment_frame(frame, 2, 9, 8, 1, 0x00, 0x04, 0x00, 0x00, 0);
+    process_frame(frame, 6);
+    ASSERT(meter_reading.valid);
+    ASSERT_STR_EQ(meter_reading.unit_suffix, "kOhm");
+    ASSERT(close_to(meter_reading.value, 298.1f, 0.05f));
 
     build_segment_frame(frame, 3, 3, 0, 0, 0x40, 0x00, 0x00, 0x00, 0);
     process_frame(frame, 6);
@@ -951,7 +964,10 @@ static int test_session_begin_resets_band_latch_on_same_mode_reentry(void)
     uint8_t unknown_band_frame[12];
 
     build_segment_frame(kohm_frame, 3, 3, 0, 0, 0x40, 0x00, 0x00, 0x00, 0);
-    build_segment_frame(unknown_band_frame, 3, 3, 0, 0, 0x20, 0x00, 0x00, 0x00, 0);
+    /* Unknown range = both frame[7] range bits at once, a pattern the bench
+     * has never seen (it used to be frame[6] upper nibble 2, back when the
+     * band was read from frame[6]). */
+    build_segment_frame(unknown_band_frame, 3, 3, 0, 0, 0x20, 0x0C, 0x00, 0x00, 0);
 
     meter_session_begin(&session, 6);
     meter_session_frame(&session, kohm_frame);
