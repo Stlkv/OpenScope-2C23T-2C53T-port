@@ -71,6 +71,11 @@ enum {
     /* Pseudo-opcode in the step queue: apply the analog frontend for the
      * submode in .lo instead of sending a word. */
     DMM53_STEP_FRONTEND = 0xFFu,
+    DMM53_STEP_WAIT_RX = 0xFEu, /* hold until the SoC's first data frame arrives */
+    DMM53_STEP_SELECTOR = 0xFDu, /* send .lo as 0x05xx, repeat until echoed */
+    DMM53_WAIT_RX_MAX_MS = 2500,
+    DMM53_ECHO_WAIT_MS = 300,
+    DMM53_SELECTOR_TRIES = 6,
 };
 
 /* Auxiliary AFE pins PB9/PA6.
@@ -196,13 +201,62 @@ static uint8_t uart_wait_txe(void) {
 }
 
 static uint16_t dmm53_tx_count;
+/* Steady-state poll period. 0 by default since 2026-09-07: the SoC streams
+ * data frames on its own (D kept climbing with the poll off, 23:21) and never
+ * echoed (0x00, 0x09) even once the header was right — the byte 0x09 stock
+ * queues is an LCD-redraw command, not meter traffic. The knob stays for the
+ * bench. */
+static uint16_t dmm53_poll_period_ms = 0;
+
+/* Frame bytes the stock image does not let us read. dvom_TX (stock
+ * 0x0803E3F4) writes only [2]=hi, [3]=lo, [9]=hi+lo into a buffer at
+ * 0x20000005 whose initial contents come from .data — and the .data region
+ * table (0x080BE314) lies past the end of the downloadable image, so bytes
+ * [0],[1] and [4..8] are unknown, not proven zero. The SoC has never answered
+ * an echo frame to anything this port or upstream sent, while its own frames
+ * carry 5A A5 / AA 55 headers. These knobs exist to find the header on the
+ * bench: `meterhdr` sets them, `meterscan` sweeps them. */
+static uint8_t dmm53_hdr[2] = { 0xAAu, 0x55u };
+/* Bytes [4..8]: zero. The factory .data image for the stock TX buffer
+ * (flash 0x080BE480 -> RAM 0x20000005..0x2000000E, read off unit #2 on
+ * 2026-09-07) is AA 55 05 43 0A 40 13 12 7A 12 — but sending 0A 40 13 12 7A
+ * in [4..8] makes the SoC ignore every word (no echo at all), while zeros
+ * are echoed and switch modes. So the SoC checks those bytes (most likely a
+ * checksum over [2..8], which stock's hi+lo only satisfies when [4..8] are
+ * zero), and stock must clear them before its meter words go out; the image
+ * value is an initializer for some other frame (command 0x43 with
+ * parameters), not a constant tail. Kept as a knob for that experiment. */
+static uint8_t dmm53_tail[5] = { 0u, 0u, 0u, 0u, 0u };
+static uint8_t dmm53_byte4 = 0u;
+static uint8_t dmm53_cs_mode; /* 0: [9] = hi+lo (stock dvom_TX); 1: sum of [0..8] */
+static uint8_t dmm53_scan_on;
+static uint16_t dmm53_scan_idx;
+static uint16_t dmm53_scan_hits;
+static uint16_t dmm53_scan_first;
+static uint16_t dmm53_scan_echo_ref;
+static uint16_t dmm53_scan_last_sent;
 
 /* Blocking 10-byte command send (~10.4ms at 9600) — called from tick, not ISR. */
 static void dmm53_send_cmd(uint8_t cmd_hi, uint8_t cmd_lo) {
     uint8_t frame[DMM53_TX_LEN] = {0};
+    frame[0] = dmm53_hdr[0];
+    frame[1] = dmm53_hdr[1];
     frame[2] = cmd_hi;
     frame[3] = cmd_lo;
-    frame[9] = (uint8_t)(cmd_hi + cmd_lo);
+    frame[4] = dmm53_byte4;
+    frame[5] = dmm53_tail[1];
+    frame[6] = dmm53_tail[2];
+    frame[7] = dmm53_tail[3];
+    frame[8] = dmm53_tail[4];
+    if (dmm53_cs_mode) {
+        uint8_t cs = 0;
+        for (uint8_t i = 0; i < 9u; ++i) {
+            cs = (uint8_t)(cs + frame[i]);
+        }
+        frame[9] = cs;
+    } else {
+        frame[9] = (uint8_t)(cmd_hi + cmd_lo);
+    }
     ++dmm53_tx_count;
     for (uint8_t i = 0; i < DMM53_TX_LEN; ++i) {
         if (!uart_wait_txe()) {
@@ -218,6 +272,75 @@ static uint8_t dmm53_probe_cmd(void) {
 }
 
 static uint8_t dmm53_plan_submode(void);
+static void dmm53_apply_mux(fpga_meter_mux_gpio_state_t *mux);
+
+static uint8_t dmm53_wait_armed;
+static uint16_t dmm53_wait_ref;
+static uint16_t dmm53_wait_ms;
+static uint8_t dmm53_sel_tries;
+static uint16_t dmm53_sel_echo_ref;
+static uint16_t dmm53_sel_ms;
+static uint8_t dmm53_sel_sent;
+
+/* Selector words as the SoC actually answers them, bench unit #2, 2026-09-07,
+ * one word at a time with the AA 55 header, echo counted per word, the
+ * SoC's frame read as the seven-segment text it is (see meter_data.c):
+ *
+ *   0x0514  "Auto"; with an input, a value               -> auto
+ *   0x050C  4.382 -> 0.005 V when the cap is pulled, f8=0x82 -> DC volts
+ *   0x050D  0000, f8=0x82                              -> AC volts (hypothesis)
+ *   0x050A  "9.576" on a 10 nF, "9.66" on a 10 uF, "0000" open, f7=0x10
+ *                                                      -> CAPACITANCE
+ *   0x050B  " 0L " open and on a 10 nF (f7=0x24, high-ohm range), ohm-like
+ *           ramp on a 10 uF                            -> resistance
+ *   0x0512  "  27" / "  28", f8=0x20                   -> temperature (internal)
+ *   0x0513  "L1uE"                                     -> LIVE (NCV), not a
+ *           measurement: the same frame with 10 uF, 10 nF and open probes
+ *   0x0510 / 0x0511 / 0x0515 / 0x0516  0003/0003/0007/0008, f8 0x81/01/81/01
+ *                                                      -> the four current modes
+ *   0x0517  " 0L ", f7=0x28 (low-ohm range) open and on a cap -> CONTINUITY
+ *   0x050E  " 0L ", f8=0x02                             -> DIODE
+ *   0x0511 / 0x0516  small (mA) current, DC / AC
+ *   0x0510 / 0x0515  large (A) current, DC / AC
+ *   0x050F  "0000", f8=0x04: accepted by the SoC, never sent by stock.
+ *
+ * Stock V1.2.0's meter, walked with its own logger on 2026-09-07 (runs 2 and
+ * 3, labels as shown on its screen, words as it sent them): eight functions
+ *   Auto 0x14, DC Voltage 0x0C, Continuity 0x17, Resistance 0x0B,
+ *   Capacitance 0x0A, Temperature 0x12, Small DC current 0x11,
+ *   Large DC current 0x10
+ * (the selector table `14 0c 17 0b 0a 12 11 10` at 0x080BB3FC in UI order),
+ * and an AC/DC toggle inside four of them: DCV -> ACV 0x0D, Continuity ->
+ * Diode 0x0E, Small DC -> Small AC 0x16, Large DC -> Large AC 0x15. HOLD
+ * sends nothing to the SoC — it is the MCU's display.
+ *
+ * The 0x0A/0x0B swap was settled by logging stock's own TX frames from a
+ * code cave (mydevice/caplog): DCV 0x0C, then 0x17, 0x0B, 0x0A while the
+ * user walked the function list to Capacitance, 0x0B for resistance, 0x0A
+ * back to Capacitance. Stock moved no frontend pin for any of it — the ten
+ * relay/mux pins, PD12/PD13, PC1/PC2/PC4/PD2 all held still; the only GPIO
+ * traffic was the key-matrix scan (PA7/PA8, PB0, PC5/PC10, PE2/PE3) and a
+ * 1 ms pulse train on PB12.
+ *
+ * Upstream's table put the UI's capacitance on 0x0512 — the temperature word. */
+static uint16_t dmm53_selector_word(uint8_t ui_mode, uint16_t plan_word) {
+    switch (ui_mode) {
+    case 0:  return 0x0514u; /* AUTO DETECT: the SoC has a real auto */
+    case 1:  return 0x050Cu; /* DC VOLTAGE */
+    case 2:  return 0x050Du; /* AC VOLTAGE (hypothesis, see above) */
+    case 3:  return 0x050Bu; /* RESISTANCE (stock sends 0x0B, caplog 2026-09-07) */
+    case 4:  return 0x050Eu; /* DIODE (stock: Continuity's AC/DC toggle, caplog run3) */
+    case 5:  return 0x050Au; /* CAPACITANCE (stock sends 0x0A, caplog 2026-09-07) */
+    case 6:  return 0x0513u; /* LIVE WIRE: the SoC's NCV display */
+    case 7:  return 0x0517u; /* CONTINUITY (stock sends 0x17, caplog 2026-09-07) */
+    case 8:  return 0x0512u; /* TEMPERATURE */
+    case 9:  return 0x0515u; /* AC HIGH CURR: stock's Large AC current */
+    case 10: return 0x0510u; /* DC HIGH CURR: stock's Large DC current */
+    case 11: return 0x0516u; /* AC LOW CURR:  stock's Small AC current */
+    case 12: return 0x0511u; /* DC LOW CURR:  stock's Small DC current */
+    default: return plan_word;
+    }
+}
 
 /* Claim the frontend pins as push-pull outputs. Called on meter-mode entry,
  * not per transition: PA6 arrives from scope mode as the TMR13 PWM output and
@@ -285,24 +408,48 @@ static void dmm53_apply_frontend(uint8_t submode) {
     gpio_set(GPIOC_BASE, (1u << 6) | (1u << 11));
 
     (void)fpga_meter_mux_gpio_state_for_submode(submode, &mux);
-#if DMM53_AUX_AFE_HIGH
-    mux.pb9 = 1u;
-    mux.pa6 = 1u;
-#endif
-    dmm53_gpio_planned = dmm53_mux_mask_from_state(&mux);
+    dmm53_apply_mux(&mux);
+}
 
-    dmm53_write_level(GPIOC_BASE, 1u << 12, mux.pc12);
-    dmm53_write_level(GPIOE_BASE, 1u << 4, mux.pe4);
-    dmm53_write_level(GPIOE_BASE, 1u << 5, mux.pe5);
-    dmm53_write_level(GPIOE_BASE, 1u << 6, mux.pe6);
-    dmm53_write_level(GPIOA_BASE, 1u << 15, mux.pa15);
-    dmm53_write_level(GPIOA_BASE, 1u << 10, mux.pa10);
-    dmm53_write_level(GPIOB_BASE, 1u << 10, mux.pb10);
-    dmm53_write_level(GPIOB_BASE, 1u << 11, mux.pb11);
-    dmm53_write_level(GPIOB_BASE, 1u << 9, mux.pb9);
-    dmm53_write_level(GPIOA_BASE, 1u << 6, mux.pa6);
+/* Drive the ten frontend pins to one projected state and read them back. */
+static void dmm53_apply_mux(fpga_meter_mux_gpio_state_t *mux) {
+#if DMM53_AUX_AFE_HIGH
+    mux->pb9 = 1u;
+    mux->pa6 = 1u;
+#endif
+    dmm53_gpio_planned = dmm53_mux_mask_from_state(mux);
+
+    dmm53_write_level(GPIOC_BASE, 1u << 12, mux->pc12);
+    dmm53_write_level(GPIOE_BASE, 1u << 4, mux->pe4);
+    dmm53_write_level(GPIOE_BASE, 1u << 5, mux->pe5);
+    dmm53_write_level(GPIOE_BASE, 1u << 6, mux->pe6);
+    dmm53_write_level(GPIOA_BASE, 1u << 15, mux->pa15);
+    dmm53_write_level(GPIOA_BASE, 1u << 10, mux->pa10);
+    dmm53_write_level(GPIOB_BASE, 1u << 10, mux->pb10);
+    dmm53_write_level(GPIOB_BASE, 1u << 11, mux->pb11);
+    dmm53_write_level(GPIOB_BASE, 1u << 9, mux->pb9);
+    dmm53_write_level(GPIOA_BASE, 1u << 6, mux->pa6);
 
     dmm53_gpio_live = dmm53_mux_mask_live();
+}
+
+/* Bench only: put the frontend on an arbitrary pair of stock mux arms
+ * (PortC/E arm, PortA/B arm, 0-9 each) without rebuilding the transition,
+ * so a pose can be swept under a fixed selector word and a fixed input.
+ * Stock's two GPIO writers (FUN_080018a4 / FUN_08001a58) have ten arms
+ * each; the plan maps eight selector slots onto arms 0-7 and never reaches
+ * 8 or 9. Returns 0 when an arm is out of range or the meter is not up. */
+uint8_t dmm53_debug_pose(uint8_t ce, uint8_t ab) {
+    fpga_meter_mux_gpio_state_t mux;
+
+    if (!dmm53_powered) {
+        return 0;
+    }
+    if (!fpga_meter_mux_gpio_state_for_stock_mux_arms(ce, ab, &mux)) {
+        return 0;
+    }
+    dmm53_apply_mux(&mux);
+    return 1u;
 }
 
 /* Transport drain across a mode switch, the small local half of what stock
@@ -311,8 +458,13 @@ static void dmm53_apply_frontend(uint8_t submode) {
  * projection re-asserts PC11 on the next step. Stock also suspends its two
  * DVOM tasks — we have no tasks, the ISR plus this reset is the whole thing. */
 static void dmm53_reset_transport(void) {
+    /* PC11 is deliberately left where it is. Low, it stops the SoC's stream
+     * dead (bench 2026-09-07: rx_data_count frozen for 3 s in scope mode), and
+     * raising it again costs a SoC restart during which every word we send
+     * is lost — the 20 ms after the pose step used to carry the whole
+     * transition into that hole. dmm_pause() still drops it on leaving the
+     * meter, like stock's exit path does. */
     USART_CTRL1(USART2_BASE) &= ~USART_CTRL1_UE;
-    gpio_clear(GPIOC_BASE, 1u << 11);
     __asm__ volatile("cpsid i" ::: "memory");
     rx_index = 0;
     rx_data_ready = 0;
@@ -345,6 +497,7 @@ static void dmm53_begin_transition(uint8_t wake_preamble) {
     uint8_t probe = dmm53_probe_cmd();
 
     dmm53_plan = fpga_meter_transition_plan_for_submode(submode);
+    dmm53_plan.selector_word = dmm53_selector_word(dmm53_mode, dmm53_plan.selector_word);
     dmm53_seq_len = 0;
     dmm53_seq_pos = 0;
     dmm53_seq_timer_ms = 0;
@@ -352,6 +505,9 @@ static void dmm53_begin_transition(uint8_t wake_preamble) {
     dmm53_poll_timer_ms = 0;
     dmm53_transition_busy = 1u;
     dmm53_discard_frames = 0;
+    dmm53_wait_armed = 0;
+    dmm53_sel_sent = 0;
+    dmm53_sel_tries = 0;
 
     /* The previous mode's reading is not this mode's reading. A fresh session
      * drops it — plus the band latch and the f6 history — so the panel cannot
@@ -362,37 +518,35 @@ static void dmm53_begin_transition(uint8_t wake_preamble) {
 
     dmm53_reset_transport();
 
-    if (wake_preamble) {
-        /* Stock brings the meter up on the DCV pose before it names a mode. */
-        dmm53_seq_push(DMM53_STEP_FRONTEND, 0u, 20u);
-        dmm53_seq_push(0x05u, 0x08u, 10u);            /* configure */
-        dmm53_seq_push(0x05u, 0x09u, 10u);            /* start */
-        dmm53_seq_push(0x05u, probe, 10u);            /* PC7-gated probe tail */
-        dmm53_seq_push(0x05u, 0x14u, 20u);            /* variant setup */
-    }
-
+    /* The transition since 2026-09-07 is the pose and one selector word.
+     *
+     * Everything else the old sequence sent is gone, and for cause. The bench
+     * proved (once the frame header was right and the SoC finally echoed) that
+     * each 0x05xx word alone puts the SoC into a distinct mode; that 0x0509
+     * — the "start" word — is not a start at all but flips the display state
+     * to a fixed 0.000-shaped frame (00E0 E504) whatever mode was selected;
+     * that 0x050A is the resistance selector and not a "probe tail" (stock's
+     * 0x07/0x0A bytes are LCD battery-icon draws, chosen by PC7 = charger
+     * sense); and that 0x0508 does nothing visible. Stock's meter entry
+     * (0x0800E360) sends no words at all — the selector goes out when the
+     * user changes function. The plan's command-bank prefix bytes went to the
+     * LCD queue in stock too. */
+    (void)probe;
+    (void)wake_preamble;
     dmm53_seq_push(DMM53_STEP_FRONTEND, submode, dmm53_plan.settle_ms);
-
-    if (dmm53_plan.has_command_bank_prefix) {
-        dmm53_seq_push(0x00u, dmm53_plan.command_bank_first,
-                       dmm53_plan.settle_ms);
-        dmm53_seq_push(0x00u, dmm53_plan.command_bank_second,
-                       dmm53_plan.settle_ms);
-    }
-    if (dmm53_plan.has_config_word) {
-        dmm53_seq_push_word(dmm53_plan.config_word, dmm53_plan.settle_ms);
-    }
+    /* After the pose — every time, not only when PC11 just went high — wait
+     * for the SoC to produce a data frame, then a little more. With PC11 low
+     * the SoC is silent (bench: rx_data_count frozen), so on entry this is
+     * its boot time; on a mode change inside the meter the relays and gain
+     * keys just moved, and words sent 20 ms after that were never echoed
+     * while the same words sent from the shell into a quiet frontend were. */
+    dmm53_seq_push(DMM53_STEP_WAIT_RX, 0u, 200u);
     if (dmm53_plan.selector_word != FPGA_METER_INVALID_SELECTOR_WORD) {
-        dmm53_seq_push_word(dmm53_plan.selector_word, dmm53_plan.settle_ms);
-    }
-    if (dmm53_plan.has_apply_word) {
-        dmm53_seq_push_word(dmm53_plan.apply_word, dmm53_plan.settle_ms);
-    }
-    if (dmm53_plan.has_probe_detect) {
-        dmm53_seq_push(0x05u, probe, 10u);
-    }
-    if (dmm53_plan.start_word) {
-        dmm53_seq_push_word(dmm53_plan.start_word, dmm53_plan.settle_ms);
+        /* Echo-verified: the SoC acknowledges every accepted word with an
+         * AA 55 frame; no echo within DMM53_ECHO_WAIT_MS means the word was
+         * lost and it is sent again, up to DMM53_SELECTOR_TRIES times. */
+        dmm53_seq_push(DMM53_STEP_SELECTOR, (uint8_t)dmm53_plan.selector_word,
+                       dmm53_plan.settle_ms);
     }
 }
 
@@ -416,7 +570,48 @@ static void dmm53_seq_tick(uint32_t elapsed_ms) {
         return;
     }
 
-    step = &dmm53_seq[dmm53_seq_pos++];
+    step = &dmm53_seq[dmm53_seq_pos];
+    if (step->hi == DMM53_STEP_WAIT_RX) {
+        /* Sit on this step until the SoC has spoken since the pose went on,
+         * or the cap runs out; ticks are 20 ms, so re-check every tick. */
+        if (!dmm53_wait_armed) {
+            dmm53_wait_armed = 1u;
+            dmm53_wait_ref = rx_data_count;
+            dmm53_wait_ms = 0;
+        }
+        dmm53_wait_ms = (uint16_t)(dmm53_wait_ms + 20u);
+        if (rx_data_count == dmm53_wait_ref && dmm53_wait_ms < DMM53_WAIT_RX_MAX_MS) {
+            return;
+        }
+        dmm53_wait_armed = 0;
+        ++dmm53_seq_pos;
+        dmm53_seq_wait_ms = step->delay_ms;
+        return;
+    }
+    if (step->hi == DMM53_STEP_SELECTOR) {
+        if (!dmm53_sel_sent) {
+            dmm53_sel_echo_ref = rx_echo_count;
+            dmm53_send_cmd(0x05u, step->lo);
+            dmm53_sel_sent = 1u;
+            dmm53_sel_ms = 0;
+            ++dmm53_sel_tries;
+            return;
+        }
+        dmm53_sel_ms = (uint16_t)(dmm53_sel_ms + 20u);
+        if (rx_echo_count != dmm53_sel_echo_ref ||
+            dmm53_sel_tries >= DMM53_SELECTOR_TRIES) {
+            dmm53_sel_sent = 0;
+            dmm53_sel_tries = 0;
+            ++dmm53_seq_pos;
+            dmm53_seq_wait_ms = step->delay_ms;
+            return;
+        }
+        if (dmm53_sel_ms >= DMM53_ECHO_WAIT_MS) {
+            dmm53_sel_sent = 0; /* resend on the next tick */
+        }
+        return;
+    }
+    ++dmm53_seq_pos;
     if (step->hi == DMM53_STEP_FRONTEND) {
         dmm53_apply_frontend(step->lo);
     } else {
@@ -622,9 +817,35 @@ void dmm_tick(uint32_t elapsed_ms) {
         return;
     }
 
-    /* Steady state: poll (0x00, 0x09) at ~4 Hz. */
+    /* Bench header scan: one frame per tick, each with the next (b0,b1) pair,
+     * attributing any echo frame that arrived since the previous tick to the
+     * previous pair. 65536 pairs at 20 ms is ~22 minutes. The word sent is
+     * the DCV/AUTO selector 0x0514, the one stock emits most. */
+    if (dmm53_scan_on) {
+        if (rx_echo_count != dmm53_scan_echo_ref) {
+            dmm53_scan_echo_ref = rx_echo_count;
+            if (!dmm53_scan_hits) {
+                dmm53_scan_first = dmm53_scan_last_sent;
+            }
+            ++dmm53_scan_hits;
+        }
+        if (dmm53_scan_idx == 0xFFFFu) {
+            dmm53_scan_on = 0;
+        } else {
+            dmm53_hdr[0] = (uint8_t)(dmm53_scan_idx >> 8);
+            dmm53_hdr[1] = (uint8_t)dmm53_scan_idx;
+            dmm53_scan_last_sent = dmm53_scan_idx;
+            dmm53_send_cmd(0x05u, 0x14u);
+            ++dmm53_scan_idx;
+        }
+        dmm53_format_status();
+        return;
+    }
+
+    /* Steady state: poll (0x00, 0x09) at ~4 Hz — unless the bench turned the
+     * poll off (dmm53_poll_period_ms == 0) to see what the SoC does without it. */
     dmm53_poll_timer_ms = (uint16_t)(dmm53_poll_timer_ms + elapsed_ms);
-    if (dmm53_poll_timer_ms >= DMM53_POLL_MS) {
+    if (dmm53_poll_period_ms && dmm53_poll_timer_ms >= dmm53_poll_period_ms) {
         dmm53_poll_timer_ms = 0;
         dmm53_send_cmd(0x00u, 0x09u);
     }
@@ -712,20 +933,100 @@ static char *hex_word_or_dashes(char *p, uint8_t present, uint16_t v) {
     return hex_n(p, v, 4u);
 }
 
-/* Queue one raw meter word from the shell, for bench work only.
+/* Send one raw meter word from the shell, for bench work only.
  *
- * Stock's mode-init dispatcher walks a BANK of one-byte commands per state,
- * not a single selector: state 9 (the extended slot capacitance shares with
- * temperature) queues 0x00, 0x12, 0x13, 0x14, 0x09 and then the probe-detect
- * command (upstream RE, meter_mode_command_table_2026_06_05.md, the TBH state
- * map at 0x0800B926). This port sends the 0x0512 selector and nothing else,
- * and on the bench 10 nF and 100 nF return the blank/OL frame family while
- * 100 uF returns a value that ramps instead of settling. Whether the missing
- * bank is the reason is what this command exists to find out — it pushes into
- * the same sequence queue the transition uses, so the word goes out on a tick
- * with the transport's own pacing rather than from the shell's stack. */
+ * Sent right here when no transition is in flight. It used to be pushed onto
+ * the transition queue instead — but dmm_tick only walks that queue while
+ * dmm53_transition_busy, so after mode entry the words sat there (the meter
+ * line showed Q9/14, the queue full and its cursor parked) and nothing ever
+ * reached USART2. Every `meterc` result taken before 2026-09-06 22:50 is
+ * therefore VOID, including the "bank after entry changes nothing" note from
+ * the 06.09 session. While a transition is still draining, the word is
+ * appended to it so the two cannot interleave on the wire.
+ *
+ * History, so nobody re-runs it: this was written to test whether stock's
+ * "state 9 command bank" (0x00 0x12 0x13 0x14 0x09) was the missing part of
+ * capacitance mode. It is not, and the bank is not meter traffic at all. In
+ * stock V1.2.0 those bytes go to the one-byte display queue 0x20002D6C and
+ * dispatch through the table at 0x0804BE74 to LCD handlers (0x08010314,
+ * 0x080103F4, 0x08010584: rectangles at 0x20008350, strings from 0x080BCxxx,
+ * the LCD semaphore 0x20002D84), all gated on ms[0xF68] == 9 — and meter
+ * entry (0x0800E360) sets ms[0xF68] = 1, so state 9 is not even the meter
+ * screen. Nothing from that bank reaches USART2. Read on the stock image with
+ * objdump, 2026-09-06. */
 void dmm53_debug_send(uint8_t hi, uint8_t lo) {
-    dmm53_seq_push(hi, lo, 20u);
+    if (dmm53_transition_busy) {
+        dmm53_seq_push(hi, lo, 20u);
+        return;
+    }
+    dmm53_send_cmd(hi, lo);
+}
+
+/* Bench only: how many words have actually left USART2. */
+uint16_t dmm53_debug_tx_count(void) {
+    return dmm53_tx_count;
+}
+
+/* Bench only: does USART2 TX actually reach the PA2 pin? Sends ten 0x00 bytes
+ * (start bit + eight zero bits = the line low for 9 of every 10 bit times)
+ * while sampling GPIOA IDR bit 2 as fast as the core can, and returns
+ * (lows << 16) | samples. IDR reads the physical pin regardless of the AF
+ * mux, so lows == 0 means the USART's output never made it to the pin — a
+ * remap or another peripheral owning PA2 — while lows ~ 80-90% of samples
+ * means the MCU side is fine and the silence is beyond the isolator. */
+uint32_t dmm53_debug_tx_probe(void) {
+    uint32_t lows = 0, samples = 0;
+
+    for (uint8_t i = 0; i < DMM53_TX_LEN; ++i) {
+        if (!uart_wait_txe()) {
+            break;
+        }
+        USART_DT(USART2_BASE) = 0x00u;
+        for (uint32_t k = 0; k < 4000u; ++k) {
+            ++samples;
+            if (!(GPIO_IDR(GPIOA_BASE) & (1u << 2))) {
+                ++lows;
+            }
+        }
+    }
+    ++dmm53_tx_count;
+    return (lows << 16) | (samples & 0xFFFFu);
+}
+
+/* Bench only: TX frame header/byte4/checksum mode, see dmm53_hdr. */
+void dmm53_debug_set_header(uint8_t b0, uint8_t b1, uint8_t b4, uint8_t cs_mode) {
+    dmm53_hdr[0] = b0;
+    dmm53_hdr[1] = b1;
+    dmm53_byte4 = b4;
+    dmm53_cs_mode = cs_mode ? 1u : 0u;
+}
+
+/* Bench only: start/stop the header sweep; status via dmm53_debug_scan_status. */
+void dmm53_debug_scan(uint8_t on, uint16_t start) {
+    dmm53_scan_on = on ? 1u : 0u;
+    if (on) {
+        dmm53_scan_idx = start;
+        dmm53_scan_hits = 0;
+        dmm53_scan_first = 0;
+        dmm53_scan_echo_ref = rx_echo_count;
+        dmm53_scan_last_sent = start;
+    }
+}
+
+void dmm53_debug_scan_status(uint8_t *on, uint16_t *idx, uint16_t *hits, uint16_t *first) {
+    *on = dmm53_scan_on;
+    *idx = dmm53_scan_idx;
+    *hits = dmm53_scan_hits;
+    *first = dmm53_scan_first;
+}
+
+/* Bench only: set the steady-state poll period in ms (0 = stop polling).
+ * Whether the SoC keeps streaming without (0x00, 0x09), and whether a
+ * selector word takes effect once the poll stops repeating, are exactly the
+ * two questions this exists to answer. */
+void dmm53_debug_poll_period(uint16_t ms) {
+    dmm53_poll_period_ms = ms;
+    dmm53_poll_timer_ms = 0;
 }
 
 const char *dmm53_debug_line(uint8_t idx) {

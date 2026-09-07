@@ -164,7 +164,7 @@ static const uint8_t default_decimal_pos[METER_SUBMODE_COUNT] = {
     2,  /* 6: Resistance— 98.99 kΩ */
     3,  /* 7: Continuity— 198.9 Ω */
     1,  /* 8: Diode     — 0.623 V */
-    3,  /* 9: Capacitance— 198.9 nF */
+    3,  /* 9: Capacitance— 198.9 nF (default until a range frame is seen) */
     1,  /* 10: Temperature — no bench reading yet; keeps the old out-of-range
          * fallback so the row costs nothing it hasn't earned */
 };
@@ -216,9 +216,15 @@ static const float bar_full_scale[METER_SUBMODE_COUNT] = {
  *   5 V DC ref → 5.008 V  (unchanged, different submode)
  * ═══════════════════════════════════════════════════════════════════ */
 
-#define METER_CAL_LOW_OHM_FACTOR  0.0304f   /* raw_bcd × this = Ω, low band */
-#define METER_CAL_KOHM_FACTOR     0.001f    /* raw_bcd × this = kΩ, mid band */
-#define METER_CAL_HIGH_KOHM_FACTOR 0.1f      /* raw_bcd × this = kΩ, high band */
+/* WITHDRAWN 2026-09-07 (unit #2, real resistance word 0x050B): the SoC's own
+ * frame carries plain ohms with its own decimal point in the f7 = 0x20/0x28
+ * ranges — a shorted probe is the text " 0.17", a 2.2 kOhm resistor "2176".
+ * raw x 0.0304 turned that short into 0.517 Ohm; the SoC says 0.17. The
+ * unit #1 April numbers above (147 Ohm -> raw 4824) cannot be reconciled
+ * with a frame that spells its value out, so the factor is gone and the
+ * low/kOhm ranges render the SoC's text. Only the high range keeps a
+ * multiplier: no point in the frame, 100 Ohm per count. */
+#define METER_CAL_HIGH_KOHM_FACTOR 0.1f      /* raw_bcd × this = kΩ, f7 & 0x04 */
 
 /* ═══════════════════════════════════════════════════════════════════
  * 4-digit float → string formatter (newlib-nano has no %f support)
@@ -546,6 +552,23 @@ static void format_reading(meter_reading_t *r, uint8_t submode)
         if (first_nonzero > start) {
             memmove(s + start, s + first_nonzero, pos - first_nonzero + 1);
         }
+    } else {
+        /* With a decimal point: drop leading zeros while more than one digit
+         * is left before the point, the way a DMM shows 10.3 and not 010.3.
+         * "0.623" keeps its zero. Added 2026-09-07 with the capacitance
+         * range (0103 -> 10.3 uF); it also turns the old "030.3" into "30.3". */
+        int start = r->negative ? 1 : 0;
+        int point = start;
+        while (point < pos && s[point] != '.') {
+            point++;
+        }
+        int first_nonzero = start;
+        while (first_nonzero < point - 1 && s[first_nonzero] == '0') {
+            first_nonzero++;
+        }
+        if (first_nonzero > start) {
+            memmove(s + start, s + first_nonzero, pos - first_nonzero + 1);
+        }
     }
 
     /* Calculate float value from BCD */
@@ -691,8 +714,13 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
 
     /* --- Special value detection --- */
 
-    /* Overload: "OL" */
-    if (digit0 == 0x0A && digit1 == 0x0B) {
+    /* Overload: "OL". Two spellings: the O/L glyph codes 0x0A/0x0B in digits
+     * 0-1 (upstream's corpus), and the meter SoC's own " 0L " — blank, digit
+     * 0, the L glyph (code 0x0E), blank — seen on unit #2 in every mode that
+     * overloads (resistance 0x050B open: 00E0 7B01 0024). Before this the
+     * second spelling fell through to the BCD path and rendered as 0.000. */
+    if ((digit0 == 0x0A && digit1 == 0x0B) ||
+        (digit0 == 0x10 && digit1 == 0x00 && digit2 == 0x0E && digit3 == 0x10)) {
         r->result_class = METER_RESULT_OVERLOAD;
         strcpy(r->display_str, "OL");
         r->value = 0.0f;
@@ -905,6 +933,56 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
      *      override below: ours still applies it, theirs fails closed).
      */
 
+    /* Capacitance — selector 0x050A, the word this file used to call
+     * resistance. Settled 2026-09-07 by logging stock's own TX frames from a
+     * code cave (mydevice/caplog): stock sends 0x0A for Capacitance and 0x0B
+     * for resistance, and moves no GPIO for either.
+     *
+     * The SoC's capacitance frame describes itself: frame[7] = 0x10 marks
+     * the mode, the decimal point is the seven-segment DP bit (bit 4) of the
+     * digit it precedes, and the unit is frame[6]'s upper nibble — 0x2_ nF,
+     * 0x1_ uF (the lower nibble rotates 7/A/B/D/E/F from frame to frame and
+     * carries no range). Measured on unit #2, one word, caps swapped by hand
+     * (frame[2..7] -> reading):
+     *   open    E4 FB EB EB 2F 10  ->  0.008 nF
+     *   10 nF   C4 DF 87 EA 27 10  ->  9.576 nF
+     *   100 nF  04 EA EB FB 27 10  ->  100.6 nF
+     *   10 uF   C4 FF E7 E7 17 10  ->  9.666 uF
+     *   100 uF  C4 EF 9B EF 17 10  ->  90.36 uF  (electrolytic, -10 %)
+     * The mF band (upper nibble 0?) and 1 uF..9 uF handoff have not been
+     * seen; an unrecognised nibble keeps the latch or the static default.
+     * The ranging frame between caps is all-blank digits with f6 = 0x20 and
+     * takes the blank branch above. */
+    /* The SoC's own decimal point: bit 4 of each digit's segment byte is the
+     * DP segment, lit on the digit the point precedes (bcd_lookup masks it,
+     * so it is read here from the raw nibbles). One bit set -> one decimal
+     * position; anything else says nothing. Checked against every live frame
+     * with a known value: 4.994 V (DP on digit 1), 31.5x V (digit 2),
+     * 226.6 V mains (digit 3), 9.576 nF / 100.6 nF / 9.666 uF / 90.36 uF,
+     * 1.346 V on a battery in diode mode. Resistance frames carry NO point:
+     * a 2.2 kOhm resistor in 0x050B is the text "2176", f7 = 0x20 — plain
+     * ohms, which is what the raw x factor override below already renders
+     * as 2.176 kOhm. The +10000 DCV extension
+     * (1.4979 V) carries no DP — its point sits before digit 0, which the
+     * four-glyph display cannot light — and stays with the stock class path. */
+    uint8_t dp_bits = (uint8_t)(((nib0 & 0x10u) ? 1u : 0u) | ((nib1 & 0x10u) ? 2u : 0u) |
+                                ((nib2 & 0x10u) ? 4u : 0u) | ((nib3 & 0x10u) ? 8u : 0u));
+    uint8_t frame_dp = (dp_bits == 2u) ? 1u : (dp_bits == 4u) ? 2u : (dp_bits == 8u) ? 3u : 0u;
+
+    if (submode == 9) {
+        const char *cap_unit = NULL;
+        if ((f6 & 0xF0u) == 0x20u) {
+            cap_unit = "nF";
+        } else if ((f6 & 0xF0u) == 0x10u) {
+            cap_unit = "uF";
+        }
+        if (cap_unit) {
+            new_unit = cap_unit;
+            new_dp = frame_dp ? frame_dp : default_decimal_pos[9];
+            decoded = true;
+        }
+    }
+
     if (decoded) {
         /* This frame carried range bits we recognize. Apply and latch. */
         r->decimal_pos = new_dp;
@@ -919,6 +997,17 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
         r->unit_suffix = s->band_latch_unit;
     }
     /* else: no latch yet, keep the static default set above. */
+
+    /* Frame DP wins over every static default and over the frame[6] latch:
+     * the point is drawn by the SoC, not guessed from the submode. DCV keeps
+     * its stock class path below (same answer on every frame seen, plus the
+     * extension); resistance keeps the raw x factor override further down.
+     * Added 2026-09-07 after the capacitance frames showed the bit; it turns
+     * the ACV mains fixture from "22.86" into "228.6" and gives the diode,
+     * temperature and current modes their first real decimal position. */
+    if (frame_dp) {
+        r->decimal_pos = frame_dp;
+    }
 
 #if METER_DCV_STOCK_EXPONENT
     /* DCV: the status bits decide the decimal position, not frame[6] and not
@@ -1006,22 +1095,28 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
      * the final numbers.
      */
     if (submode == 6 || submode == 7) {
-        float       scale = 0.0f;
+        float       v     = 0.0f;
         const char *unit  = NULL;
         uint8_t     range = frame[7] & 0x0Cu;
 
-        if (range == 0x08u) {
-            scale = METER_CAL_LOW_OHM_FACTOR; unit = "Ohm";
-        } else if (range == 0x04u) {
-            scale = METER_CAL_HIGH_KOHM_FACTOR; unit = "kOhm";
-        } else if (range == 0x00u) {
-            scale = METER_CAL_KOHM_FACTOR; unit = "kOhm";
+        if (range == 0x04u) {
+            /* High range: no point in the frame, 100 Ohm per count.
+             * 300 kOhm -> "2983" -> 298.3 kOhm (2026-09-07, word 0x050B). */
+            v = (float)r->raw_bcd * METER_CAL_HIGH_KOHM_FACTOR; unit = "kOhm";
+        } else if (range == 0x00u || range == 0x08u) {
+            /* Ohms as the SoC spells them, with its own point when it lights
+             * one: "2176" -> 2176 Ohm, " 0.17" (short) -> 0.17 Ohm, in both
+             * the resistance word (f7 0x20) and continuity (f7 0x28). */
+            float ohms = (float)r->raw_bcd;
+            int   k;
+            for (k = frame_dp ? frame_dp : 4; k < 4; ++k) ohms /= 10.0f;
+            if (ohms >= 1000.0f) { v = ohms / 1000.0f; unit = "kOhm"; }
+            else                 { v = ohms;           unit = "Ohm";  }
         }
         /* 0x0C — both bits at once — is a pattern this bench has never seen.
          * Leave format_reading's output rather than guess a fourth range. */
 
-        if (scale != 0.0f) {
-            float v = (float)r->raw_bcd * scale;
+        if (unit) {
             if (r->negative) v = -v;
             r->value       = v;
             r->unit_suffix = unit;

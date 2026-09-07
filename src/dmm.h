@@ -30,3 +30,17 @@ void dmm_uart_irq_handler(void);
 const char *dmm53_debug_line(uint8_t idx);
 /* Bench only: queue one raw meter command word (see dmm53.c). */
 void dmm53_debug_send(uint8_t hi, uint8_t lo);
+/* Bench only: drive the frontend to stock mux arms (ce, ab), 0-9 each. */
+uint8_t dmm53_debug_pose(uint8_t ce, uint8_t ab);
+/* Bench only: USART2 TX frame counter, to prove a word went out. */
+uint16_t dmm53_debug_tx_count(void);
+/* Bench only: steady-state poll period, ms; 0 stops the (0x00,0x09) poll. */
+void dmm53_debug_poll_period(uint16_t ms);
+/* Bench only: TX-to-pin probe, returns (PA2 low samples << 16) | samples. */
+uint32_t dmm53_debug_tx_probe(void);
+/* Bench only: TX frame header bytes [0],[1], byte [4], checksum mode. */
+void dmm53_debug_set_header(uint8_t b0, uint8_t b1, uint8_t b4, uint8_t cs_mode);
+/* Bench only: sweep header pairs from `start`, one frame per tick, until an
+ * echo frame (AA 55) arrives; results via dmm53_debug_scan_status. */
+void dmm53_debug_scan(uint8_t on, uint16_t start);
+void dmm53_debug_scan_status(uint8_t *on, uint16_t *idx, uint16_t *hits, uint16_t *first);

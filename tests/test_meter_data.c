@@ -894,6 +894,8 @@ static int test_port_formatting_defaults_per_submode(void)
  * 0.0304) and the kOhm band identity. Upstream withdrew the low-ohm factor
  * and fails closed; PLAN.md carries this divergence explicitly ("on the
  * same resistor our firmware shows ~147 Ohm, theirs shows ---"). */
+static void raw_frame(uint8_t frame[12], const char *hex24);
+
 static int test_port_resistance_band_calibration_override(void)
 {
     uint8_t frame[12];
@@ -902,13 +904,29 @@ static int test_port_resistance_band_calibration_override(void)
     /* The range lives in frame[7] bits 3:2, not in frame[6] — measured on
      * unit #2, 2026-09-06, where a shorted probe and a 300 kOhm resistor both
      * report frame[6] upper nibble 0. Low-Ohm range: bit 3. */
+    /* Low range, no point in the frame: the digits are ohms as the SoC
+     * shows them. (The unit #1 "147 Ohm -> raw 4824 x 0.0304" reading this
+     * case used to pin is withdrawn — see meter_data.c.) */
     build_segment_frame(frame, 4, 8, 2, 4, 0x00, 0x08, 0x00, 0x00, 0);
     process_frame(frame, 6);
     ASSERT(meter_reading.valid);
     ASSERT(meter_reading.result_class == METER_RESULT_NORMAL);
-    ASSERT_STR_EQ(meter_reading.unit_suffix, "Ohm");
-    /* 4824 * 0.0304 = 146.65 */
-    ASSERT(close_to(meter_reading.value, 146.65f, 0.05f));
+    ASSERT_STR_EQ(meter_reading.unit_suffix, "kOhm");
+    ASSERT(close_to(meter_reading.value, 4.824f, 0.0005f));
+
+    /* Shorted probes on unit #2, 2026-09-07: text " 0.17" (DP on digit 2),
+     * the same in the resistance word (f7 0x20) and continuity (f7 0x28). */
+    raw_frame(frame, "5AA504E01B8A0A2000000124");
+    process_frame(frame, 6);
+    ASSERT(expect_normal_reading("0.170", "Ohm", 0.17f, 0.0005f));
+    raw_frame(frame, "5AA500E01B8A0A280000012A");
+    process_frame(frame, 7);
+    ASSERT(expect_normal_reading("0.170", "Ohm", 0.17f, 0.0005f));
+
+    /* 2.2 kOhm, word 0x050B: "2176", no point, f7 0x20 -> 2.176 kOhm. */
+    raw_frame(frame, "5AA5A40D8AEA47208000" "0127");
+    process_frame(frame, 6);
+    ASSERT(expect_normal_reading("2.176", "kOhm", 2.176f, 0.0005f));
 
     /* High range: bit 2, 100 Ohm per count. This is the bench failure of
      * 2026-09-06 — a 300 kOhm resistor read 90.62 Ohm because raw 2981 took
@@ -936,6 +954,87 @@ static int test_port_resistance_band_calibration_override(void)
  * (b) meter_session_begin() is the latch's reset — a re-entry into the
  *     same mode starts clean instead of inheriting the previous session's
  *     dp/unit, which is what the old function-local statics did. */
+/* Capacitance frames captured on bench unit #2, 2026-09-07, selector 0x050A
+ * (the word stock sends for Capacitance — logged from stock itself with the
+ * mydevice/caplog code cave). The frame is self-describing: DP bit of the
+ * digit it precedes, unit in frame[6]'s upper nibble (0x2_ nF, 0x1_ uF).
+ * Values are what the SoC showed for the nominal caps on the probes. */
+static void raw_frame(uint8_t frame[12], const char *hex24)
+{
+    for (int i = 0; i < 12; i++) {
+        unsigned v = 0;
+        sscanf(hex24 + 2 * i, "%2x", &v);
+        frame[i] = (uint8_t)v;
+    }
+}
+
+static int test_port_capacitance_frames_from_bench_unit2(void)
+{
+    uint8_t frame[12];
+
+    meter_data_init();
+    raw_frame(frame, "5AA5C4DF87EA2710000000E3");        /* 10 nF */
+    process_frame(frame, 9);
+    ASSERT(expect_normal_reading("9.576", "nF", 9.576f, 0.0005f));
+
+    raw_frame(frame, "5AA504EAEBFB2710000000DB");        /* 100 nF */
+    process_frame(frame, 9);
+    ASSERT(expect_normal_reading("100.6", "nF", 100.6f, 0.05f));
+
+    raw_frame(frame, "5AA5C4FFE7E71710000000DB");        /* 10 uF */
+    process_frame(frame, 9);
+    ASSERT(expect_normal_reading("9.666", "uF", 9.666f, 0.0005f));
+
+    raw_frame(frame, "5AA5C4EF9BEF1710000000DB");        /* 100 uF */
+    process_frame(frame, 9);
+    ASSERT(expect_normal_reading("90.36", "uF", 90.36f, 0.005f));
+
+    raw_frame(frame, "5AA5E4FBEBEB2F10000000DB");        /* open probes */
+    process_frame(frame, 9);
+    ASSERT(expect_normal_reading("0.008", "nF", 0.008f, 0.0005f));
+
+    /* Ranging frame between two caps: blank digits, f6 = 0x20. */
+    raw_frame(frame, "5AA504100000201000000011");
+    process_frame(frame, 9);
+    ASSERT(meter_reading.valid);
+    ASSERT(meter_reading.result_class == METER_RESULT_BLANK);
+
+    /* Resistance word 0x050B on the same 10 nF: OL in the high-ohm range. */
+    raw_frame(frame, "5AA500E07B01002400000107");
+    process_frame(frame, 6);
+    ASSERT(meter_reading.valid);
+    ASSERT(meter_reading.result_class == METER_RESULT_OVERLOAD);
+    return 1;
+}
+
+/* The SoC draws its own decimal point (DP segment = bit 4 of the digit it
+ * precedes). Frames with a known value from both benches: the port used to
+ * render the ACV mains frame at its dp-2 default ("22.86"); with the frame DP
+ * it reads 226.6 V in submode 1 as it does through the stock class path in
+ * submode 0. Diode and temperature go the same way. */
+static int test_port_frame_decimal_point_drives_non_dcv_modes(void)
+{
+    uint8_t frame[12];
+
+    meter_data_init();
+    raw_frame(frame, "5AA5A5ADEDF70700020000" "32");     /* mains, upstream fixture */
+    process_frame(frame, 1);
+    ASSERT(expect_normal_reading("226.6", "V", 226.6f, 0.05f));
+    ASSERT(meter_reading.decimal_pos == 3);
+
+    raw_frame(frame, "5AA546DECF4F0E0002000182");        /* live 4.994 V, DP on digit 1 */
+    process_frame(frame, 8);                              /* as a diode reading */
+    ASSERT(meter_reading.decimal_pos == 1);
+    ASSERT_STR_EQ(meter_reading.display_str, "4.994");
+
+    /* No DP bit at all: the submode default stays (ACV open probes, 1027). */
+    raw_frame(frame, "5AA505EAAB8D0A0082000000");
+    process_frame(frame, 1);
+    ASSERT(meter_reading.decimal_pos == 2);
+    ASSERT_STR_EQ(meter_reading.display_str, "10.27");
+    return 1;
+}
+
 static int test_port_band_latch_reuses_last_band_within_session(void)
 {
     uint8_t kohm_frame[12];
@@ -1136,6 +1235,8 @@ int main(void)
     TEST(port_formatting_defaults_per_submode);
     TEST(port_resistance_band_calibration_override);
     TEST(port_band_latch_reuses_last_band_within_session);
+    TEST(port_capacitance_frames_from_bench_unit2);
+    TEST(port_frame_decimal_point_drives_non_dcv_modes);
     TEST(session_begin_resets_band_latch_on_same_mode_reentry);
 
     printf("\n%d/%d passed, %d skipped (unported upstream features)\n",
