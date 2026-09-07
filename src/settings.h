@@ -7,6 +7,9 @@ enum {
     SETTINGS_START_DMM,
     SETTINGS_START_SCOPE,
     SETTINGS_START_GEN,
+    /* Boot into whatever screen was showing last time: the mode, and the
+     * mode menu if it was open over it. The default since 2026-09-06. */
+    SETTINGS_START_LAST,
     SETTINGS_START_COUNT,
     SETTINGS_LEVEL_COUNT = 5,
     SETTINGS_SLEEP_COUNT = 4,
@@ -52,7 +55,8 @@ typedef struct {
     uint8_t beep_level;
     uint8_t brightness_level;
     uint8_t startup_screen;
-    uint8_t last_screen;
+    uint8_t last_screen;   /* 0 DMM, 1 SCOPE, 2 GEN — the mode last shown */
+    uint8_t last_in_menu;  /* the mode menu was open over it */
     uint8_t sleep_enabled;
     uint8_t scope_timebase;
     uint8_t scope_display;

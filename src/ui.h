@@ -22,3 +22,9 @@ uint8_t ui_debug_mode_byte(void);
  * valid to store. 2C53T builds only. */
 uint8_t ui_save_ch2_ref(void);
 uint8_t ui_save_ch1_ref(void);
+/* Bench: switch the UI to mode 0/1/2 (DMM/SCOPE/GEN) as if picked from the
+ * mode menu, and for DMM optionally select a meter submode (ui.c
+ * dmm_mode_names index; 0xFF = leave the default). Goes through the same
+ * ui_switch_mode path the keys use, so it persists like a keypress would.
+ * Returns 0 on a bad argument. */
+uint8_t ui_shell_set_mode(uint8_t mode, uint8_t dmm_submode);

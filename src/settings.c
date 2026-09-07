@@ -42,10 +42,14 @@ enum {
     SETTINGS_STATE_SIGGEN_SWEEP_START_HI = 0xDEu,
     SETTINGS_STATE_SIGGEN_SWEEP_STOP_LO = 0xDFu,
     SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI = 0xE0u,
+    /* Startup policy + last screen. Lives in its own record because the main
+     * record's 2-bit startup field cannot hold SETTINGS_START_LAST, and the
+     * absence of this record (a page written by an older build) reads as LAST. */
+    SETTINGS_STATE_STARTUP = 0xE1u,
     SETTINGS_SCOPE_BIAS_DEFAULT = 1861u,
     SETTINGS_SCOPE_BIAS_RATE_DEFAULT = 505u,
     SETTINGS_SCOPE_CAL_WORDS = SETTINGS_SCOPE_CHANNEL_COUNT * SETTINGS_SCOPE_RANGE_COUNT * 2,
-    SETTINGS_STATE_WORDS = SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI -
+    SETTINGS_STATE_WORDS = SETTINGS_STATE_STARTUP -
                            SETTINGS_STATE_SCOPE_CORE + 1u,
     SETTINGS_WRITE_BYTES = 4u * (1u + SETTINGS_SCOPE_CAL_WORDS + SETTINGS_STATE_WORDS),
     FLASH_BANK2_BASE = 0x08080000u,
@@ -109,12 +113,9 @@ static void settings_defaults(settings_state_t *settings) {
     settings->dmm_mode = 0;
     settings->beep_level = 3;
     settings->brightness_level = 4;
-#if HW_TARGET_2C53T
-    settings->startup_screen = SETTINGS_START_SCOPE;
-#else
-    settings->startup_screen = SETTINGS_START_DMM;
-#endif
+    settings->startup_screen = SETTINGS_START_LAST;
     settings->last_screen = 0;
+    settings->last_in_menu = 0;
     settings->sleep_enabled = 0;
     settings->scope_timebase = SETTINGS_SCOPE_TIMEBASE_DEFAULT;
     settings->scope_display = 0;
@@ -170,6 +171,7 @@ static void settings_copy(settings_state_t *dst, const settings_state_t *src) {
     dst->brightness_level = src->brightness_level;
     dst->startup_screen = src->startup_screen;
     dst->last_screen = src->last_screen;
+    dst->last_in_menu = src->last_in_menu;
     dst->sleep_enabled = src->sleep_enabled;
     dst->scope_timebase = src->scope_timebase;
     dst->scope_display = src->scope_display;
@@ -228,6 +230,7 @@ static uint8_t settings_equal(const settings_state_t *a, const settings_state_t 
         a->brightness_level != b->brightness_level ||
         a->startup_screen != b->startup_screen ||
         a->last_screen != b->last_screen ||
+        a->last_in_menu != b->last_in_menu ||
         a->sleep_enabled != b->sleep_enabled ||
         a->scope_timebase != b->scope_timebase ||
         a->scope_display != b->scope_display ||
@@ -295,15 +298,12 @@ static void settings_clamp(settings_state_t *settings) {
         settings->brightness_level = 4;
     }
     if (settings->startup_screen >= SETTINGS_START_COUNT) {
-#if HW_TARGET_2C53T
-        settings->startup_screen = SETTINGS_START_SCOPE;
-#else
-        settings->startup_screen = SETTINGS_START_DMM;
-#endif
+        settings->startup_screen = SETTINGS_START_LAST;
     }
     if (settings->last_screen > 2u) {
         settings->last_screen = 0;
     }
+    settings->last_in_menu = settings->last_in_menu ? 1u : 0u;
     if (settings->sleep_enabled >= SETTINGS_SLEEP_COUNT) {
         settings->sleep_enabled = 0;
     }
@@ -552,7 +552,14 @@ static uint8_t settings_record_valid(uint32_t record, settings_state_t *settings
     settings->dmm_mode = (uint8_t)(payload & 0x0Fu);
     settings->beep_level = (uint8_t)((payload >> 4) & 0x07u);
     settings->brightness_level = (uint8_t)((payload >> 7) & 0x07u);
-    settings->startup_screen = (uint8_t)((payload >> 10) & 0x03u);
+    /* Bits 10-11 used to carry startup_screen. The field outgrew them (LAST is
+     * a fifth value) and moved to the SETTINGS_STATE_STARTUP record, which is
+     * written after this one and overrides. Without that record — a page from
+     * a build before 2026-09-06 — the policy is LAST, not whatever the two bits
+     * say: the old fixed-screen choice is dropped deliberately, so a fresh
+     * flash comes up where it was left rather than where the old default
+     * pointed. */
+    settings->startup_screen = SETTINGS_START_LAST;
     settings->last_screen = (uint8_t)((payload >> 12) & 0x03u);
     settings->sleep_enabled = (uint8_t)((payload >> 14) & 0x03u);
     settings_clamp(settings);
@@ -646,6 +653,10 @@ static uint8_t settings_state_record_valid(uint32_t record, settings_state_t *se
         settings->siggen_sweep_stop_hz = (settings->siggen_sweep_stop_hz & 0xFFFF0000u) | payload;
     } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI) {
         settings->siggen_sweep_stop_hz = (settings->siggen_sweep_stop_hz & 0x0000FFFFu) | ((uint32_t)payload << 16);
+    } else if (type == SETTINGS_STATE_STARTUP) {
+        settings->startup_screen = (uint8_t)(payload & 0x07u);
+        settings->last_screen = (uint8_t)((payload >> 4) & 0x03u);
+        settings->last_in_menu = (uint8_t)((payload >> 6) & 0x01u);
     } else {
         return 0;
     }
@@ -771,6 +782,12 @@ static void settings_write_state_records(uint32_t *addr, const settings_state_t 
     *addr += 4u;
     flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI,
                                                     (uint16_t)(settings->siggen_sweep_stop_hz >> 16)));
+    *addr += 4u;
+
+    payload = (uint16_t)((settings->startup_screen & 0x07u) |
+                         ((settings->last_screen & 0x03u) << 4) |
+                         ((settings->last_in_menu & 0x01u) << 6));
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_STARTUP, payload));
     *addr += 4u;
 }
 

@@ -698,7 +698,7 @@ static const uint8_t gen_wave_order[] = {
 static const char *const gen_param_labels[] = {"WAVE", "FREQ", "DUTY", "AMP"};
 static const char *const menu_labels[] = {"MULTIMETER", "OSCILLOSCOPE", "SIGNAL GENERATOR", "SETTINGS"};
 static const char *const settings_row_labels[] = {"BEEP", "DISPLAY", "START", "SLEEP", "INFO"};
-static const char *const startup_labels[] = {"MENU", "DMM", "SCOPE", "GEN"};
+static const char *const startup_labels[] = {"MENU", "DMM", "SCOPE", "GEN", "LAST"};
 static const char *const beep_level_labels[] = {"OFF", "LOW", "MEDIUM", "HIGH", "MAX"};
 static const char *const brightness_level_labels[] = {"DIM", "LOW", "MEDIUM", "HIGH", "BRIGHT"};
 static const char *const sleep_labels[] = {"OFF", "10 MIN", "20 MIN", "30 MIN"};
@@ -7445,7 +7445,7 @@ static const char *startup_label(void) {
     if (ui_settings.startup_screen == SETTINGS_START_GEN) {
         return startup_labels[3];
     }
-    return startup_labels[1];
+    return startup_labels[4];
 }
 
 static const char *settings_value_text(uint8_t row, char out[12]) {
@@ -7817,16 +7817,27 @@ static void ui_switch_mode(ui_mode_t mode) {
         dmm_hold_active = 0;
         dmm_rel_active = 0;
         dmm_stats_reset();
-        if (old_mode == UI_MODE_DMM) {
-            dmm_set_mode(DMM_MODE_AUTO);
-        } else {
+        if (old_mode != UI_MODE_DMM) {
             siggen_shutdown();
-            dmm_reenter(DMM_MODE_AUTO);
         }
+        /* Re-enter even when old_mode is already DMM. The two ways to arrive
+         * here from DMM — boot (ui.mode reads DMM before the first switch)
+         * and the mode menu — both have the meter paused by dmm_pause(), and
+         * dmm_set_mode() alone never powers it back: on the 2C53T it queued a
+         * transition that dmm_tick, gated on dmm53_powered, never walked, so a
+         * device booted straight into the meter sat silent (T0, G000/000)
+         * until MODE was pressed. Found 2026-09-06 when LAST made booting into
+         * the meter the common case. */
+        dmm_reenter(DMM_MODE_AUTO);
         ui_settings.dmm_mode = DMM_MODE_AUTO;
     }
     ui_settings.last_screen = (uint8_t)mode;
+    ui_settings.last_in_menu = 0;
     settings_note(&ui_settings);
+    /* Written now, not at shutdown: the whole point of remembering the screen
+     * is surviving resets that never see shutdown_now(). A mode switch is a
+     * rare, deliberate act, and the page holds several writes per erase. */
+    settings_flush();
 }
 
 void ui_init(void) {
@@ -7859,6 +7870,19 @@ void ui_init(void) {
         start_mode = UI_MODE_SCOPE;
     } else if (ui_settings.startup_screen == SETTINGS_START_GEN) {
         start_mode = UI_MODE_GEN;
+    } else if (ui_settings.startup_screen == SETTINGS_START_LAST) {
+        /* Come up where the device was left: the mode last shown, and the
+         * mode menu over it if that was open. last_screen is written by
+         * ui_switch_mode and flushed there, so a reset that skips the
+         * shutdown path (fwswap, a pulled battery) still lands right. */
+        if (ui_settings.last_screen == 1u) {
+            start_mode = UI_MODE_SCOPE;
+        } else if (ui_settings.last_screen == 2u) {
+            start_mode = UI_MODE_GEN;
+        } else {
+            start_mode = UI_MODE_DMM;
+        }
+        start_in_menu = ui_settings.last_in_menu ? 1u : 0u;
     }
 
     ui.gen_duty_percent = GEN_DEFAULT_DUTY_PERCENT;
@@ -9784,11 +9808,11 @@ static void settings_cycle_startup(int8_t dir) {
     uint8_t value = ui_settings.startup_screen;
 
     if (value >= SETTINGS_START_COUNT) {
-        value = SETTINGS_START_DMM;
+        value = SETTINGS_START_LAST;
     } else if (dir > 0) {
-        value = value == SETTINGS_START_GEN ? SETTINGS_START_MENU : (uint8_t)(value + 1u);
+        value = value + 1u >= SETTINGS_START_COUNT ? SETTINGS_START_MENU : (uint8_t)(value + 1u);
     } else {
-        value = value == SETTINGS_START_MENU ? SETTINGS_START_GEN : (uint8_t)(value - 1u);
+        value = value == SETTINGS_START_MENU ? (uint8_t)(SETTINGS_START_COUNT - 1u) : (uint8_t)(value - 1u);
     }
 
     ui_settings.startup_screen = value;
@@ -9921,6 +9945,8 @@ static void ui_open_mode_menu_item(uint8_t index) {
     } else {
         ui.overlay = UI_OVERLAY_SETTINGS;
         ui.settings_row = 0;
+        ui_settings.last_in_menu = 0;
+        settings_note(&ui_settings);
     }
 }
 
@@ -9983,6 +10009,8 @@ static void ui_handle_menu_keys(uint32_t events) {
         dmm_pause_for_menu_overlay();
         ui.overlay = UI_OVERLAY_MODE_MENU;
         ui.menu_index = 3;
+        ui_settings.last_in_menu = 1;
+        settings_note(&ui_settings);
         ui_render();
         return;
     }
@@ -10532,6 +10560,10 @@ void ui_handle_keys(uint32_t events) {
             ui.menu_index = 0;
         }
         ui.chrome_visible = 1;
+        /* Noted, not flushed: the shutdown path flushes, and a menu left open
+         * across a hard reset is not worth a flash write per keypress. */
+        ui_settings.last_in_menu = 1;
+        settings_note(&ui_settings);
         ui_render();
         return;
     }
@@ -11037,4 +11069,22 @@ void ui_tick(uint32_t elapsed_ms) {
     } else {
         ui.idle_ms = (uint16_t)next;
     }
+}
+
+uint8_t ui_shell_set_mode(uint8_t mode, uint8_t dmm_submode) {
+    if (mode > (uint8_t)UI_MODE_GEN) {
+        return 0;
+    }
+    if (mode == (uint8_t)UI_MODE_DMM && dmm_submode != 0xFFu &&
+        dmm_submode >= (uint8_t)DMM_MODE_COUNT) {
+        return 0;
+    }
+    ui_direct_mode(mode);
+    if (mode == (uint8_t)UI_MODE_DMM && dmm_submode != 0xFFu) {
+        ui.dmm_mode = dmm_submode;
+        ui.auto_range = dmm_submode == (uint8_t)DMM_MODE_AUTO ? 1u : 0u;
+        dmm_apply_selected_mode();
+    }
+    ui_render();
+    return 1u;
 }
