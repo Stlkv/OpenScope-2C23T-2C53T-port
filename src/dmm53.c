@@ -128,6 +128,8 @@ static uint16_t dmm53_seq_timer_ms;
 static uint16_t dmm53_seq_wait_ms;
 
 static fpga_meter_transition_plan_t dmm53_plan;
+static uint32_t dmm53_cont_frames;
+static uint32_t dmm53_cont_numeric;
 static uint8_t dmm53_transition_busy;
 static volatile uint8_t dmm53_discard_frames;
 static volatile uint32_t dmm53_skip_count;
@@ -802,7 +804,32 @@ uint8_t dmm_poll(void) {
      * reads the frame under the same submode whose selector words are on the
      * wire, not under whatever the UI mode says right now. */
     meter_session_frame(&dmm53_session, dmm53_frame);
+
+    /* Bench: does the SoC's own display catch a probe touch that its beep
+     * request line misses? Counted only in continuity, where OL is the
+     * resting state, so any numeric frame means the SoC saw something
+     * conductive. If these move on taps that PC3 sleeps through, the frame
+     * path can be made MORE sensitive than stock; if they do not, the SoC's
+     * detector is the floor for both. */
+    if (dmm53_session.submode == 7u) {
+        ++dmm53_cont_frames;
+        if (dmm53_session.reading.valid &&
+            (dmm53_session.reading.result_class == METER_RESULT_NORMAL ||
+             dmm53_session.reading.result_class == METER_RESULT_CONTINUITY)) {
+            ++dmm53_cont_numeric;
+        }
+    }
     return 1u;
+}
+
+void dmm_cont_frame_counts(uint32_t *frames, uint32_t *numeric) {
+    *frames = dmm53_cont_frames;
+    *numeric = dmm53_cont_numeric;
+}
+
+void dmm_cont_frame_clear(void) {
+    dmm53_cont_frames = 0;
+    dmm53_cont_numeric = 0;
 }
 
 void dmm_tick(uint32_t elapsed_ms) {
@@ -910,8 +937,23 @@ uint8_t dmm_live_wire_active(void) {
     return 0;
 }
 
+/* Continuity from the frame itself. The SoC marks a short with the stock BCD
+ * pattern (digit1=0x12, digit2=0x0A, digit3=5) that meter_data turns into
+ * continuity_beep; this path is independent of the PC3 request line, so the
+ * bench can tell which of the two actually fires. */
 uint8_t dmm_diode_continuity_active(void) {
-    return 0;
+    const meter_reading_t *r = &dmm53_session.reading;
+
+    /* A partial-blank frame returns without clearing continuity_beep in our
+     * decoder (upstream's does clear it -- METER_HAS_SPECIAL_PAYLOAD_CLEAR=0
+     * in the ported test map), so a latched flag could hold the tone on
+     * forever. Refusing to sound on a BLANK result closes that here without
+     * touching the decoder. */
+    if (!r->valid || r->result_class == METER_RESULT_BLANK) {
+        return 0;
+    }
+    return (uint8_t)(r->continuity_beep ||
+                     r->result_class == METER_RESULT_CONTINUITY);
 }
 
 /* Fixed-width hex, most significant nibble first. */

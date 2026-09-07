@@ -10826,7 +10826,17 @@ static uint32_t settings_sleep_timeout_ms(void) {
 }
 
 uint8_t ui_diode_beep_enabled(void) {
-    return ui.mode == UI_MODE_DMM && ui.overlay == UI_OVERLAY_NONE && ui.dmm_mode == DMM_MODE_DIODE;
+    if (ui.mode != UI_MODE_DMM || ui.overlay != UI_OVERLAY_NONE) {
+        return 0;
+    }
+#if HW_TARGET_2C53T
+    /* CONT is its own mode on this board (stock word 0x0517), and it is the
+     * mode that has to beep. */
+    if (ui.dmm_mode == DMM_MODE_CONT) {
+        return 1;
+    }
+#endif
+    return ui.dmm_mode == DMM_MODE_DIODE;
 }
 
 uint8_t ui_live_beep_enabled(void) {

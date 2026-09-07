@@ -19,6 +19,11 @@
 #define DMA1_BASE   0x40020000u
 #define FLASH_R_BASE 0x40022000u
 #define TMR5_BASE   0x40000C00u
+/* 2C53T: TMR10_CH1 is PB8 (LCD backlight), TMR11_CH1 is PB9 (piezo).
+ * Stock enables exactly these two on APB2 next to the GPIOB clock
+ * (0x0802B180..0x0802B1B0 writes CRM_APB2EN bits 3, 20, 3, 21). */
+#define TMR10_BASE  0x40015000u
+#define TMR11_BASE  0x40015400u
 #define SPI2_BASE   0x40003800u
 #define SPI3_BASE   0x40003C00u
 #define USART3_BASE 0x40004800u
@@ -49,6 +54,7 @@
 #define EXTI_IMR     REG32(EXTI_BASE + 0x00u)
 #define EXTI_RTSR    REG32(EXTI_BASE + 0x08u)
 #define EXTI_FTSR    REG32(EXTI_BASE + 0x0Cu)
+#define EXTI_SWIER   REG32(EXTI_BASE + 0x10u)
 #define EXTI_PR      REG32(EXTI_BASE + 0x14u)
 
 #define GPIO_CRL(base)  REG32((base) + 0x00u)
@@ -110,8 +116,11 @@
 #define TMR_CVAL(base)  REG32((base) + 0x24u)
 #define TMR_PSC(base)   REG32((base) + 0x28u)
 #define TMR_PR(base)    REG32((base) + 0x2Cu)
+#define TMR_STCTRL(base) REG32((base) + 0x04u)
+#define TMR_RPR(base)   REG32((base) + 0x30u)
 #define TMR_C1DT(base)  REG32((base) + 0x34u)
 #define TMR_C2DT(base)  REG32((base) + 0x38u)
+#define TMR_BRK(base)   REG32((base) + 0x44u)
 
 #define SPI_CTRL1(base) REG32((base) + 0x00u)
 #define SPI_CTRL2(base) REG32((base) + 0x04u)

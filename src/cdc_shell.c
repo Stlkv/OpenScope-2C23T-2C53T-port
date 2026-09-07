@@ -225,6 +225,13 @@ static void cmd_help(const char *args) {
            "  meterscan on [start]|off|?   sweep header pairs until the SoC echoes\r\n"
            "  mode dmm|scope|gen [n]       switch screen; n = DMM submode (5 = CAP)\r\n"
            "  mem <addr> <len>             hex dump, flash/RAM only, len <= 256\r\n"
+#if HW_TARGET_2C53T
+           "  beep [ms] [pct] [div]        piezo PB9/TMR11; div = pitch, 2399 = stock\r\n"
+           "  beep ?                       PC3 request line: level, edge counts\r\n"
+           "  beep hold [ms]               shortest audible continuity tone\r\n"
+           "  beep sw                      fire one PC3 pulse in software, time the tone\r\n"
+           "  pins [clear]                 GPIOs that changed since clear\r\n"
+#endif
            "  pin <A-E><n> <0|1|in>        drive a GPIO as push-pull output, or read it\r\n"
            "  uptime                       ms since boot\r\n");
 }
@@ -915,6 +922,245 @@ static void cmd_pin(const char *args) {
     sh_out("\r\n");
 }
 
+#if HW_TARGET_2C53T
+/* Bench: `beep [ms] [percent] [div]` drives the piezo, `beep ?` reads the
+ * request line. The piezo is PB9 on TMR11_CH1: duty is the volume, the
+ * divider is the pitch (f = APB2 / ((div + 1) * 25), so stock's 2399 means
+ * 2 kHz at 120 MHz). Sweep div for the loudest point -- the piezo is
+ * resonant, and this board's APB2 clock is whatever the factory bootloader
+ * left. `beep ?` also prints the PC3 edge counters: PC3 is the SoC's beep
+ * request in stock (EXTI3), and it is counted but not yet trusted to sound
+ * the piezo. */
+/* Sample PB9 while the tone runs: a piezo cannot be heard from the host, but
+ * the duty cycle can be counted. Asynchronous sampling of a square wave
+ * returns its duty, so a driven pin shows roughly the C1DT ratio and a dead
+ * one shows 0% or 100%. Doubles as the delay -- the loop budget matches
+ * delay_ms's 12000 nops per ms. */
+static uint32_t beep53_sample_pb9(uint32_t ms, uint32_t *high_out) {
+    uint32_t samples = 0;
+    uint32_t high = 0;
+
+    while (ms--) {
+        for (volatile uint32_t i = 0; i < 1500u; ++i) {
+            if (GPIO_IDR(GPIOB_BASE) & (1u << 9)) {
+                ++high;
+            }
+            ++samples;
+        }
+    }
+    *high_out = high;
+    return samples;
+}
+
+static void cmd_beep(const char *args) {
+    const char *p = skip_spaces(args);
+    uint32_t ms = 200u;
+    uint32_t percent = 40u;
+    uint32_t div;
+    uint32_t samples;
+    uint32_t high = 0;
+
+    if (p[0] == 's') { /* beep sw -- fire one PC3 pulse in software */
+        uint32_t noarm, istart, on, off, lastc, taken;
+        uint8_t armed;
+        /* The whole tap -> tone chain, minus the probes: EXTI_SWIER raises
+         * line 3 exactly as a real edge would, and stock's own ISR reads that
+         * register too. Wait out the tone, then report how long it lasted. */
+        EXTI_SWIER = 1u << 3;
+        delay_ms(20);
+        board_dmm_beep_chain_probe(&noarm, &istart, &on, &off, &lastc, &taken,
+                                   &armed);
+        sh_out("beep sw armed=");
+        sh_u32(armed);
+        sh_out(" irq=");
+        sh_u32(istart);
+        sh_out(" on=");
+        sh_u32(on);
+        sh_out(" off=");
+        sh_u32(off);
+        sh_out(" ticks=");
+        sh_u32(board_beep_last_on_ticks());
+        sh_out(" hold=");
+        sh_u32(board_buzzer_min_beep_ms());
+        sh_out("\r\n");
+        return;
+    }
+    if (p[0] == 'h') { /* beep hold [ms] -- shortest audible continuity tone */
+        p = skip_spaces(p + 4);
+        if (*p) {
+            uint32_t hold;
+            if (!parse_u32(&p, &hold) || hold > 2000u) {
+                sh_out("beep: bad hold (0-2000)\r\n");
+                return;
+            }
+            board_buzzer_set_min_beep_ms((uint16_t)hold);
+        }
+        sh_out("beep hold=");
+        sh_u32(board_buzzer_min_beep_ms());
+        sh_out(" ms (firmware ms, first pulse latches this)\r\n");
+        return;
+    }
+    if (*p == '?') {
+        uint32_t rise = 0;
+        uint32_t fall = 0;
+        uint8_t level = 0;
+        uint32_t edges = 0;
+        uint32_t phigh = 0;
+        uint32_t psamples = 0;
+        uint32_t pcycles = 0;
+        board_dmm_beep_probe(&rise, &fall, &level);
+        board_dmm_beep_pulse_probe(&edges, &phigh, &psamples, &pcycles);
+        sh_out("beep pc3=");
+        sh_u32(level);
+        sh_out(" rise=");
+        sh_u32(rise);
+        sh_out(" fall=");
+        sh_u32(fall);
+        sh_out(" poll edges=");
+        sh_u32(edges);
+        sh_out(" high=");
+        sh_u32(phigh);
+        sh_out("/");
+        sh_u32(psamples);
+        sh_out(" cycles=");
+        sh_u32(pcycles);
+        {
+            uint32_t noarm = 0, istart = 0, on = 0, off = 0, lastc = 0, taken = 0;
+            uint8_t armed = 0;
+            board_dmm_beep_chain_probe(&noarm, &istart, &on, &off, &lastc,
+                                       &taken, &armed);
+            sh_out(" | armed=");
+            sh_u32(armed);
+            sh_out(" noarm=");
+            sh_u32(noarm);
+            sh_out(" irq=");
+            sh_u32(istart);
+            sh_out(" on=");
+            sh_u32(on);
+            sh_out(" off=");
+            sh_u32(off);
+            sh_out(" taken=");
+            sh_u32(taken);
+            sh_out(" ticks=");
+            sh_u32(board_beep_last_on_ticks());
+            sh_out(" lastcyc=");
+            sh_u32(lastc);
+        }
+        {
+            sh_out(" | svc=");
+            sh_u32(board_beep_stat(0));
+            sh_out(" latch=");
+            sh_u32(board_beep_stat(1));
+            sh_out(" offdiode=");
+            sh_u32(board_beep_stat(2));
+            sh_out(" offelse=");
+            sh_u32(board_beep_stat(3));
+        }
+        {
+            uint32_t cframes = 0, cnumeric = 0;
+            dmm_cont_frame_counts(&cframes, &cnumeric);
+            sh_out(" | cont frames=");
+            sh_u32(cframes);
+            sh_out(" numeric=");
+            sh_u32(cnumeric);
+        }
+        {
+            uint8_t pc0 = 0, pc7 = 0;
+            uint32_t pc0e = 0, pc7e = 0;
+            board_probe_watch_read(&pc0, &pc0e, &pc7, &pc7e);
+            sh_out(" | pc0=");
+            sh_u32(pc0);
+            sh_out("/");
+            sh_u32(pc0e);
+            sh_out(" pc7=");
+            sh_u32(pc7);
+            sh_out("/");
+            sh_u32(pc7e);
+        }
+        sh_out(" div=");
+        sh_u32(board_buzzer_tone_div());
+        sh_out(" cont=");
+        sh_u32(dmm_diode_continuity_active());
+        sh_out("\r\n");
+        return;
+    }
+    if (*p && !parse_u32(&p, &ms)) {
+        sh_out("usage: beep [ms] [percent] [div] | beep ?\r\n");
+        return;
+    }
+    p = skip_spaces(p);
+    if (*p && !parse_u32(&p, &percent)) {
+        sh_out("usage: beep [ms] [percent] [div] | beep ?\r\n");
+        return;
+    }
+    p = skip_spaces(p);
+    if (*p) {
+        if (!parse_u32(&p, &div) || div > 65535u) {
+            sh_out("beep: bad divider\r\n");
+            return;
+        }
+        board_buzzer_set_tone_div((uint16_t)div);
+    }
+    if (ms > 1000u) {
+        ms = 1000u;
+    }
+    if (percent > 100u) {
+        percent = 100u;
+    }
+    board_buzzer_set_percent(1u, (uint8_t)percent);
+    samples = beep53_sample_pb9(ms, &high);
+    board_buzzer_set_percent(0u, (uint8_t)percent);
+    sh_out("beep ");
+    sh_u32(ms);
+    sh_out(" ms ");
+    sh_u32(percent);
+    sh_out("% div=");
+    sh_u32(board_buzzer_tone_div());
+    sh_out(" pb9 high=");
+    sh_u32(high);
+    sh_out("/");
+    sh_u32(samples);
+    sh_out(" =");
+    sh_u32(samples ? (high * 100u) / samples : 0u);
+    sh_out("%\r\n");
+}
+#endif
+
+#if HW_TARGET_2C53T
+/* Bench: `pins` lists every GPIO that changed since `pins clear`, with the
+ * sample count for scale. Run it once idle for a baseline and once over a tap
+ * series: a line that answers a probe touch stands out against the keypad
+ * scan and the LCD bus. */
+static void cmd_pins(const char *args) {
+    const char *p = skip_spaces(args);
+    uint8_t port;
+    uint8_t bit;
+
+    if (p[0] == 'c') {
+        board_pin_sweep_clear();
+        dmm_cont_frame_clear();
+        sh_out("pins cleared\r\n");
+        return;
+    }
+    sh_out("pins samples=");
+    sh_u32(board_pin_sweep_samples());
+    for (port = 0; port < 5u; ++port) {
+        for (bit = 0; bit < 16u; ++bit) {
+            uint16_t n = board_pin_sweep_read(port, bit);
+            if (!n) {
+                continue;
+            }
+            sh_out(" ");
+            sh_out((const char[]){(char)('A' + port), '\0'});
+            sh_u32(bit);
+            sh_out("=");
+            sh_u32(n);
+        }
+    }
+    sh_out("\r\n");
+}
+#endif
+
 static void cmd_uptime(const char *args) {
     (void)args;
     sh_u32(sh_uptime_ms);
@@ -953,6 +1199,8 @@ static const sh_cmd_t sh_cmds[] = {
     { "meterhdr", cmd_meterhdr },
     { "meterscan", cmd_meterscan },
     { "meterc", cmd_meterc },
+    { "beep", cmd_beep },
+    { "pins", cmd_pins },
 #endif
 #endif
     { "mode", cmd_mode },

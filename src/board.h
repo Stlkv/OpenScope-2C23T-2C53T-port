@@ -50,6 +50,28 @@ uint8_t board_dmm_beep_active(void);
 uint8_t board_dmm_beep_edge_seen(void);
 void board_dmm_beep_irq_arm(uint8_t enabled);
 void board_dmm_beep_irq_force_full(uint8_t enabled);
+/* 2C53T only: the piezo is PB9/TMR11_CH1 and the SoC's beep request is PC3. */
+void board_buzzer_set_tone_div(uint16_t div);
+uint16_t board_buzzer_tone_div(void);
+void board_buzzer_set_min_beep_ms(uint16_t ms);
+uint16_t board_buzzer_min_beep_ms(void);
+void board_dmm_beep_irq_handler(void);
+void board_dmm_beep_probe(uint32_t *rise, uint32_t *fall, uint8_t *level);
+void board_dmm_beep_pulse_probe(uint32_t *edges, uint32_t *high,
+                                uint32_t *samples, uint32_t *cycles);
+void board_probe_watch_tick(void);
+void board_pin_sweep_clear(void);
+void board_beep_stat_inc(uint8_t slot);
+uint32_t board_beep_stat(uint8_t slot);
+uint32_t board_beep_last_on_ticks(void);
+uint16_t board_pin_sweep_read(uint8_t port, uint8_t bit);
+uint32_t board_pin_sweep_samples(void);
+void board_probe_watch_read(uint8_t *pc0, uint32_t *pc0_edges,
+                            uint8_t *pc7, uint32_t *pc7_edges);
+void board_dmm_beep_chain_probe(uint32_t *noarm, uint32_t *irq_start,
+                                uint32_t *on, uint32_t *off,
+                                uint32_t *last_cycles, uint32_t *seen_taken,
+                                uint8_t *armed);
 void battery_init(void);
 void battery_update(void);
 void battery_update_charging_status(void);

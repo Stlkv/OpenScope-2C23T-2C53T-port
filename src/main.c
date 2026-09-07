@@ -52,6 +52,11 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
     uint8_t diode_mode = ui_diode_beep_enabled();
     uint8_t live_mode = ui_live_beep_enabled();
 
+    /* Bench watch on the two probe-ish pins, sampled here because this is the
+     * fastest loop the port has. Read only; it decides nothing. */
+    board_probe_watch_tick();
+    board_beep_stat_inc(0);
+
     if (diode_mode && !diode_beep_was_enabled) {
         diode_beep_ready = 0;
         diode_beep_hold_ms = 0;
@@ -80,7 +85,30 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
             diode_beep_ready = 1;
             (void)board_dmm_beep_edge_seen();
         }
+#if HW_TARGET_2C53T
+        /* Measured 2026-09-07: the old gate left the beep dead for 2-4 s after
+         * entering continuity (armed=0 at 2.0 s, armed=1 at 4.1 s), because
+         * diode_beep_ready waits for the first parsed frame while the mode
+         * transition is still draining frames. That gate exists to stop a
+         * beep from stale data at mode entry -- which cannot happen through
+         * the line, since a PC3 edge is a physical event. So the line arms as
+         * soon as we are in the mode; only the frame source stays behind
+         * diode_beep_ready. */
+        board_dmm_beep_irq_arm(1);
+        dmm_beep_seen = (uint8_t)(board_dmm_beep_edge_seen() ||
+                                  (diode_beep_ready &&
+                                   dmm_diode_continuity_active()));
+#else
         if (diode_beep_ready) {
+            /* PC3 pulses while the SoC wants a tone (measured 2026-09-07:
+             * nothing at all until the probes are shorted in continuity, then
+             * a train of tens of thousands of edges). Stock re-arms the tone
+             * on every pulse and lets a timeout kill it; here every pulse
+             * sets edge_seen and edge_seen refreshes DIODE_BEEP_HOLD_MS, which
+             * is the same shape. The frame's own continuity mark stays OR'd in
+             * as an independent second source -- on this unit the SoC prints
+             * "0.170 Ohm" in continuity instead of the stock BCD mark, so the
+             * frame path alone stayed silent. */
 #if HW_TARGET_HW40
             board_dmm_beep_irq_arm(0);
             dmm_beep_seen = dmm_diode_continuity_active();
@@ -93,8 +121,22 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
             (void)board_dmm_beep_edge_seen();
             dmm_beep_seen = 0;
         }
+#endif
         if (dmm_beep_seen) {
-            diode_beep_hold_ms = DIODE_BEEP_HOLD_MS;
+            /* A tap can be a single PC3 pulse: the first pulse after silence
+             * latches the minimum audible length, later pulses only refresh
+             * the keep-alive tail. board_buzzer_min_beep_ms() is 0 on the
+             * 2C23T, which leaves that board's behaviour as it was. */
+            uint16_t hold = board_buzzer_min_beep_ms();
+            if (hold < DIODE_BEEP_HOLD_MS) {
+                hold = DIODE_BEEP_HOLD_MS;
+            }
+            if (diode_beep_hold_ms == 0) {
+                diode_beep_hold_ms = hold;
+                board_beep_stat_inc(1);
+            } else if (diode_beep_hold_ms < DIODE_BEEP_HOLD_MS) {
+                diode_beep_hold_ms = DIODE_BEEP_HOLD_MS;
+            }
         } else if (diode_beep_hold_ms > elapsed_ms) {
             diode_beep_hold_ms = (uint16_t)(diode_beep_hold_ms - elapsed_ms);
         } else {
@@ -152,6 +194,8 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
     } else if (force_full) {
         if (buzzer_on) {
             ui_beep_ms = 0;
+        } else {
+            board_beep_stat_inc(2);
         }
         board_buzzer_set_full(buzzer_on);
     } else if (fixed_volume) {
@@ -168,6 +212,9 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
             board_buzzer_set(1);
         }
     } else {
+        if (!buzzer_on) {
+            board_beep_stat_inc(3);
+        }
         board_buzzer_set(buzzer_on);
     }
 }

@@ -23,6 +23,9 @@ void USART2_IRQHandler(void);
 void USART3_IRQHandler(void);
 #endif
 void power_key_irq_handler(void);
+#if HW_TARGET_2C53T
+void board_dmm_beep_irq_handler(void);
+#endif
 void fpga_capture_ready_irq_handler(void);
 int main(void);
 
@@ -145,7 +148,12 @@ void Default_Handler(void) {
 }
 
 void EXTI3_IRQHandler(void) {
+#if HW_TARGET_2C53T
+    /* PC3, the meter SoC's beep request; POWER is polled on this board. */
+    board_dmm_beep_irq_handler();
+#else
     power_key_irq_handler();
+#endif
 }
 
 void EXTI4_IRQHandler(void) {

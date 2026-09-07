@@ -18,6 +18,10 @@ const char *dmm_status_text(void);
 uint8_t dmm_reading_is_real(void);
 uint8_t dmm_live_wire_active(void);
 uint8_t dmm_diode_continuity_active(void);
+#if HW_TARGET_2C53T
+void dmm_cont_frame_counts(uint32_t *frames, uint32_t *numeric);
+void dmm_cont_frame_clear(void);
+#endif
 void dmm_uart_irq_handler(void);
 
 /* 2C53T only (dmm53.c): small-font debug overlay lines for the meter
