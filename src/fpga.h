@@ -275,6 +275,15 @@ void fpga53_glitch_stats(uint8_t ch,
  * channel follows a signal the window cannot contain. */
 void fpga53_window_envelope(uint8_t ch, uint8_t *emin, uint8_t *emax);
 
+/* Spread of the first rising crossing across fresh frames, per channel, and
+ * the frame count it rests on; cleared by the read. This is the trigger's own
+ * metric: with the window free-running the first crossing wanders over a full
+ * period (100 samples at 50 kHz and 5 MSa/s), with the window aligned to the
+ * input it sits inside the edge jitter. Compare the spread against T16/16 from
+ * the same dump, never against a number from another run. */
+void fpga53_first_spread(uint8_t ch, uint16_t *fmin, uint16_t *fmax,
+                         uint16_t *n);
+
 /* Decimated raw samples of each channel's last window — the trimmed part, the
  * one the renderer draws, before the ADC offset subtraction. Returns the
  * buffer and reports its length and the sample step it was taken at. Summary

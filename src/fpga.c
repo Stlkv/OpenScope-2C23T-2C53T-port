@@ -1601,6 +1601,22 @@ static uint32_t fpga53_gl_last[2];
 static uint8_t fpga53_env_min[2] = {0xFFu, 0xFFu};
 static uint8_t fpga53_env_max[2];
 
+/* Where the first rising crossing of the trimmed window falls, accumulated
+ * across fresh frames and cleared by the dump that reads it. This is the one
+ * number a trigger can show up in. A free-running engine hands the window back
+ * at whatever phase the refill happened to land on, so `first` wanders over a
+ * whole period - 100 samples at 50 kHz and 5 MSa/s. An engine that aligns the
+ * window to the input pins it to the edge's own jitter, a few samples. The
+ * period is measured in the same pass, so the spread is read against it and
+ * not against a constant from the journal.
+ *
+ * Registered here rather than in the seam build because `trigreg` needs it in
+ * an ordinary scope image: the 2026-09-06 sweep of register 0x08 could not
+ * tell "no effect" from "flat input has no phase" for want of exactly this. */
+static uint16_t fpga53_first_min[2] = {0xFFFFu, 0xFFFFu};
+static uint16_t fpga53_first_max[2];
+static uint16_t fpga53_first_n[2];
+
 /* A crossing pair closer than this is the acquisition, not the input: at
  * 50 kHz and 5 MSa/s the grid runs 48-52 samples, and a real edge jitters by
  * one or two. Same constant the 2026-08-16 seam hunt used. */
@@ -1704,6 +1720,16 @@ static void fpga53_window_metrics(uint8_t ch) {
         ++fpga53_gl_hit[ch];
     }
 
+    if (fresh && edges >= 2u) {
+        if (first < fpga53_first_min[ch]) {
+            fpga53_first_min[ch] = first;
+        }
+        if (first > fpga53_first_max[ch]) {
+            fpga53_first_max[ch] = first;
+        }
+        ++fpga53_first_n[ch];
+    }
+
     if (ch) {
         fpga53_diag.win_edges2 = edges;
         fpga53_diag.win_period2 =
@@ -1735,6 +1761,28 @@ void fpga53_window_envelope(uint8_t ch, uint8_t *emin, uint8_t *emax) {
      * one, so the bench gesture is "attach the probe, take a dump". */
     fpga53_env_min[ch] = 0xFFu;
     fpga53_env_max[ch] = 0;
+}
+
+/* Read and clear, same gesture as the envelope: the bench takes one dump per
+ * trigger-register value, and each dump must report the frames since the last
+ * one. `n` is the denominator - a spread of 0 over 2 frames says nothing. */
+void fpga53_first_spread(uint8_t ch, uint16_t *fmin, uint16_t *fmax,
+                         uint16_t *n) {
+    if (ch > 1u) {
+        ch = 1u;
+    }
+    if (fmin) {
+        *fmin = fpga53_first_n[ch] ? fpga53_first_min[ch] : 0u;
+    }
+    if (fmax) {
+        *fmax = fpga53_first_max[ch];
+    }
+    if (n) {
+        *n = fpga53_first_n[ch];
+    }
+    fpga53_first_min[ch] = 0xFFFFu;
+    fpga53_first_max[ch] = 0;
+    fpga53_first_n[ch] = 0;
 }
 
 void fpga53_glitch_stats(uint8_t ch,

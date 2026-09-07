@@ -283,13 +283,19 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
      *   env = envelope across frames since the previous dump; the liveness
      *         test on inputs slower than the 166 us window
      *   e/T16 = rising crossings and mean period x16, window samples
+     *   fst = first rising crossing across frames: min-max/frames. Read it
+     *         against T16/16: a spread near one period is a window that starts
+     *         wherever the refill left it, a spread of a few samples is a
+     *         window aligned to the input. The trigger metric.
      *   G   = glitch reach: furthest start / frames hit / fresh frames */
     for (uint8_t ch = 0; ch < 2u; ++ch) {
         uint16_t gmax = 0, hit = 0, frames = 0;
+        uint16_t fmin = 0, fmax = 0, fn = 0;
         uint8_t emin = 0, emax = 0;
 
         fpga53_glitch_stats(ch, &gmax, &hit, &frames);
         fpga53_window_envelope(ch, &emin, &emax);
+        fpga53_first_spread(ch, &fmin, &fmax, &fn);
         p = put_str(dst, cap, p, ch ? "C2 w=" : "C1 w=");
         p = put_hex(dst, cap, p, ch ? dg.wmin2 : dg.wmin, 2);
         p = put_str(dst, cap, p, "-");
@@ -302,6 +308,12 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
         p = put_dec(dst, cap, p, ch ? dg.win_edges2 : dg.win_edges);
         p = put_str(dst, cap, p, " T16=");
         p = put_dec(dst, cap, p, ch ? dg.win_period2 : dg.win_period);
+        p = put_str(dst, cap, p, " fst=");
+        p = put_dec(dst, cap, p, fmin);
+        p = put_str(dst, cap, p, "-");
+        p = put_dec(dst, cap, p, fmax);
+        p = put_str(dst, cap, p, "/");
+        p = put_dec(dst, cap, p, fn);
         p = put_str(dst, cap, p, " G=");
         p = put_dec(dst, cap, p, gmax);
         p = put_str(dst, cap, p, "/");

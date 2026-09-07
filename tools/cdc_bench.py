@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import re
 import sys
 import time
 import zlib
@@ -106,6 +107,78 @@ def cmd_mon(args) -> int:
     return 0
 
 
+C1_RE = re.compile(
+    r"^C(?P<ch>[12]) w=(?P<wmin>[0-9A-F]{2})-(?P<wmax>[0-9A-F]{2})"
+    r" env=(?P<emin>[0-9A-F]{2})-(?P<emax>[0-9A-F]{2})"
+    r" e=(?P<edges>\d+) T16=(?P<t16>\d+)"
+    r" fst=(?P<fmin>\d+)-(?P<fmax>\d+)/(?P<fn>\d+)"
+    r" G=\d+/\d+/(?P<frames>\d+)",
+    re.M,
+)
+
+
+def cmd_trigsweep(args) -> int:
+    """Sweep scope-engine register 0x08 and tabulate the window's phase.
+
+    The 2026-09-06 sweep could not tell "the register does nothing" from "a
+    flat input has no phase to align": with no signal on CH1 every value gave
+    the same 62-63 frames per 3 s and the same envelope. The number that
+    separates the two is the spread of the first rising crossing (`fst` in the
+    dump) read against the period (`T16`/16) measured in the same frames:
+
+        spread ~ one period  -> the window starts wherever the refill left it
+        spread ~ a few samples -> the window is aligned to the input
+
+    So the pass/fail line is fixed before the run: any value of 0x08 whose
+    spread/period ratio drops well under 1.0 while a neighbouring value sits
+    near 1.0 is the register doing something. Every value near 1.0 is a
+    NEGATIVE result on a live input - which the flat-input run could not be.
+    """
+    values = [int(v, 0) for v in args.values.split(",")] if args.values else \
+        list(range(0, 256, args.step))
+    with open_port(find_port(args.port)) as port:
+        read_until_quiet(port, quiet=0.2, limit=1.0)
+        print("reg   ch  w      fst_min-fst_max  spread  T16/16  spr/per"
+              "     n   fresh/s")
+        for value in values:
+            send_line(port, f"trigreg {value}")
+            read_until_quiet(port, quiet=0.2, limit=2.0)
+            send_line(port, "dbg")                    # clears the accumulators
+            before = {m.group("ch"): int(m.group("frames"))
+                      for m in C1_RE.finditer(
+                          read_until_quiet(port, quiet=0.4, limit=3.0))}
+            started = time.monotonic()
+            time.sleep(args.dwell)
+            send_line(port, "dbg")                    # the frames since then
+            text = read_until_quiet(port, quiet=0.4, limit=3.0)
+            elapsed = time.monotonic() - started
+            rows = list(C1_RE.finditer(text))
+            if not rows:
+                print(f"0x{value:02X}  -- no dump")
+                continue
+            for m in rows:
+                ch = m.group("ch")
+                if args.channel and ch != args.channel:
+                    continue
+                fmin, fmax = int(m.group("fmin")), int(m.group("fmax"))
+                n, t16 = int(m.group("fn")), int(m.group("t16"))
+                spread = fmax - fmin
+                period = t16 / 16.0
+                ratio = f"{spread / period:6.3f}" if period else "   n/a"
+                # The second observable, and the one that survives a flat
+                # input: `fst` needs two crossings to mean anything, the fresh-
+                # frame rate needs none. It is a READ rate, not the engine's
+                # refill rate - the window is 205 us at 5 MSa/s and we read it
+                # about 15 times a second - so it counts reads that saw new
+                # content, and it falls when the engine holds a window longer.
+                fps = (int(m.group("frames")) - before.get(ch, 0)) / elapsed
+                w = f"{m.group('wmin')}-{m.group('wmax')}"
+                print(f"0x{value:02X}  C{ch}  {w}  {fmin:6d}-{fmax:<6d}"
+                      f"  {spread:6d}  {period:6.2f}  {ratio}  {n:4d}  {fps:6.2f}")
+        send_line(port, "mon off")
+    return 0
+
+
 def cmd_flash(args) -> int:
     payload = open(args.image, "rb").read()
     if len(payload) % 2:
@@ -168,6 +241,14 @@ def main() -> int:
     p.add_argument("--period", type=int, default=500, help="ms between dumps")
     p.add_argument("--log", help="also write the stream to this file")
     p.set_defaults(func=cmd_mon)
+
+    p = sub.add_parser("trigsweep",
+                       help="sweep scope reg 0x08 and tabulate window phase")
+    p.add_argument("--values", help="comma list, e.g. 0x00,0x2D,0xAD,0xFF")
+    p.add_argument("--step", type=int, default=16, help="sweep step when no list")
+    p.add_argument("--dwell", type=float, default=1.5, help="s of frames per value")
+    p.add_argument("--channel", choices=["1", "2"], default="1")
+    p.set_defaults(func=cmd_trigsweep)
 
     p = sub.add_parser("flash", help="stream an image into a W25Q cache slot")
     p.add_argument("image")
