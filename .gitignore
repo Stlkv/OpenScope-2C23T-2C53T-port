@@ -4,3 +4,4 @@ dist/
 *.elf
 *.map
 *.o
+__pycache__/
