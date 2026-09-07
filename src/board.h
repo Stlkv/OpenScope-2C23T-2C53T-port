@@ -41,6 +41,7 @@ uint8_t board_power_off_requested(void);
 void board_power_off(void);
 void board_backlight_set(uint8_t on);
 void board_backlight_set_level(uint8_t percent);
+uint8_t board_backlight_level(void); /* 2C53T only */
 void board_buzzer_init(void);
 void board_buzzer_set(uint8_t on);
 void board_buzzer_set_full(uint8_t on);

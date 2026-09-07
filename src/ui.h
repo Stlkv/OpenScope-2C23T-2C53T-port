@@ -11,6 +11,12 @@ void ui_note_runtime_settings(void);
 uint8_t ui_consume_beep_preview(void);
 uint8_t ui_auto_sleep_due(void);
 uint8_t ui_diode_beep_enabled(void);
+/* 2C53T only: the palette indirection is gated there, see ui.c. */
+void ui_set_theme(uint8_t light);  /* 0 = dark (default), 1 = light draft */
+void ui_settings_set_theme(uint8_t light); /* + persist, as the menu tile does */
+void ui_capture_screenshot(void);          /* bench: SAVE without the button */
+void ui_shell_inject_keys(uint32_t events);/* bench: drive the UI from the host */
+uint8_t ui_theme(void);
 uint8_t ui_live_beep_enabled(void);
 void ui_set_live_wire_detected(uint8_t detected);
 /* Current UI mode + overlay packed for the DBGREQ dump: low nibble = mode

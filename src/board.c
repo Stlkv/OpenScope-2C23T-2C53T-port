@@ -252,21 +252,62 @@ static void tmr5_update_counter(void) {
 }
 
 #if HW_TARGET_2C53T
+/* PB8 is TMR10_CH1, the other half of the discovery that named the piezo:
+ * stock enables IOPBEN+TMR10EN and IOPBEN+TMR11EN back to back, and its
+ * TMR10 runs DIV=119, PR=99 -- 10 kHz at a 120 MHz APB2 -- with C1DT
+ * (0x40015034) as the brightness. Until now this board drove PB8 as a plain
+ * output and the brightness setting was cosmetic.
+ *
+ * Full brightness deliberately stays a plain GPIO high, exactly the path this
+ * board has always used: at the default level the screen does not depend on
+ * the timer at all, so a mistake here cannot leave a dark display on a device
+ * that only comes back through MENU+Power. The UI's levels are
+ * 20/40/60/80/100, so only the four lower ones engage the PWM. */
+enum {
+    BACKLIGHT53_PR = 99u,
+    BACKLIGHT53_DIV = 119u,
+};
+
+static void backlight53_pwm_off(void) {
+    TMR_CCEN(TMR10_BASE) &= ~1u;
+    TMR_CTRL1(TMR10_BASE) &= ~1u;
+}
+
+static void backlight53_apply(void) {
+    if (!g_backlight_on) {
+        gpio_config_mask(GPIOB_BASE, 1u << 8, 0x1u);
+        gpio_clear(GPIOB_BASE, 1u << 8);
+        backlight53_pwm_off();
+        return;
+    }
+    if (g_backlight_percent >= 100u) {
+        gpio_config_mask(GPIOB_BASE, 1u << 8, 0x1u);
+        gpio_set(GPIOB_BASE, 1u << 8);
+        backlight53_pwm_off();
+        return;
+    }
+    TMR_C1DT(TMR10_BASE) =
+        percent_to_timer_compare(g_backlight_percent, BACKLIGHT53_PR);
+    TMR_CCEN(TMR10_BASE) |= 1u;  // CH1 enable
+    TMR_CTRL1(TMR10_BASE) |= 1u; // counter on
+    gpio_config_mask(GPIOB_BASE, 1u << 8, 0xBu); // TMR10 CH1, AF push-pull
+}
+
 void board_backlight_set(uint8_t on) {
     g_backlight_on = on ? 1u : 0u;
-    if (on) {
-        gpio_set(GPIOB_BASE, 1u << 8); // PB8 plain GPIO backlight
-    } else {
-        gpio_clear(GPIOB_BASE, 1u << 8);
-    }
-    tmr5_update_counter();
+    backlight53_apply();
 }
 
 void board_backlight_set_level(uint8_t percent) {
     if (percent > 100u) {
         percent = 100u;
     }
-    g_backlight_percent = percent; // no PWM on PB8; brightness setting is cosmetic
+    g_backlight_percent = percent;
+    backlight53_apply();
+}
+
+uint8_t board_backlight_level(void) {
+    return g_backlight_percent;
 }
 #else
 void board_backlight_set(uint8_t on) {
@@ -306,6 +347,18 @@ void board_buzzer_init(void) {
     /* Piezo: PB9 = TMR11_CH1. Between beeps the pin stays a plain output
      * because the meter frontend pose still lists it (dmm53_apply_mux), so a
      * beep borrows it as AF push-pull and hands it back. */
+    RCC_APB2ENR |= 1u << 20; // TMR10, backlight PWM on PB8
+    TMR_CTRL1(TMR10_BASE) = 0;
+    TMR_CCEN(TMR10_BASE) = 0;
+    TMR_PSC(TMR10_BASE) = BACKLIGHT53_DIV;
+    TMR_PR(TMR10_BASE) = BACKLIGHT53_PR;
+    TMR_RPR(TMR10_BASE) = 0;
+    TMR_C1DT(TMR10_BASE) = BACKLIGHT53_PR; // full until a level says otherwise
+    TMR_CCM1(TMR10_BASE) = (6u << 4) | (1u << 3); // CH1 PWM mode A, preload
+    TMR_BRK(TMR10_BASE) |= 1u << 15;              // MOE, as in stock's init
+    TMR_EG(TMR10_BASE) = 1u;
+    TMR_CTRL1(TMR10_BASE) = 1u << 7;              // ARPE, counter off
+
     RCC_APB2ENR |= 1u << 21; // TMR11, stock enables it right after IOPBEN
     TMR_CTRL1(TMR11_BASE) = 0;
     TMR_CCEN(TMR11_BASE) = 0;
@@ -530,6 +583,7 @@ void board_probe_watch_tick(void) {
 #endif
 }
 
+#if HW_TARGET_2C53T
 void board_beep_stat_inc(uint8_t slot) {
     if (slot < 5u) {
         g_beep_stat[slot]++;
@@ -582,6 +636,14 @@ void board_probe_watch_read(uint8_t *pc0, uint32_t *pc0_edges,
     *pc0_edges = g_pc0_edges;
     *pc7_edges = g_pc7_edges;
 }
+#else
+/* The bench counters above live on the 2C53T hunt for the beep chain; the
+ * 2C23T shares the policy code that pokes one of them, so it gets a stub
+ * rather than the counters. */
+void board_beep_stat_inc(uint8_t slot) {
+    (void)slot;
+}
+#endif
 
 uint16_t board_buzzer_min_beep_ms(void) {
 #if HW_TARGET_2C53T

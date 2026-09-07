@@ -231,6 +231,10 @@ static void cmd_help(const char *args) {
            "  beep hold [ms]               shortest audible continuity tone\r\n"
            "  beep sw                      fire one PC3 pulse in software, time the tone\r\n"
            "  pins [clear]                 GPIOs that changed since clear\r\n"
+           "  bl [0-100]                   backlight level; PB8 duty measured\r\n"
+           "  theme [0|1]                  UI palette: 0 dark, 1 light draft\r\n"
+           "  shot                         store a screenshot to the volume\r\n"
+           "  key <name>[,<name>]          inject UI key events\r\n"
 #endif
            "  pin <A-E><n> <0|1|in>        drive a GPIO as push-pull output, or read it\r\n"
            "  uptime                       ms since boot\r\n");
@@ -1127,6 +1131,41 @@ static void cmd_beep(const char *args) {
 #endif
 
 #if HW_TARGET_2C53T
+/* Bench: `bl [percent]` sets the backlight level and counts PB8's duty by
+ * sampling IDR, the same way `beep` measures the piezo. Full brightness is a
+ * plain GPIO high by design, so 100 reads back as 100% with the timer off. */
+static void cmd_bl(const char *args) {
+    const char *p = skip_spaces(args);
+    uint32_t pct;
+    uint32_t high = 0;
+    uint32_t samples = 0;
+
+    if (*p) {
+        if (!parse_u32(&p, &pct) || pct > 100u) {
+            sh_out("usage: bl [0-100]\r\n");
+            return;
+        }
+        board_backlight_set_level((uint8_t)pct);
+    }
+    for (uint32_t i = 0; i < 60000u; ++i) {
+        if (GPIO_IDR(GPIOB_BASE) & (1u << 8)) {
+            ++high;
+        }
+        ++samples;
+    }
+    sh_out("bl level=");
+    sh_u32(board_backlight_level());
+    sh_out("% pb8 high=");
+    sh_u32(high);
+    sh_out("/");
+    sh_u32(samples);
+    sh_out(" =");
+    sh_u32(samples ? (high * 100u) / samples : 0u);
+    sh_out("% cr=");
+    sh_hex((REG32(GPIOB_BASE + 0x04u) >> 0) & 0xFu, 1);
+    sh_out("\r\n");
+}
+
 /* Bench: `pins` lists every GPIO that changed since `pins clear`, with the
  * sample count for scale. Run it once idle for a baseline and once over a tap
  * series: a line that answers a probe touch stands out against the keypad
@@ -1158,6 +1197,88 @@ static void cmd_pins(const char *args) {
         }
     }
     sh_out("\r\n");
+}
+#endif
+
+#if HW_TARGET_2C53T
+/* Bench: `shot` stores a screenshot to the device volume exactly as a long
+ * SAVE does, and `key <name>[,<name>...]` injects UI key events. Together
+ * they make a screen-by-screen palette check scriptable: set the state, take
+ * the shot, read the BMP off the volume. Remount the volume before reading --
+ * the host caches FAT. */
+static void cmd_shot(const char *args) {
+    (void)args;
+    ui_capture_screenshot();
+    sh_out("shot stored (read img_NN.bmp after a remount)\r\n");
+}
+
+static const struct { const char *name; uint32_t bit; } sh_keys[] = {
+    { "move", KEY_MOVE }, { "f2", KEY_F2 }, { "f3", KEY_F3 }, { "f4", KEY_F4 },
+    { "auto", KEY_AUTO }, { "menu", KEY_MENU }, { "left", KEY_LEFT },
+    { "right", KEY_RIGHT }, { "up", KEY_UP }, { "down", KEY_DOWN },
+    { "ok", KEY_OK }, { "ch1", KEY_CH1 }, { "ch2", KEY_CH2 },
+    { "save", KEY_SAVE }, { "movelong", KEY_MOVE_LONG },
+    { "f2long", KEY_F2_LONG }, { "f3long", KEY_F3_LONG },
+    { "f4long", KEY_F4_LONG }, { "autolong", KEY_AUTO_LONG },
+    { "savelong", KEY_SAVE_LONG }, { "ch1long", KEY_CH1_LONG }, { 0, 0 },
+};
+
+static void cmd_key(const char *args) {
+    const char *p = skip_spaces(args);
+    uint32_t events = 0;
+
+    while (*p) {
+        const char *start = p;
+        uint32_t bit = 0;
+        while (*p && *p != ',' && *p != ' ') {
+            ++p;
+        }
+        for (uint8_t i = 0; sh_keys[i].name; ++i) {
+            const char *a = start;
+            const char *b = sh_keys[i].name;
+            while (a < p && *b && ((*a | 0x20) == *b)) {
+                ++a;
+                ++b;
+            }
+            if (a == p && *b == '\0') {
+                bit = sh_keys[i].bit;
+                break;
+            }
+        }
+        if (!bit) {
+            sh_out("key: unknown name (power is refused on purpose)\r\n");
+            return;
+        }
+        events |= bit;
+        p = skip_spaces(*p == ',' ? p + 1 : p);
+    }
+    if (!events) {
+        sh_out("usage: key <move|f2|f3|f4|menu|ok|up|down|left|right|save|...>\r\n");
+        return;
+    }
+    ui_shell_inject_keys(events);
+    sh_out("key ");
+    sh_hex(events, 6);
+    sh_out("\r\n");
+}
+
+/* Bench: `theme [0|1]` flips the UI palette. Phase 1 of the colour-scheme
+ * plan -- not persisted, no menu row yet, and the light table is a draft
+ * with the inline colours of the sweep and math menus still unconverted. */
+static void cmd_theme(const char *args) {
+    const char *p = skip_spaces(args);
+    uint32_t want;
+
+    if (*p) {
+        if (!parse_u32(&p, &want) || want > 1u) {
+            sh_out("usage: theme [0|1]   (0 dark, 1 light draft)\r\n");
+            return;
+        }
+        ui_settings_set_theme((uint8_t)want);
+    }
+    sh_out("theme ");
+    sh_u32(ui_theme());
+    sh_out(ui_theme() ? " (light draft)\r\n" : " (dark)\r\n");
 }
 #endif
 
@@ -1201,6 +1322,10 @@ static const sh_cmd_t sh_cmds[] = {
     { "meterc", cmd_meterc },
     { "beep", cmd_beep },
     { "pins", cmd_pins },
+    { "bl", cmd_bl },
+    { "theme", cmd_theme },
+    { "shot", cmd_shot },
+    { "key", cmd_key },
 #endif
 #endif
     { "mode", cmd_mode },

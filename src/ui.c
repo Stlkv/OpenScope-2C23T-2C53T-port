@@ -414,6 +414,7 @@ static void ui_settings_copy(settings_state_t *dst, const settings_state_t *src)
     dst->dmm_mode = src->dmm_mode;
     dst->beep_level = src->beep_level;
     dst->brightness_level = src->brightness_level;
+    dst->theme = src->theme;
     dst->startup_screen = src->startup_screen;
     dst->last_screen = src->last_screen;
     dst->sleep_enabled = src->sleep_enabled;
@@ -487,8 +488,15 @@ enum {
     SCOPE_STUB_FRAME_MS = 90,
     DMM_FAST_RENDER_MS = 80,
     DMM_STATS_ZERO_RESET_SAMPLES = 8,
+#if HW_TARGET_2C53T
+    /* Six tiles: BEEP DISPLAY START / SLEEP THEME INFO — two full rows of the
+     * three-column grid. THEME is 2C53T-only, so the 2C23T keeps five. */
+    SETTINGS_ROW_COUNT = 6,
+    SETTINGS_SELECTABLE_COUNT = 5,
+#else
     SETTINGS_ROW_COUNT = 5,
     SETTINGS_SELECTABLE_COUNT = 4,
+#endif
     SETTINGS_GRID_COLUMNS = 3,
     GEN_PREVIEW_CYCLES = 3,
     GEN_DEFERRED_APPLY_MS = 100,
@@ -509,6 +517,211 @@ enum {
     SCOPE_CURSOR_COUNT,
 };
 
+#if HW_TARGET_2C53T
+/* Gated to the 2C53T on purpose. Every C_* use site becomes a load through
+ * the pointer instead of an immediate, which measured +796 B on the 2C23T
+ * builds -- and hw4 had 1812 B left under its 229376 B ceiling. That board
+ * gains nothing from a theme, so it keeps the constants and its headroom.
+ *
+ * The palette behind the C_* names. Phase 1 of docs/plans/
+ * ui-color-schemes-2026-09-07.md: the eighteen colours move into a table and
+ * the names become lookups through a pointer, so all 316 use sites stay
+ * exactly as they were. No C_* is used in a static initializer anywhere in
+ * this file -- checked before the change -- which is what makes the pointer
+ * form legal.
+ *
+ * The dark table carries the previous constants verbatim and stays the
+ * default, so nothing about the current screen changes. The light table is a
+ * FIRST DRAFT and is not the deliverable: with the 105 inline RGB565 call
+ * sites still in place (43 distinct values, 42 of them in the sweep and math
+ * menus), a light theme still has white-on-white patches. Those are phase 2,
+ * and choosing the light values properly is phase 4, against screenshots. */
+typedef struct {
+    uint16_t bg;
+    uint16_t top;
+    uint16_t panel;
+    uint16_t panel_2;
+    uint16_t grid;
+    uint16_t text;
+    uint16_t muted;
+    uint16_t warn;
+    uint16_t ch1;
+    uint16_t ch2;
+    uint16_t dmm;
+    uint16_t scope;
+    uint16_t gen;
+    uint16_t menu_scope;
+    uint16_t menu_gen;
+    uint16_t menu_settings;
+    uint16_t batt;
+    uint16_t batt_full;
+    uint16_t grid_bg;
+    uint16_t grid_axis;
+    uint16_t box_bg;
+    uint16_t box_frame;
+    uint16_t box_sep;
+    uint16_t box_text;
+    uint16_t box_dim;
+    uint16_t accent;
+    uint16_t accent_fg;
+    uint16_t plot_axis;
+    uint16_t plot_label;
+    uint16_t plot_label_dim;
+    uint16_t plot_bar;
+    uint16_t plot_alt;
+    uint16_t plot_note;
+    uint16_t plot_done;
+    uint16_t dbg_dim;
+    uint16_t ok;
+    uint16_t bad;
+    uint16_t warn_bright;
+    uint16_t err_bg;
+    uint16_t panel_run;
+    uint16_t ch1_dim;
+    uint16_t ch2_dim;
+    uint16_t math_trace;
+} ui_palette_t;
+
+static const ui_palette_t ui_pal_dark = {
+    .bg = RGB565(5, 9, 14),
+    .top = RGB565(12, 18, 24),
+    .panel = RGB565(16, 25, 34),
+    .panel_2 = RGB565(22, 34, 45),
+    .grid = RGB565(39, 53, 63),
+    .text = RGB565(232, 240, 246),
+    .muted = RGB565(126, 144, 154),
+    .warn = RGB565(238, 74, 80),
+    .ch1 = RGB565(245, 197, 66),
+    .ch2 = RGB565(48, 206, 230),
+    .dmm = RGB565(43, 202, 134),
+    .scope = RGB565(116, 154, 255),
+    .gen = RGB565(178, 118, 255),
+    .menu_scope = RGB565(180, 202, 220),
+    .menu_gen = RGB565(190, 118, 255),
+    .menu_settings = RGB565(255, 126, 92),
+    .batt = RGB565(232, 240, 246),
+    .batt_full = RGB565(232, 240, 246),
+    .grid_bg = RGB565(4, 8, 11),
+    .grid_axis = RGB565(67, 85, 95),
+    .box_bg = RGB565(30, 30, 45),
+    .box_frame = RGB565(255, 165, 0),
+    .box_sep = RGB565(100, 100, 100),
+    .box_text = RGB565(255, 255, 255),
+    .box_dim = RGB565(120, 120, 120),
+    .accent = RGB565(0, 120, 240),
+    .accent_fg = RGB565(255, 255, 255),
+    .plot_axis = RGB565(150, 150, 150),
+    .plot_label = RGB565(180, 180, 180),
+    .plot_label_dim = RGB565(140, 140, 140),
+    .plot_bar = RGB565(0, 180, 255),
+    .plot_alt = RGB565(255, 180, 40),
+    .plot_note = RGB565(255, 255, 0),
+    .plot_done = RGB565(180, 220, 180),
+    .dbg_dim = RGB565(160, 160, 160),
+    .ok = RGB565(0, 255, 0),
+    .bad = RGB565(255, 80, 80),
+    .warn_bright = RGB565(255, 200, 0),
+    .err_bg = RGB565(64, 24, 28),
+    .panel_run = RGB565(12, 56, 39),
+    .ch1_dim = RGB565(88, 65, 26),
+    .ch2_dim = RGB565(18, 72, 82),
+    .math_trace = RGB565(255, 0, 255),
+};
+
+/* Draft: the neutrals are inverted and the accents darkened enough to sit on
+ * a light ground. Untuned -- phase 4 replaces these against screenshots. */
+static const ui_palette_t ui_pal_light = {
+    .bg = RGB565(244, 246, 248),
+    .top = RGB565(226, 231, 236),
+    .panel = RGB565(232, 236, 240),
+    .panel_2 = RGB565(212, 219, 226),
+    .grid = RGB565(176, 186, 196),
+    .text = RGB565(18, 24, 30),
+    .muted = RGB565(92, 104, 114),
+    .warn = RGB565(196, 32, 40),
+    .ch1 = RGB565(138, 92, 0),
+    .ch2 = RGB565(12, 98, 116),
+    .dmm = RGB565(18, 128, 84),
+    .scope = RGB565(46, 84, 200),
+    .gen = RGB565(112, 52, 190),
+    .menu_scope = RGB565(70, 92, 110),
+    .menu_gen = RGB565(112, 52, 190),
+    .menu_settings = RGB565(178, 68, 32),
+    .batt = RGB565(18, 24, 30),
+    .batt_full = RGB565(18, 24, 30),
+    .grid_bg = RGB565(250, 251, 252),
+    .grid_axis = RGB565(150, 160, 170),
+    .box_bg = RGB565(236, 238, 242),
+    .box_frame = RGB565(200, 120, 0),
+    .box_sep = RGB565(170, 176, 182),
+    .box_text = RGB565(18, 24, 30),
+    .box_dim = RGB565(96, 104, 112),
+    .accent = RGB565(0, 86, 190),
+    .accent_fg = RGB565(250, 251, 252),
+    .plot_axis = RGB565(94, 102, 110),
+    .plot_label = RGB565(60, 70, 80),
+    .plot_label_dim = RGB565(100, 110, 120),
+    .plot_bar = RGB565(0, 110, 170),
+    .plot_alt = RGB565(190, 120, 0),
+    .plot_note = RGB565(126, 98, 0),
+    .plot_done = RGB565(22, 98, 48),
+    .dbg_dim = RGB565(90, 100, 110),
+    .ok = RGB565(0, 112, 40),
+    .bad = RGB565(190, 30, 40),
+    .warn_bright = RGB565(148, 94, 0),
+    .err_bg = RGB565(250, 220, 220),
+    .panel_run = RGB565(210, 238, 220),
+    .ch1_dim = RGB565(220, 200, 150),
+    .ch2_dim = RGB565(170, 210, 220),
+    .math_trace = RGB565(180, 0, 180),
+};
+
+static const ui_palette_t *ui_pal = &ui_pal_dark;
+
+#define C_BG            (ui_pal->bg)
+#define C_TOP           (ui_pal->top)
+#define C_PANEL         (ui_pal->panel)
+#define C_PANEL_2       (ui_pal->panel_2)
+#define C_GRID          (ui_pal->grid)
+#define C_TEXT          (ui_pal->text)
+#define C_MUTED         (ui_pal->muted)
+#define C_WARN          (ui_pal->warn)
+#define C_CH1           (ui_pal->ch1)
+#define C_CH2           (ui_pal->ch2)
+#define C_DMM           (ui_pal->dmm)
+#define C_SCOPE         (ui_pal->scope)
+#define C_GEN           (ui_pal->gen)
+#define C_MENU_SCOPE    (ui_pal->menu_scope)
+#define C_MENU_GEN      (ui_pal->menu_gen)
+#define C_MENU_SETTINGS (ui_pal->menu_settings)
+#define C_BATT          (ui_pal->batt)
+#define C_BATT_FULL     (ui_pal->batt_full)
+#define C_GRID_BG       (ui_pal->grid_bg)
+#define C_GRID_AXIS     (ui_pal->grid_axis)
+#define C_BOX_BG        (ui_pal->box_bg)
+#define C_BOX_FRAME     (ui_pal->box_frame)
+#define C_BOX_SEP       (ui_pal->box_sep)
+#define C_BOX_TEXT      (ui_pal->box_text)
+#define C_BOX_DIM       (ui_pal->box_dim)
+#define C_ACCENT        (ui_pal->accent)
+#define C_ACCENT_FG     (ui_pal->accent_fg)
+#define C_PLOT_AXIS     (ui_pal->plot_axis)
+#define C_PLOT_LABEL    (ui_pal->plot_label)
+#define C_PLOT_LABEL_DIM (ui_pal->plot_label_dim)
+#define C_PLOT_BAR      (ui_pal->plot_bar)
+#define C_PLOT_ALT      (ui_pal->plot_alt)
+#define C_PLOT_NOTE     (ui_pal->plot_note)
+#define C_PLOT_DONE     (ui_pal->plot_done)
+#define C_DBG_DIM       (ui_pal->dbg_dim)
+#define C_OK            (ui_pal->ok)
+#define C_BAD           (ui_pal->bad)
+#define C_WARN_BRIGHT   (ui_pal->warn_bright)
+#define C_ERR_BG        (ui_pal->err_bg)
+#define C_PANEL_RUN     (ui_pal->panel_run)
+#define C_CH1_DIM       (ui_pal->ch1_dim)
+#define C_CH2_DIM       (ui_pal->ch2_dim)
+#define C_MATH_TRACE    (ui_pal->math_trace)
+#else
 static const uint16_t C_BG = RGB565(5, 9, 14);
 static const uint16_t C_TOP = RGB565(12, 18, 24);
 static const uint16_t C_PANEL = RGB565(16, 25, 34);
@@ -527,6 +740,35 @@ static const uint16_t C_MENU_GEN = RGB565(190, 118, 255);
 static const uint16_t C_MENU_SETTINGS = RGB565(255, 126, 92);
 static const uint16_t C_BATT = RGB565(232, 240, 246);
 static const uint16_t C_BATT_FULL = RGB565(232, 240, 246);
+/* Some roles are only drawn by 2C53T-only screens (the debug overlays, the
+ * math and sweep menus), so on this target a few of them are legitimately
+ * unused and -Werror would otherwise reject the build. */
+__attribute__((unused)) static const uint16_t C_GRID_BG = RGB565(4, 8, 11);
+__attribute__((unused)) static const uint16_t C_GRID_AXIS = RGB565(67, 85, 95);
+__attribute__((unused)) static const uint16_t C_BOX_BG = RGB565(30, 30, 45);
+__attribute__((unused)) static const uint16_t C_BOX_FRAME = RGB565(255, 165, 0);
+__attribute__((unused)) static const uint16_t C_BOX_SEP = RGB565(100, 100, 100);
+__attribute__((unused)) static const uint16_t C_BOX_TEXT = RGB565(255, 255, 255);
+__attribute__((unused)) static const uint16_t C_BOX_DIM = RGB565(120, 120, 120);
+__attribute__((unused)) static const uint16_t C_ACCENT = RGB565(0, 120, 240);
+__attribute__((unused)) static const uint16_t C_ACCENT_FG = RGB565(255, 255, 255);
+__attribute__((unused)) static const uint16_t C_PLOT_AXIS = RGB565(150, 150, 150);
+__attribute__((unused)) static const uint16_t C_PLOT_LABEL = RGB565(180, 180, 180);
+__attribute__((unused)) static const uint16_t C_PLOT_LABEL_DIM = RGB565(140, 140, 140);
+__attribute__((unused)) static const uint16_t C_PLOT_BAR = RGB565(0, 180, 255);
+__attribute__((unused)) static const uint16_t C_PLOT_ALT = RGB565(255, 180, 40);
+__attribute__((unused)) static const uint16_t C_PLOT_NOTE = RGB565(255, 255, 0);
+__attribute__((unused)) static const uint16_t C_PLOT_DONE = RGB565(180, 220, 180);
+__attribute__((unused)) static const uint16_t C_DBG_DIM = RGB565(160, 160, 160);
+__attribute__((unused)) static const uint16_t C_OK = RGB565(0, 255, 0);
+__attribute__((unused)) static const uint16_t C_BAD = RGB565(255, 80, 80);
+__attribute__((unused)) static const uint16_t C_WARN_BRIGHT = RGB565(255, 200, 0);
+__attribute__((unused)) static const uint16_t C_ERR_BG = RGB565(64, 24, 28);
+__attribute__((unused)) static const uint16_t C_PANEL_RUN = RGB565(12, 56, 39);
+__attribute__((unused)) static const uint16_t C_CH1_DIM = RGB565(88, 65, 26);
+__attribute__((unused)) static const uint16_t C_CH2_DIM = RGB565(18, 72, 82);
+__attribute__((unused)) static const uint16_t C_MATH_TRACE = RGB565(255, 0, 255);
+#endif
 
 enum {
     DMM_MODE_AUTO,
@@ -697,7 +939,13 @@ static const uint8_t gen_wave_order[] = {
 };
 static const char *const gen_param_labels[] = {"WAVE", "FREQ", "DUTY", "AMP"};
 static const char *const menu_labels[] = {"MULTIMETER", "OSCILLOSCOPE", "SIGNAL GENERATOR", "SETTINGS"};
+#if HW_TARGET_2C53T
+static const char *const settings_row_labels[] = {"BEEP", "DISPLAY", "START",
+                                                  "SLEEP", "THEME", "INFO"};
+static const char *const theme_labels[] = {"DARK", "LIGHT"};
+#else
 static const char *const settings_row_labels[] = {"BEEP", "DISPLAY", "START", "SLEEP", "INFO"};
+#endif
 static const char *const startup_labels[] = {"MENU", "DMM", "SCOPE", "GEN", "LAST"};
 static const char *const beep_level_labels[] = {"OFF", "LOW", "MEDIUM", "HIGH", "MAX"};
 static const char *const brightness_level_labels[] = {"DIM", "LOW", "MEDIUM", "HIGH", "BRIGHT"};
@@ -1221,7 +1469,7 @@ static void draw_fw_update_overlay(uint16_t bg) {
         return;
     }
 
-    box_bg = status.state == FW_UPDATE_STATE_ERROR ? RGB565(64, 24, 28) : C_TEXT;
+    box_bg = status.state == FW_UPDATE_STATE_ERROR ? C_ERR_BG : C_TEXT;
     box_fg = status.state == FW_UPDATE_STATE_ERROR ? C_TEXT : C_BG;
     lcd_rect(x, y, w, h, box_bg);
     lcd_frame(x, y, w, h, status.state == FW_UPDATE_STATE_ERROR ? C_WARN : C_PANEL_2);
@@ -1259,7 +1507,7 @@ static void draw_screenshot_overlay(uint16_t bg) {
         box_fg = C_BG;
         accent = C_DMM;
     } else {
-        box_bg = RGB565(64, 24, 28);
+        box_bg = C_ERR_BG;
         box_fg = C_TEXT;
         accent = C_WARN;
     }
@@ -1292,7 +1540,11 @@ static uint8_t dmm_group_first(uint8_t mode) {
     if (mode >= DMM_MODE_AC_HI_CURR) {
         return DMM_MODE_AC_HI_CURR;
     }
-    if (mode == DMM_MODE_DIODE || mode == DMM_MODE_CAP) {
+    if (mode == DMM_MODE_DIODE || mode == DMM_MODE_CAP
+#if HW_TARGET_2C53T
+        || mode == DMM_MODE_CONT
+#endif
+    ) {
         return DMM_MODE_DIODE;
     }
     if (mode >= DMM_MODE_LIVE) {
@@ -1309,7 +1561,11 @@ static uint8_t dmm_group_count(uint8_t first) {
         return 2;
     }
     if (first == DMM_MODE_DIODE) {
+#if HW_TARGET_2C53T
+        return 3; /* diode, continuity, capacitance */
+#else
         return 2;
+#endif
     }
     return 3;
 }
@@ -1762,6 +2018,14 @@ static void math_menu_step_selected(int8_t dir) {
     }
 }
 
+/* Text on a selected row sits on C_ACCENT, not on the box background, so it
+ * needs the accent's own foreground. In the dark palette both are white and
+ * this changes nothing; in a light one it is the difference between a 2.6 and
+ * a 6.6 contrast ratio, i.e. between unreadable and readable. */
+static uint16_t menu_row_fg(uint16_t bg, uint16_t fallback) {
+    return bg == C_ACCENT ? C_ACCENT_FG : fallback;
+}
+
 static void ui_draw_math_menu(void) {
     if (!ui_math_menu_visible) {
         return;
@@ -1795,19 +2059,19 @@ static void ui_draw_math_menu(void) {
     uint16_t box_h = (uint16_t)(36u + rows * 18u);
 
     // Draw menu background and frame
-    lcd_rect(box_x, box_y, box_w, box_h, RGB565(30, 30, 45));
-    lcd_frame(box_x, box_y, box_w, box_h, RGB565(255, 165, 0));
+    lcd_rect(box_x, box_y, box_w, box_h, C_BOX_BG);
+    lcd_frame(box_x, box_y, box_w, box_h, C_BOX_FRAME);
 
-    lcd_text(box_x + 10, box_y + 8, "MATH / BODE MENU", RGB565(255, 255, 255), RGB565(30, 30, 45), 1);
-    lcd_rect(box_x + 10, box_y + 20, box_w - 20, 1, RGB565(100, 100, 100));
+    lcd_text(box_x + 10, box_y + 8, "MATH / BODE MENU", C_BOX_TEXT, C_BOX_BG, 1);
+    lcd_rect(box_x + 10, box_y + 20, box_w - 20, 1, C_BOX_SEP);
 
     row_y = box_y + 26;
 
     for (uint8_t row = 0; row < rows; row++) {
         uint8_t item = menu[row];
 
-        color_bg = (scope_math_selected == row) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-        color_fg = RGB565(255, 255, 255);
+        color_bg = (scope_math_selected == row) ? C_ACCENT : C_BOX_BG;
+        color_fg = menu_row_fg(color_bg, C_BOX_TEXT);
 
         lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
 
@@ -1818,13 +2082,13 @@ static void ui_draw_math_menu(void) {
                 break;
 
             case MENU_ITEM_FFT_WINDOW:
-                if (scope_fft_src != 1 && scope_fft_src != 2) color_fg = RGB565(120, 120, 120);
+                if (scope_fft_src != 1 && scope_fft_src != 2) color_fg = C_BOX_DIM;
                 lcd_text(box_x + 12, row_y + 3, "FFT WINDOW:", color_fg, color_bg, 1);
                 lcd_text(box_x + 110, row_y + 3, fft_window_text[scope_fft_window], color_fg, color_bg, 1);
                 break;
 
             case MENU_ITEM_FFT_DISPLAY:
-                if (scope_fft_src != 1 && scope_fft_src != 2) color_fg = RGB565(120, 120, 120);
+                if (scope_fft_src != 1 && scope_fft_src != 2) color_fg = C_BOX_DIM;
                 lcd_text(box_x + 12, row_y + 3, "FFT DISPLAY:", color_fg, color_bg, 1);
                 lcd_text(box_x + 110, row_y + 3, fft_display_text[scope_fft_display], color_fg, color_bg, 1);
                 break;
@@ -1835,7 +2099,7 @@ static void ui_draw_math_menu(void) {
                 break;
 
             case MENU_ITEM_MATH_OP:
-                if (!scope_math_mode) color_fg = RGB565(120, 120, 120);
+                if (!scope_math_mode) color_fg = C_BOX_DIM;
                 lcd_text(box_x + 12, row_y + 3, "MATH OP:", color_fg, color_bg, 1);
                 lcd_text(box_x + 110, row_y + 3, math_op_text[scope_math_op], color_fg, color_bg, 1);
                 break;
@@ -1862,8 +2126,8 @@ static void ui_draw_math_menu(void) {
                             uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
                             char d_str[2] = { start_digits[d], '\0' };
                             if (d == ui_edit_digit_index) {
-                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, C_ACCENT_FG);
+                                lcd_text(dx, row_y + 3, d_str, C_ACCENT, C_ACCENT_FG, 1);
                             } else {
                                 lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
                             }
@@ -1876,9 +2140,9 @@ static void ui_draw_math_menu(void) {
                         uint8_t uselected = (uint8_t)(bstart_edit && ui_edit_digit_index == 4u);
                         static const char * const bsun[] = {"Hz", "kHz", "MHz"};
                         uint8_t bsun_idx = bode_start_unit < 3u ? bode_start_unit : 0;
-                        lcd_text(ux, row_y + 3, bsun[bsun_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+                        lcd_text(ux, row_y + 3, bsun[bsun_idx], uselected ? C_ACCENT : color_fg, uselected ? C_ACCENT_FG : color_bg, 1);
                         if (uselected) {
-                            lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(bsun_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
+                            lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(bsun_idx == 0u ? 10u : 16u), 2, C_ACCENT_FG);
                         }
                     }
                 }
@@ -1901,8 +2165,8 @@ static void ui_draw_math_menu(void) {
                             uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
                             char d_str[2] = { stop_digits[d], '\0' };
                             if (d == ui_edit_digit_index) {
-                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, C_ACCENT_FG);
+                                lcd_text(dx, row_y + 3, d_str, C_ACCENT, C_ACCENT_FG, 1);
                             } else {
                                 lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
                             }
@@ -1915,9 +2179,9 @@ static void ui_draw_math_menu(void) {
                         uint8_t uselected = (uint8_t)(bstop_edit && ui_edit_digit_index == 4u);
                         static const char * const bsun[] = {"Hz", "kHz", "MHz"};
                         uint8_t bsun_idx = bode_stop_unit < 3u ? bode_stop_unit : 0;
-                        lcd_text(ux, row_y + 3, bsun[bsun_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+                        lcd_text(ux, row_y + 3, bsun[bsun_idx], uselected ? C_ACCENT : color_fg, uselected ? C_ACCENT_FG : color_bg, 1);
                         if (uselected) {
-                            lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(bsun_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
+                            lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(bsun_idx == 0u ? 10u : 16u), 2, C_ACCENT_FG);
                         }
                     }
                 }
@@ -1938,8 +2202,8 @@ static void ui_draw_math_menu(void) {
                             uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
                             char d_str[2] = { steps_digits[d], '\0' };
                             if (d == ui_edit_digit_index) {
-                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, C_ACCENT_FG);
+                                lcd_text(dx, row_y + 3, d_str, C_ACCENT, C_ACCENT_FG, 1);
                             } else {
                                 lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
                             }
@@ -2060,22 +2324,22 @@ static void ui_draw_fft_spectrum(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t
     float f_max_hz = sample_rate_hz / 2.0f;
     float hz_per_bin = sample_rate_hz / (float)FFT_SIZE;
 
-    uint16_t bar_color = RGB565(0, 180, 255);
-    uint16_t axis_color = RGB565(150, 150, 150);
-    uint16_t text_bg = RGB565(30, 30, 45);
+    uint16_t bar_color = C_PLOT_BAR;
+    uint16_t axis_color = C_PLOT_AXIS;
+    uint16_t text_bg = C_BOX_BG;
     uint16_t y_bottom = (uint16_t)(gy + gh - 2u);
     uint16_t y_axis_top = (uint16_t)(gy + 2u);
     char freq_label[12];
 
     lcd_line(gx, y_axis_top, (uint16_t)(gx + gw), y_axis_top, axis_color);
-    lcd_text(gx, (uint16_t)(y_axis_top + 4u), "0.0HZ", RGB565(180, 180, 180), text_bg, 1);
+    lcd_text(gx, (uint16_t)(y_axis_top + 4u), "0.0HZ", C_PLOT_LABEL, text_bg, 1);
 
     scope_format_frequency_reading(freq_label, (uint32_t)(f_max_hz + 0.5f));
     uint16_t fw = lcd_text_width(freq_label, 1);
     lcd_text(gx + gw > fw ? (uint16_t)(gx + gw - fw) : gx,
              (uint16_t)(y_axis_top + 4u),
              freq_label,
-             RGB565(180, 180, 180),
+             C_PLOT_LABEL,
              text_bg,
              1);
 
@@ -2094,13 +2358,13 @@ static void ui_draw_fft_spectrum(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t
     lcd_text((uint16_t)(gx + gw / 2u - 30u),
              (uint16_t)(y_axis_top + 4u),
              "PK",
-             RGB565(255, 255, 0),
+             C_PLOT_NOTE,
              text_bg,
              1);
     lcd_text((uint16_t)(gx + gw / 2u - 12u),
              (uint16_t)(y_axis_top + 4u),
              freq_label,
-             RGB565(255, 255, 0),
+             C_PLOT_NOTE,
              text_bg,
              1);
 }
@@ -2494,10 +2758,10 @@ static void ui_draw_bode(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t gh) {
     uint16_t mag_h;
     uint16_t phase_y;
     uint16_t phase_h;
-    uint16_t axis_color = RGB565(150, 150, 150);
-    uint16_t text_bg = RGB565(30, 30, 45);
-    uint16_t mag_color = RGB565(0, 180, 255);
-    uint16_t phase_color = RGB565(255, 180, 40);
+    uint16_t axis_color = C_PLOT_AXIS;
+    uint16_t text_bg = C_BOX_BG;
+    uint16_t mag_color = C_PLOT_BAR;
+    uint16_t phase_color = C_PLOT_ALT;
     uint8_t completed;
     char label[16];
     uint16_t x_start;
@@ -2529,23 +2793,23 @@ static void ui_draw_bode(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t gh) {
     uint16_t phase_center_y = (uint16_t)(phase_y + (phase_h / 2u));
     lcd_line(x_start, phase_center_y, x_end, phase_center_y, axis_color);
     lcd_line(x_start, (uint16_t)(phase_y + phase_h), x_end, (uint16_t)(phase_y + phase_h), axis_color);
-    lcd_text(gx, (uint16_t)(gy + 2u), "MAG", RGB565(180, 180, 180), text_bg, 1);
-    lcd_text((uint16_t)(gx + gw - 46u), (uint16_t)(gy + 2u), "+20DB", RGB565(140, 140, 140), text_bg, 1);
-    lcd_text((uint16_t)(gx + gw - 34u), (uint16_t)(mag_0db_y - 4u), "0DB", RGB565(140, 140, 140), text_bg, 1);
-    lcd_text(gx, (uint16_t)(gy + mag_h - 5u), "-60", RGB565(140, 140, 140), text_bg, 1);
-    lcd_text(gx, (uint16_t)(phase_y + 2u), "PHASE", RGB565(180, 180, 180), text_bg, 1);
-    lcd_text((uint16_t)(gx + gw - 40u), (uint16_t)(phase_y + 2u), "+180", RGB565(140, 140, 140), text_bg, 1);
-    lcd_text(gx, (uint16_t)(phase_center_y - 4u), "0", RGB565(140, 140, 140), text_bg, 1);
-    lcd_text(gx, (uint16_t)(phase_y + phase_h - 10u), "-180", RGB565(140, 140, 140), text_bg, 1);
+    lcd_text(gx, (uint16_t)(gy + 2u), "MAG", C_PLOT_LABEL, text_bg, 1);
+    lcd_text((uint16_t)(gx + gw - 46u), (uint16_t)(gy + 2u), "+20DB", C_PLOT_LABEL_DIM, text_bg, 1);
+    lcd_text((uint16_t)(gx + gw - 34u), (uint16_t)(mag_0db_y - 4u), "0DB", C_PLOT_LABEL_DIM, text_bg, 1);
+    lcd_text(gx, (uint16_t)(gy + mag_h - 5u), "-60", C_PLOT_LABEL_DIM, text_bg, 1);
+    lcd_text(gx, (uint16_t)(phase_y + 2u), "PHASE", C_PLOT_LABEL, text_bg, 1);
+    lcd_text((uint16_t)(gx + gw - 40u), (uint16_t)(phase_y + 2u), "+180", C_PLOT_LABEL_DIM, text_bg, 1);
+    lcd_text(gx, (uint16_t)(phase_center_y - 4u), "0", C_PLOT_LABEL_DIM, text_bg, 1);
+    lcd_text(gx, (uint16_t)(phase_y + phase_h - 10u), "-180", C_PLOT_LABEL_DIM, text_bg, 1);
 
     scope_format_frequency_reading(label, bode_start_hz);
-    lcd_text((uint16_t)(gx + 28u), (uint16_t)(gy + mag_h - 10u), label, RGB565(180, 180, 180), text_bg, 1);
+    lcd_text((uint16_t)(gx + 28u), (uint16_t)(gy + mag_h - 10u), label, C_PLOT_LABEL, text_bg, 1);
     scope_format_frequency_reading(label, bode_stop_hz);
-    lcd_text((uint16_t)(gx + gw - 56u), (uint16_t)(gy + mag_h - 10u), label, RGB565(180, 180, 180), text_bg, 1);
+    lcd_text((uint16_t)(gx + gw - 56u), (uint16_t)(gy + mag_h - 10u), label, C_PLOT_LABEL, text_bg, 1);
     // scope_format_frequency_reading(label, bode_start_hz);
-    // lcd_text((uint16_t)(gx + 28u), (uint16_t)(phase_y + phase_h - 10u), label, RGB565(180, 180, 180), text_bg, 1);
+    // lcd_text((uint16_t)(gx + 28u), (uint16_t)(phase_y + phase_h - 10u), label, C_PLOT_LABEL, text_bg, 1);
     // scope_format_frequency_reading(label, bode_stop_hz);
-    // lcd_text((uint16_t)(gx + gw - 56u), (uint16_t)(phase_y + phase_h - 10u), label, RGB565(180, 180, 180), text_bg, 1);
+    // lcd_text((uint16_t)(gx + gw - 56u), (uint16_t)(phase_y + phase_h - 10u), label, C_PLOT_LABEL, text_bg, 1);
 
     for (i = 1; i < completed; ++i) {
         uint16_t x0 = (uint16_t)(gx + ((uint32_t)(i - 1u) * gw) / (uint32_t)(bode_steps - 1u));
@@ -2572,11 +2836,11 @@ static void ui_draw_bode(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t gh) {
             scope_format_u32(step_total, (uint32_t)bode_steps);
             ui_text_append(progress, step_total, sizeof(progress));
         }
-        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + gh - 12u), progress, RGB565(255, 255, 0), text_bg, 1);
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + gh - 12u), progress, C_PLOT_NOTE, text_bg, 1);
         scope_format_frequency_reading(label, bode_step_freq_hz);
-        lcd_text((uint16_t)(gx + gw - 72u), (uint16_t)(gy + gh - 12u), label, RGB565(255, 255, 0), text_bg, 1);
+        lcd_text((uint16_t)(gx + gw - 72u), (uint16_t)(gy + gh - 12u), label, C_PLOT_NOTE, text_bg, 1);
     } else if (completed > 0u) {
-        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + gh - 12u), "BODE DONE", RGB565(180, 220, 180), text_bg, 1);
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + gh - 12u), "BODE DONE", C_PLOT_DONE, text_bg, 1);
     }
 }
 
@@ -3598,9 +3862,13 @@ static uint8_t dmm_mode_uses_real_reading(void) {
 }
 
 static uint8_t dmm_sanitize_mode(uint8_t mode) {
+#if !HW_TARGET_2C53T
+    /* No continuity selector on the 2C23T; on the 2C53T it is a real mode
+     * (stock word 0x0517) and must come back after a power cycle. */
     if (mode == DMM_MODE_CONT) {
         return DMM_MODE_DIODE;
     }
+#endif
     return mode < DMM_MODE_COUNT ? mode : DMM_MODE_AUTO;
 }
 
@@ -4206,7 +4474,7 @@ static void draw_dmm_immersive_panel(void) {
 static void draw_dmm53_debug_overlay(void) {
     for (uint8_t i = 0; i < 4u; ++i) {
         lcd_text(14, (uint16_t)(155u + i * 11u), dmm53_debug_line(i),
-                 RGB565(255, 255, 255), C_BG, 1);
+                 C_TEXT, C_BG, 1);
     }
 }
 #endif
@@ -5008,9 +5276,9 @@ static uint8_t scope_sample_raw_at(uint16_t idx, uint8_t ch2) {
 
 static uint16_t scope_dim_color(uint16_t color) {
     if (color == C_CH1) {
-        return RGB565(88, 65, 26);
+        return C_CH1_DIM;
     }
-    return RGB565(18, 72, 82);
+    return C_CH2_DIM;
 }
 
 static uint32_t scope_timebase_unit_ns_value(void) {
@@ -6002,8 +6270,8 @@ static void draw_scope_stub_grid(uint16_t gx, uint16_t gy, uint16_t gw, uint16_t
         uint16_t y = (uint16_t)(gy + ((uint32_t)gh * div) / SCOPE_Y_DIVS);
         lcd_rect((uint16_t)(gx + 1u), y, (uint16_t)(gw - 2u), 1, C_GRID);
     }
-    lcd_rect((uint16_t)(gx + ((uint32_t)gw * 6u) / SCOPE_X_DIVS), (uint16_t)(gy + 1u), 2, (uint16_t)(gh - 2u), RGB565(67, 85, 95));
-    lcd_rect((uint16_t)(gx + 1u), (uint16_t)(gy + ((uint32_t)gh * 4u) / SCOPE_Y_DIVS), (uint16_t)(gw - 2u), 2, RGB565(67, 85, 95));
+    lcd_rect((uint16_t)(gx + ((uint32_t)gw * 6u) / SCOPE_X_DIVS), (uint16_t)(gy + 1u), 2, (uint16_t)(gh - 2u), C_GRID_AXIS);
+    lcd_rect((uint16_t)(gx + 1u), (uint16_t)(gy + ((uint32_t)gh * 4u) / SCOPE_Y_DIVS), (uint16_t)(gw - 2u), 2, C_GRID_AXIS);
 }
 
 static int16_t scope_stub_y(uint16_t px, uint16_t width, int16_t center, int16_t amp, uint8_t phase_offset) {
@@ -6352,7 +6620,7 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     p = (uint8_t)(p + ui_dbg_str(&dbg[p], " N"));
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], (uint16_t)dg.slow_points));
     dbg[p] = '\0';
-    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, RGB565(255, 255, 255), grid_bg, 1);
+    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, C_TEXT, grid_bg, 1);
 
     if (!dg.v04_id) {
         /* Two ways to get here. dg.warm = the warm-boot token was intact, so
@@ -6364,10 +6632,10 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
         lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u),
                  dg.warm ? "V:KEPT (warm boot, port not touched)"
                          : "V:SILENT (FPGA configured - warm boot)",
-                 RGB565(160, 160, 160), grid_bg, 1);
+                 C_DBG_DIM, grid_bg, 1);
         lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u),
                  eng_ok ? "ENG:RUN" : "ENG:DEAD",
-                 eng_ok ? RGB565(0, 255, 0) : RGB565(255, 80, 80), grid_bg, 1);
+                 eng_ok ? C_OK : C_BAD, grid_bg, 1);
     }
     if (dg.v04_id) {
         /* The 0x80 first-window marker can land on the top byte of any of the
@@ -6375,9 +6643,9 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
          * bit 7. */
         {
             static const uint8_t cst_ok[5] = {0x00u, 0x01u, 0x42u, 0x2Eu, 0x2Eu};
-            const uint16_t ok_c = RGB565(0, 255, 0);
-            const uint16_t bad_c = RGB565(255, 80, 80);
-            const uint16_t warn_c = RGB565(255, 200, 0);
+            const uint16_t ok_c = C_OK;
+            const uint16_t bad_c = C_BAD;
+            const uint16_t warn_c = C_WARN_BRIGHT;
             uint32_t id_m = dg.v04_id & 0x7FFFFFFFu;
             uint32_t stb_m = dg.v04_stb & 0x7FFFFFFFu;
             uint32_t sta_m = dg.v04_sta & 0x7FFFFFFFu;
@@ -6445,10 +6713,10 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
                 }
                 dbg[p] = '\0';
                 lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u), dbg,
-                         RGB565(255, 255, 0), grid_bg, 1);
+                         C_PLOT_NOTE, grid_bg, 1);
                 lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 33u),
                          "exp B=00039020 A=0003F460",
-                         RGB565(160, 160, 160), grid_bg, 1);
+                         C_DBG_DIM, grid_bg, 1);
             }
         }
     }
@@ -6460,7 +6728,7 @@ static void draw_scope_chrome_live(void) {
     uint16_t gy = 55;
     uint16_t gw = 300;
     uint16_t gh = 124;
-    uint16_t grid_bg = RGB565(6, 12, 16);
+    uint16_t grid_bg = C_GRID_BG;
 
 #if SCOPE_UI_SAFE_STUB
     scope_sanitize_state();
@@ -6508,8 +6776,8 @@ static void draw_scope_chrome_live(void) {
         uint16_t y = (uint16_t)(gy + ((uint32_t)gh * div) / SCOPE_Y_DIVS);
         lcd_rect((uint16_t)(gx + 1u), y, (uint16_t)(gw - 2u), 1, C_GRID);
     }
-    lcd_rect((uint16_t)(gx + ((uint32_t)gw * 6u) / SCOPE_X_DIVS), (uint16_t)(gy + 1u), 2, (uint16_t)(gh - 2u), RGB565(67, 85, 95));
-    lcd_rect((uint16_t)(gx + 1u), (uint16_t)(gy + ((uint32_t)gh * 4u) / SCOPE_Y_DIVS), (uint16_t)(gw - 2u), 2, RGB565(67, 85, 95));
+    lcd_rect((uint16_t)(gx + ((uint32_t)gw * 6u) / SCOPE_X_DIVS), (uint16_t)(gy + 1u), 2, (uint16_t)(gh - 2u), C_GRID_AXIS);
+    lcd_rect((uint16_t)(gx + 1u), (uint16_t)(gy + ((uint32_t)gh * 4u) / SCOPE_Y_DIVS), (uint16_t)(gw - 2u), 2, C_GRID_AXIS);
 
     if (scope_frame_valid || !scope_hw_enabled()) {
         if (ui.scope_display == SCOPE_DISPLAY_XY) {
@@ -6567,7 +6835,7 @@ static void ui_draw_math_waveform(uint16_t gx, uint16_t gy, uint16_t gw, uint16_
 
     int16_t center_y = (int16_t)(gy + gh / 2u);
     int16_t prev_y = -1;
-    uint16_t math_color = RGB565(255, 0, 255); // Pink/Magenta
+    uint16_t math_color = C_MATH_TRACE; // Pink/Magenta
 
     uint16_t sample_count = scope_trace_cache[0].count;
     if (sample_count > SCOPE_TRACE_MAX_POINTS) {
@@ -6607,7 +6875,7 @@ static void ui_draw_math_waveform(uint16_t gx, uint16_t gy, uint16_t gw, uint16_
 }
 
 static void draw_scope_immersive(void) {
-    const uint16_t grid_bg = RGB565(4, 8, 11);
+    const uint16_t grid_bg = C_GRID_BG;
     uint16_t gx = 8;
     uint16_t gy = 28;
     uint16_t gw = 304;
@@ -6660,8 +6928,8 @@ static void draw_scope_immersive(void) {
         uint16_t y = (uint16_t)(gy + ((uint32_t)gh * div) / SCOPE_Y_DIVS);
         lcd_rect((uint16_t)(gx + 1u), y, (uint16_t)(gw - 2u), 1, C_GRID);
     }
-    lcd_rect((uint16_t)(gx + ((uint32_t)gw * 6u) / SCOPE_X_DIVS), (uint16_t)(gy + 1u), 2, (uint16_t)(gh - 2u), RGB565(67, 85, 95));
-    lcd_rect((uint16_t)(gx + 1u), (uint16_t)(gy + ((uint32_t)gh * 4u) / SCOPE_Y_DIVS), (uint16_t)(gw - 2u), 2, RGB565(67, 85, 95));
+    lcd_rect((uint16_t)(gx + ((uint32_t)gw * 6u) / SCOPE_X_DIVS), (uint16_t)(gy + 1u), 2, (uint16_t)(gh - 2u), C_GRID_AXIS);
+    lcd_rect((uint16_t)(gx + 1u), (uint16_t)(gy + ((uint32_t)gh * 4u) / SCOPE_Y_DIVS), (uint16_t)(gw - 2u), 2, C_GRID_AXIS);
 
     if (scope_frame_valid || !scope_hw_enabled() || scope_fft_src == 4u) {
         if (ui.scope_display == SCOPE_DISPLAY_XY) {
@@ -6925,7 +7193,7 @@ static int16_t gen_wave_preview_y(uint16_t point, uint16_t width, int16_t center
 }
 
 static void draw_gen_wave_preview(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t bg) {
-    uint16_t grid_bg = RGB565(6, 12, 18);
+    uint16_t grid_bg = C_GRID_BG;
     uint16_t center_y = (uint16_t)(y + h / 2u);
     uint16_t plot_x0 = (uint16_t)(x + 8u);
     uint16_t plot_w = (uint16_t)(w - 16u);
@@ -6938,7 +7206,7 @@ static void draw_gen_wave_preview(uint16_t x, uint16_t y, uint16_t w, uint16_t h
     for (uint16_t gx = (uint16_t)(x + w / 4u); gx < (uint16_t)(x + w); gx = (uint16_t)(gx + w / 4u)) {
         lcd_rect(gx, (uint16_t)(y + 1u), 1, (uint16_t)(h - 2u), C_PANEL_2);
     }
-    lcd_rect((uint16_t)(x + 1u), center_y, (uint16_t)(w - 2u), 1, RGB565(58, 74, 88));
+    lcd_rect((uint16_t)(x + 1u), center_y, (uint16_t)(w - 2u), 1, C_GRID_AXIS);
 
     for (uint16_t px = 3; px <= plot_w; px = (uint16_t)(px + 3u)) {
         int16_t sx = (int16_t)(plot_x0 + px);
@@ -6952,7 +7220,7 @@ static void draw_gen_wave_preview(uint16_t x, uint16_t y, uint16_t w, uint16_t h
 }
 
 static void draw_gen_output_panel(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t bg) {
-    uint16_t panel_bg = ui.running ? RGB565(12, 56, 39) : C_PANEL;
+    uint16_t panel_bg = ui.running ? C_PANEL_RUN : C_PANEL;
     uint16_t accent = ui.running ? C_DMM : C_WARN;
 
     (void)bg;
@@ -7116,25 +7384,25 @@ static void ui_draw_gen_sweep_menu(void) {
     uint16_t box_h = 160;
 
 
-    lcd_rect(box_x, box_y, box_w, box_h, RGB565(30, 30, 45)); 
-    lcd_frame(box_x, box_y, box_w, box_h, RGB565(255, 165, 0)); 
+    lcd_rect(box_x, box_y, box_w, box_h, C_BOX_BG); 
+    lcd_frame(box_x, box_y, box_w, box_h, C_BOX_FRAME); 
 
-    lcd_text(box_x + 10, box_y + 8, "SWEEP AND MODULATION", RGB565(255, 255, 255), RGB565(30, 30, 45), 1);
-    lcd_rect(box_x + 10, box_y + 20, box_w - 20, 1, RGB565(100, 100, 100)); 
+    lcd_text(box_x + 10, box_y + 8, "SWEEP AND MODULATION", C_BOX_TEXT, C_BOX_BG, 1);
+    lcd_rect(box_x + 10, box_y + 20, box_w - 20, 1, C_BOX_SEP); 
 
     uint16_t color_fg, color_bg;
     uint16_t row_y;
 
     row_y = box_y + 26;
-    color_bg = (gen_sweep_row_selected == 0) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = RGB565(255, 255, 255);
+    color_bg = (gen_sweep_row_selected == 0) ? C_ACCENT : C_BOX_BG;
+    color_fg = menu_row_fg(color_bg, C_BOX_TEXT);
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "SWEEP MODE:", color_fg, color_bg, 1);
     lcd_text(box_x + 110, row_y + 3, gen_sweep_mode_names[gen_sweep_mode], color_fg, color_bg, 1);
 
     row_y = box_y + 44;
-    color_bg = (gen_sweep_row_selected == 1) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = (gen_sweep_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    color_bg = (gen_sweep_row_selected == 1) ? C_ACCENT : C_BOX_BG;
+    color_fg = menu_row_fg(color_bg, (gen_sweep_mode) ? C_BOX_TEXT : C_BOX_DIM); 
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "SWEEP TIME:", color_fg, color_bg, 1);
     
@@ -7150,8 +7418,8 @@ static void ui_draw_gen_sweep_menu(void) {
             uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
             char d_str[2] = { sweep_digits[d], '\0' };
             if (d == ui_edit_digit_index) {
-                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, C_ACCENT_FG);
+                lcd_text(dx, row_y + 3, d_str, C_ACCENT, C_ACCENT_FG, 1);
             } else {
                 lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
             }
@@ -7162,8 +7430,8 @@ static void ui_draw_gen_sweep_menu(void) {
     lcd_text(box_x + 110 + (4 * 6) + 2, row_y + 3, "ms", color_fg, color_bg, 1);
 
     row_y = box_y + 62;
-    color_bg = (gen_sweep_row_selected == 2) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = (gen_sweep_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    color_bg = (gen_sweep_row_selected == 2) ? C_ACCENT : C_BOX_BG;
+    color_fg = menu_row_fg(color_bg, (gen_sweep_mode) ? C_BOX_TEXT : C_BOX_DIM); 
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "START FREQ:", color_fg, color_bg, 1);
     
@@ -7182,8 +7450,8 @@ static void ui_draw_gen_sweep_menu(void) {
                 uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
                 char d_str[2] = { start_digits[d], '\0' };
                 if (d == ui_edit_digit_index) {
-                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                    lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, C_ACCENT_FG);
+                    lcd_text(dx, row_y + 3, d_str, C_ACCENT, C_ACCENT_FG, 1);
                 } else {
                     lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
                 }
@@ -7196,16 +7464,16 @@ static void ui_draw_gen_sweep_menu(void) {
             uint8_t uselected = (uint8_t)(start_edit && ui_edit_digit_index == 4u);
             static const char * const sunit[] = {"Hz", "kHz", "MHz"};
             uint8_t sunit_idx = sweep_start_unit < 3u ? sweep_start_unit : 0;
-            lcd_text(ux, row_y + 3, sunit[sunit_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+            lcd_text(ux, row_y + 3, sunit[sunit_idx], uselected ? C_ACCENT : color_fg, uselected ? C_ACCENT_FG : color_bg, 1);
             if (uselected) {
-                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(sunit_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
+                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(sunit_idx == 0u ? 10u : 16u), 2, C_ACCENT_FG);
             }
         }
     }
 
     row_y = box_y + 80;
-    color_bg = (gen_sweep_row_selected == 3) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = (gen_sweep_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    color_bg = (gen_sweep_row_selected == 3) ? C_ACCENT : C_BOX_BG;
+    color_fg = menu_row_fg(color_bg, (gen_sweep_mode) ? C_BOX_TEXT : C_BOX_DIM); 
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "STOP FREQ:", color_fg, color_bg, 1);
     
@@ -7224,8 +7492,8 @@ static void ui_draw_gen_sweep_menu(void) {
                 uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
                 char d_str[2] = { stop_digits[d], '\0' };
                 if (d == ui_edit_digit_index) {
-                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                    lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, C_ACCENT_FG);
+                    lcd_text(dx, row_y + 3, d_str, C_ACCENT, C_ACCENT_FG, 1);
                 } else {
                     lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
                 }
@@ -7238,30 +7506,30 @@ static void ui_draw_gen_sweep_menu(void) {
             uint8_t uselected = (uint8_t)(stop_edit && ui_edit_digit_index == 4u);
             static const char * const sunit[] = {"Hz", "kHz", "MHz"};
             uint8_t sunit_idx = sweep_stop_unit < 3u ? sweep_stop_unit : 0;
-            lcd_text(ux, row_y + 3, sunit[sunit_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+            lcd_text(ux, row_y + 3, sunit[sunit_idx], uselected ? C_ACCENT : color_fg, uselected ? C_ACCENT_FG : color_bg, 1);
             if (uselected) {
-                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(sunit_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
+                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(sunit_idx == 0u ? 10u : 16u), 2, C_ACCENT_FG);
             }
         }
     }
 
     row_y = box_y + 98;
-    color_bg = (gen_sweep_row_selected == 4) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = RGB565(255, 255, 255);
+    color_bg = (gen_sweep_row_selected == 4) ? C_ACCENT : C_BOX_BG;
+    color_fg = menu_row_fg(color_bg, C_BOX_TEXT);
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "FM MODE:", color_fg, color_bg, 1);
     lcd_text(box_x + 110, row_y + 3, gen_fm_mode_names[gen_fm_mode], color_fg, color_bg, 1);
 
     row_y = box_y + 116;
-    color_bg = (gen_sweep_row_selected == 5) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = (gen_fm_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    color_bg = (gen_sweep_row_selected == 5) ? C_ACCENT : C_BOX_BG;
+    color_fg = menu_row_fg(color_bg, (gen_fm_mode) ? C_BOX_TEXT : C_BOX_DIM); 
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "FM WAVE:", color_fg, color_bg, 1);
     lcd_text(box_x + 110, row_y + 3, gen_fm_wave_names[gen_fm_source], color_fg, color_bg, 1);
 
     row_y = box_y + 134;
-    color_bg = (gen_sweep_row_selected == 6) ? RGB565(0, 120, 240) : RGB565(30, 30, 45);
-    color_fg = (gen_fm_mode) ? RGB565(255, 255, 255) : RGB565(120, 120, 120); 
+    color_bg = (gen_sweep_row_selected == 6) ? C_ACCENT : C_BOX_BG;
+    color_fg = menu_row_fg(color_bg, (gen_fm_mode) ? C_BOX_TEXT : C_BOX_DIM); 
     lcd_rect(box_x + 8, row_y, box_w - 16, 14, color_bg);
     lcd_text(box_x + 12, row_y + 3, "FM FREQ:", color_fg, color_bg, 1);
     
@@ -7280,8 +7548,8 @@ static void ui_draw_gen_sweep_menu(void) {
                 uint16_t dx = (uint16_t)(box_x + 110 + (d * 6));
                 char d_str[2] = { freq_digits[d], '\0' };
                 if (d == ui_edit_digit_index) {
-                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, RGB565(255, 255, 255));
-                    lcd_text(dx, row_y + 3, d_str, RGB565(0, 120, 240), RGB565(255, 255, 255), 1);
+                    lcd_rect(dx, (uint16_t)(row_y + 2), 6, 10, C_ACCENT_FG);
+                    lcd_text(dx, row_y + 3, d_str, C_ACCENT, C_ACCENT_FG, 1);
                 } else {
                     lcd_text(dx, row_y + 3, d_str, color_fg, color_bg, 1);
                 }
@@ -7294,9 +7562,9 @@ static void ui_draw_gen_sweep_menu(void) {
             uint8_t uselected = (uint8_t)(fm_edit && ui_edit_digit_index == 4u);
             static const char * const funit[] = {"Hz", "kHz", "MHz"};
             uint8_t funit_idx = fm_freq_unit < 3u ? fm_freq_unit : 0;
-            lcd_text(ux, row_y + 3, funit[funit_idx], uselected ? RGB565(0, 120, 240) : color_fg, uselected ? RGB565(255, 255, 255) : color_bg, 1);
+            lcd_text(ux, row_y + 3, funit[funit_idx], uselected ? C_ACCENT : color_fg, uselected ? C_ACCENT_FG : color_bg, 1);
             if (uselected) {
-                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(funit_idx == 0u ? 10u : 16u), 2, RGB565(255, 255, 255));
+                lcd_rect(ux, (uint16_t)(row_y + 11), (uint16_t)(funit_idx == 0u ? 10u : 16u), 2, C_ACCENT_FG);
             }
         }
     }
@@ -7463,6 +7731,11 @@ static const char *settings_value_text(uint8_t row, char out[12]) {
         uint8_t sleep = ui_settings.sleep_enabled < SETTINGS_SLEEP_COUNT ? ui_settings.sleep_enabled : 0u;
         return sleep_labels[sleep];
     }
+#if HW_TARGET_2C53T
+    if (row == 4u) {
+        return theme_labels[ui_settings.theme & 1u];
+    }
+#endif
     return FIRMWARE_VERSION_TEXT;
 }
 
@@ -7597,7 +7870,7 @@ static void ui_draw_battery_status_scene(void) {
     if (ui.chrome_visible) {
         draw_battery_status_header();
     } else if (ui.mode == UI_MODE_SCOPE) {
-        draw_battery_status_overlay(RGB565(4, 8, 11));
+        draw_battery_status_overlay(C_GRID_BG);
     } else {
         draw_battery_status_overlay(C_BG);
     }
@@ -7639,8 +7912,19 @@ static void ui_draw_gen_preview_params_scene(void) {
     draw_gen_param_row(GEN_PARAM_ROW_X, (uint16_t)(Y_SOFT + 4u));
 }
 
+static uint8_t ui_theme_repaint;
+
 static void ui_render_dispatch(void *ctx) {
     (void)ctx;
+    /* A palette change has to repaint pixels no scene owns. Measured on the
+     * bench: after `theme 1` the DMM screen came back with light softkeys on
+     * the old dark ground, because a FULL render draws the chrome and the
+     * panels but never fills the screen -- the background dates from mode
+     * entry. The flag lives across both render passes (collect and paint) and
+     * is cleared by ui_set_theme once the render returns. */
+    if (ui_theme_repaint) {
+        lcd_fill(C_BG);
+    }
     if (ui.overlay == UI_OVERLAY_MODE_MENU) {
         draw_mode_menu();
         draw_fw_update_overlay(C_BG);
@@ -7674,14 +7958,15 @@ static void ui_render_dispatch(void *ctx) {
     if (!ui.chrome_visible && (ui.softkeys_ms || scope_any_menu_open())) {
         draw_softkeys();
     }
-    draw_fw_update_overlay((!ui.chrome_visible && ui.mode == UI_MODE_SCOPE) ? RGB565(4, 8, 11) : C_BG);
-    draw_screenshot_overlay((!ui.chrome_visible && ui.mode == UI_MODE_SCOPE) ? RGB565(4, 8, 11) : C_BG);
+    draw_fw_update_overlay((!ui.chrome_visible && ui.mode == UI_MODE_SCOPE) ? C_GRID_BG : C_BG);
+    draw_screenshot_overlay((!ui.chrome_visible && ui.mode == UI_MODE_SCOPE) ? C_GRID_BG : C_BG);
 }
 
 static void ui_render_job(ui_render_job_t job) {
     uint32_t start = load_counter_read();
     current_render_job = job;
     lcd_render(ui_render_dispatch, 0);
+    ui_theme_repaint = 0; /* consumed: the fill above covered both passes */
     ui_last_render_ticks = load_counter_elapsed(start, load_counter_read());
     if (job == UI_RENDER_FULL || job == UI_RENDER_BATTERY ||
         (!ui.chrome_visible && (job == UI_RENDER_MODE_CONTENT || job == UI_RENDER_SCOPE_FRAME))) {
@@ -7966,6 +8251,11 @@ void ui_init(void) {
     ui_settings.dmm_mode = ui.dmm_mode;
     board_buzzer_set_volume(beep_level_percent[ui_settings.beep_level]);
     board_backlight_set_level(brightness_level_percent[ui_settings.brightness_level]);
+#if HW_TARGET_2C53T
+    /* Before the first render, so the whole boot draws in the saved palette
+     * instead of flashing the dark one first. */
+    ui_pal = ui_settings.theme ? &ui_pal_light : &ui_pal_dark;
+#endif
     dmm_set_mode(ui.dmm_mode);
     dmm_stats_reset();
     ui_switch_mode(start_mode);
@@ -7979,6 +8269,11 @@ void ui_init(void) {
         ui.chrome_visible = 1;
     }
     battery_snapshot_store();
+    /* The first frame fills every pixel: the framebuffer lives in RAM and
+     * survives a warm reset, so after an fwswap the screen otherwise keeps
+     * pixels drawn by the previous firmware -- and the chrome-visible views
+     * never fill the background themselves. */
+    ui_theme_repaint = 1;
     ui_render();
 }
 
@@ -8427,7 +8722,18 @@ static void dmm_toggle_relative(void) {
 }
 
 static void dmm_step_diode_group(int8_t dir) {
+#if HW_TARGET_2C53T
+    /* Continuity had no way in from the front panel at all: it is in every
+     * table (name, short label, stock selector word 0x0517) but in no
+     * softkey cycle, so the only way to reach it was `mode dmm 7` over the
+     * cable. It joins the diode key because that is where it belongs on the
+     * SoC too -- diode is 0x0510/0x0515 and continuity 0x0511/0x0516, one
+     * pair. */
+    static const uint8_t modes[] = {DMM_MODE_DIODE, DMM_MODE_CONT,
+                                    DMM_MODE_CAP};
+#else
     static const uint8_t modes[] = {DMM_MODE_DIODE, DMM_MODE_CAP};
+#endif
     uint8_t idx = 0;
     uint8_t found = 0;
 
@@ -9836,6 +10142,13 @@ static void settings_adjust_current(int8_t dir) {
         cycle_u8(&ui_settings.sleep_enabled, SETTINGS_SLEEP_COUNT, dir);
         ui.sleep_ms = 0;
         ui.sleep_due = 0;
+#if HW_TARGET_2C53T
+    } else if (ui.settings_row == 4u) {
+        cycle_u8(&ui_settings.theme, 2u, dir);
+        ui_set_theme(ui_settings.theme);
+        /* settings_note below covers the write; the flush happens when the
+         * menu is left, same as every other row here. */
+#endif
     } else {
         (void)dir;
         changed = 0;
@@ -10824,6 +11137,55 @@ static uint32_t settings_sleep_timeout_ms(void) {
     }
     return timeouts_ms[sleep];
 }
+
+#if HW_TARGET_2C53T
+/* Phase 1 has no persistence and no menu row -- those are phase 3. This is
+ * the bench handle that makes the mechanism testable on the device: flipping
+ * the pointer must repaint every screen from the other table and nothing
+ * else. A full render is mandatory, since a partial repaint would leave half
+ * the screen in the previous palette. */
+void ui_set_theme(uint8_t light) {
+    /* No early return when the palette is already the wanted one: the point
+     * of the call is a screen that matches it, and the bench found the two
+     * ways it can fail to. The chrome-visible DMM and scope views never fill
+     * the background -- only their immersive variants do -- so stale pixels
+     * survive any number of ordinary renders. */
+    ui_pal = light ? &ui_pal_light : &ui_pal_dark;
+    ui_theme_repaint = 1;
+    ui_render();
+}
+
+/* The settings-level entry point: the tile in the settings menu and the bench
+ * command both come through here, so a theme set either way is the same act
+ * and survives a reset. settings_note marks the page dirty; settings_flush
+ * commits it, which is what makes the reboot test honest. */
+void ui_settings_set_theme(uint8_t light) {
+    ui_settings.theme = light ? 1u : 0u;
+    ui_set_theme(ui_settings.theme);
+    settings_note(&ui_settings);
+    settings_flush();
+}
+
+/* Bench: take a screenshot without the SAVE press, and drive the UI with
+ * injected key events. Between them the whole colour-scheme verification
+ * becomes scriptable from the host -- every screen in both palettes without
+ * anyone at the buttons. POWER is refused in the shell, not here. */
+void ui_capture_screenshot(void) {
+    capture_screenshot_now();
+}
+
+void ui_shell_inject_keys(uint32_t events) {
+    if (!events) {
+        return;
+    }
+    ui_handle_keys(events);
+    ui_render();
+}
+
+uint8_t ui_theme(void) {
+    return ui_pal == &ui_pal_light ? 1u : 0u;
+}
+#endif
 
 uint8_t ui_diode_beep_enabled(void) {
     if (ui.mode != UI_MODE_DMM || ui.overlay != UI_OVERLAY_NONE) {

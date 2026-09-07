@@ -113,6 +113,7 @@ static void settings_defaults(settings_state_t *settings) {
     settings->dmm_mode = 0;
     settings->beep_level = 3;
     settings->brightness_level = 4;
+    settings->theme = 0;
     settings->startup_screen = SETTINGS_START_LAST;
     settings->last_screen = 0;
     settings->last_in_menu = 0;
@@ -169,6 +170,7 @@ static void settings_copy(settings_state_t *dst, const settings_state_t *src) {
     dst->dmm_mode = src->dmm_mode;
     dst->beep_level = src->beep_level;
     dst->brightness_level = src->brightness_level;
+    dst->theme = src->theme;
     dst->startup_screen = src->startup_screen;
     dst->last_screen = src->last_screen;
     dst->last_in_menu = src->last_in_menu;
@@ -228,6 +230,7 @@ static uint8_t settings_equal(const settings_state_t *a, const settings_state_t 
     if (a->dmm_mode != b->dmm_mode ||
         a->beep_level != b->beep_level ||
         a->brightness_level != b->brightness_level ||
+        a->theme != b->theme ||
         a->startup_screen != b->startup_screen ||
         a->last_screen != b->last_screen ||
         a->last_in_menu != b->last_in_menu ||
@@ -296,6 +299,9 @@ static void settings_clamp(settings_state_t *settings) {
     }
     if (settings->brightness_level >= SETTINGS_LEVEL_COUNT) {
         settings->brightness_level = 4;
+    }
+    if (settings->theme > 1u) {
+        settings->theme = 0;
     }
     if (settings->startup_screen >= SETTINGS_START_COUNT) {
         settings->startup_screen = SETTINGS_START_LAST;
@@ -657,6 +663,13 @@ static uint8_t settings_state_record_valid(uint32_t record, settings_state_t *se
         settings->startup_screen = (uint8_t)(payload & 0x07u);
         settings->last_screen = (uint8_t)((payload >> 4) & 0x03u);
         settings->last_in_menu = (uint8_t)((payload >> 6) & 0x01u);
+        /* Bit 8 is the UI theme. It rides this record instead of the main one
+         * because every bit of the main record is taken, and instead of bits
+         * 10-11 there (vacated by startup_screen) because a page written
+         * before 2026-09-06 still holds startup_screen in them and would read
+         * back as a theme. A page with no STARTUP record keeps the default
+         * from settings_defaults, which is dark. */
+        settings->theme = (uint8_t)((payload >> 8) & 0x01u);
     } else {
         return 0;
     }
@@ -786,7 +799,8 @@ static void settings_write_state_records(uint32_t *addr, const settings_state_t 
 
     payload = (uint16_t)((settings->startup_screen & 0x07u) |
                          ((settings->last_screen & 0x03u) << 4) |
-                         ((settings->last_in_menu & 0x01u) << 6));
+                         ((settings->last_in_menu & 0x01u) << 6) |
+                         ((settings->theme & 0x01u) << 8));
     flash_program_word(*addr, settings_state_record(SETTINGS_STATE_STARTUP, payload));
     *addr += 4u;
 }
