@@ -1397,7 +1397,21 @@ static const uint32_t fpga53_tb_entry_ns[] = {
      * 2.008. The 20 Hz sweep had said 200 us, but that reading had three
      * intervals to work with. Index 0x12 anchors the pair: 400.0 us from 50 Hz
      * over sixteen intervals, against 401.6 us from the independent 2 kHz run,
-     * which is also what says the generator is honest. */
+     * which is also what says the generator is honest.
+     *
+     * 2026-09-07, 50 Hz, twenty samples per index instead of a handful: index
+     * 0x11 gives a median of 100.0 samples per period (mode-by-edge-count
+     * 103.4, range 90.5-103.4, scatter 13 %) and index 0x12 gives 48.4 (range
+     * 48.4-50.0, 3 %), so the pair's ratio lands anywhere in 2.07-2.14
+     * depending on how the samples are pooled. Both 1.905 and a clean 2.0 sit
+     * outside or at the edge of that, i.e. THIS METRIC CANNOT SETTLE THE
+     * QUESTION: at eight intervals per window one spurious crossing moves the
+     * estimate by a tenth, and the contamination is visible as a systematic
+     * trend — the more crossings a frame reports, the shorter its estimate.
+     * The numbers below are therefore left as they were. What would settle it
+     * needs no new signal source, only host code: the raw window is already in
+     * the dump (the decimated S1 line), and an autocorrelation over many dumps
+     * is immune to a single miscounted crossing where this estimator is not. */
     105000u, 200803u,
     /* 50MS onward: roll territory, index 13's interval. */
     418848u, 418848u, 418848u, 418848u, 418848u, 418848u, 418848u, 418848u,
