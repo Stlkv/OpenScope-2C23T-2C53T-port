@@ -580,6 +580,7 @@ typedef struct {
     uint16_t ch1_dim;
     uint16_t ch2_dim;
     uint16_t math_trace;
+    uint16_t on_accent;
 } ui_palette_t;
 
 static const ui_palette_t ui_pal_dark = {
@@ -626,6 +627,14 @@ static const ui_palette_t ui_pal_dark = {
     .ch1_dim = RGB565(88, 65, 26),
     .ch2_dim = RGB565(18, 72, 82),
     .math_trace = RGB565(255, 0, 255),
+    /* Text drawn on top of an accent fill (the green DMM chip, the purple
+     * generator chip). It is near-black here on purpose: the dark palette
+     * fills those chips with a bright accent, where black reads at 4.2 and
+     * white at 1.9. The light palette fills them with a dark accent, so
+     * there it is near-white. One colour per chip either way -- mixing
+     * C_BG for the label with C_TEXT for the value is what made the value
+     * unreadable in the light theme. */
+    .on_accent = RGB565(5, 9, 14),
 };
 
 /* Draft: the neutrals are inverted and the accents darkened enough to sit on
@@ -674,6 +683,7 @@ static const ui_palette_t ui_pal_light = {
     .ch1_dim = RGB565(220, 200, 150),
     .ch2_dim = RGB565(170, 210, 220),
     .math_trace = RGB565(180, 0, 180),
+    .on_accent = RGB565(250, 251, 252),
 };
 
 static const ui_palette_t *ui_pal = &ui_pal_dark;
@@ -721,6 +731,7 @@ static const ui_palette_t *ui_pal = &ui_pal_dark;
 #define C_CH1_DIM       (ui_pal->ch1_dim)
 #define C_CH2_DIM       (ui_pal->ch2_dim)
 #define C_MATH_TRACE    (ui_pal->math_trace)
+#define C_ON_ACCENT     (ui_pal->on_accent)
 #else
 static const uint16_t C_BG = RGB565(5, 9, 14);
 static const uint16_t C_TOP = RGB565(12, 18, 24);
@@ -768,6 +779,8 @@ __attribute__((unused)) static const uint16_t C_PANEL_RUN = RGB565(12, 56, 39);
 __attribute__((unused)) static const uint16_t C_CH1_DIM = RGB565(88, 65, 26);
 __attribute__((unused)) static const uint16_t C_CH2_DIM = RGB565(18, 72, 82);
 __attribute__((unused)) static const uint16_t C_MATH_TRACE = RGB565(255, 0, 255);
+/* Kept at the old value on this board: its rendering is not ours to restyle. */
+static const uint16_t C_ON_ACCENT = RGB565(232, 240, 246);
 #endif
 
 enum {
@@ -1236,7 +1249,7 @@ static void format_gen_freq_digits(char out[5]) {
 }
 
 static void gen_freq_draw_unit(uint16_t x, uint16_t y, uint8_t unit, uint16_t fg, uint16_t bg, uint8_t selected) {
-    uint16_t text = selected ? C_TEXT : fg;
+    uint16_t text = fg; /* one colour per chip; the underline marks selection */
 
     if (unit > 2u) {
         unit = 0;
@@ -1244,14 +1257,14 @@ static void gen_freq_draw_unit(uint16_t x, uint16_t y, uint8_t unit, uint16_t fg
     if (unit == 0u) {
         lcd_text(x, (uint16_t)(y + 4u), "HZ", text, bg, 1);
         if (selected) {
-            lcd_rect(x, (uint16_t)(y + 14u), 12, 2, C_TEXT);
+            lcd_rect(x, (uint16_t)(y + 14u), 12, 2, text);
         }
     } else {
         char prefix[2] = {unit == 1u ? 'K' : 'M', 0};
         lcd_text((uint16_t)(x + 3u), y, prefix, text, bg, 1);
         lcd_text(x, (uint16_t)(y + 10u), "HZ", text, bg, 1);
         if (selected) {
-            lcd_rect(x, (uint16_t)(y + 20u), 12, 2, C_TEXT);
+            lcd_rect(x, (uint16_t)(y + 20u), 12, 2, text);
         }
     }
 }
@@ -2856,7 +2869,11 @@ static uint8_t dmm_group_selected(uint8_t group) {
         return ui.dmm_mode == DMM_MODE_DCV || ui.dmm_mode == DMM_MODE_ACV || ui.dmm_mode == DMM_MODE_RES;
     }
     if (group == 1u) {
-        return ui.dmm_mode == DMM_MODE_DIODE || ui.dmm_mode == DMM_MODE_CAP;
+        return ui.dmm_mode == DMM_MODE_DIODE || ui.dmm_mode == DMM_MODE_CAP
+#if HW_TARGET_2C53T
+               || ui.dmm_mode == DMM_MODE_CONT
+#endif
+            ;
     }
     if (group == 2u) {
         return ui.dmm_mode == DMM_MODE_LIVE || ui.dmm_mode == DMM_MODE_TEMP;
@@ -2890,14 +2907,14 @@ static void draw_dmm_selected_group_value(uint16_t x, uint16_t y, uint16_t w, co
         underline_w = (uint16_t)(w - 12u);
     }
     underline_x = (uint16_t)(x + (w - underline_w) / 2u);
-    lcd_text(text_x, (uint16_t)(y + 13u), value, C_TEXT, bg, 2);
-    lcd_rect(underline_x, (uint16_t)(y + 29u), underline_w, 2, C_TEXT);
+    lcd_text(text_x, (uint16_t)(y + 13u), value, C_ON_ACCENT, bg, 2);
+    lcd_rect(underline_x, (uint16_t)(y + 29u), underline_w, 2, C_ON_ACCENT);
 }
 
 static void draw_dmm_group_chip(uint16_t x, uint16_t y, uint16_t w, uint8_t group, const char *label) {
     uint8_t active = dmm_group_selected(group);
     uint16_t bg = active ? C_DMM : C_PANEL_2;
-    uint16_t fg = active ? C_BG : C_MUTED;
+    uint16_t fg = active ? C_ON_ACCENT : C_MUTED;
 
     lcd_rect(x, y, w, 32, bg);
     lcd_rect(x, y, w, 2, C_DMM);
@@ -2907,6 +2924,14 @@ static void draw_dmm_group_chip(uint16_t x, uint16_t y, uint16_t w, uint8_t grou
     } else if (group == 3u) {
         lcd_text_center(x, (uint16_t)(y + 13u), w, "HI LO", fg, bg, 1);
         lcd_text_center(x, (uint16_t)(y + 23u), w, "DC AC", fg, bg, 1);
+#if HW_TARGET_2C53T
+    } else if (group == 1u) {
+        /* Three modes in this group here, and "DIODE CONT CAP" is 84 px
+         * against a 72 px chip -- two lines, the way the current group
+         * already does it. */
+        lcd_text_center(x, (uint16_t)(y + 13u), w, "DIODE CONT", fg, bg, 1);
+        lcd_text_center(x, (uint16_t)(y + 23u), w, "CAP", fg, bg, 1);
+#endif
     } else {
         lcd_text_center(x, (uint16_t)(y + 18u), w, dmm_group_value(group), fg, bg, 1);
     }
@@ -7233,9 +7258,12 @@ static void draw_gen_output_panel(uint16_t x, uint16_t y, uint16_t w, uint16_t h
 static void draw_gen_editor_digit(uint16_t x, uint16_t y, char digit, uint8_t selected, uint16_t fg, uint16_t bg) {
     char text[2] = {digit, 0};
 
-    lcd_text(x, y, text, selected ? C_TEXT : fg, bg, 2);
+    /* One colour for every digit; the selected one is marked by the
+     * underline alone. Two colours in one chip read as a rendering fault,
+     * and on an accent fill the second of them is the unreadable one. */
+    lcd_text(x, y, text, fg, bg, 2);
     if (selected) {
-        lcd_rect((uint16_t)(x + 1u), (uint16_t)(y + 15u), 10, 2, C_TEXT);
+        lcd_rect((uint16_t)(x + 1u), (uint16_t)(y + 15u), 10, 2, fg);
     }
 }
 
@@ -7243,7 +7271,7 @@ static void draw_gen_param_chip(uint16_t x, uint16_t y, uint16_t w, uint8_t para
     uint8_t enabled = gen_param_available(param);
     uint8_t active = enabled && ui.gen_param == param;
     uint16_t chip_bg = active ? C_GEN : (enabled ? C_PANEL_2 : C_TOP);
-    uint16_t fg = active ? C_BG : (enabled ? C_MUTED : C_GRID);
+    uint16_t fg = active ? C_ON_ACCENT : (enabled ? C_MUTED : C_GRID);
     const char *shown_value = enabled ? value : "--";
     uint8_t unit = gen_freq_unit < GEN_FREQ_UNIT_COUNT ? gen_freq_unit : 0u;
     char digits[5];
@@ -10016,7 +10044,7 @@ static void arb_load_waveform(void) {
 static uint8_t gen_adjust_current_value(int8_t dir, uint8_t repeat) {
     if (ui.gen_wave == SIGGEN_WAVE_ARBITRARY) {
         if (ui.gen_param == GEN_PARAM_WAVE) {
-            gen_cycle_wave((int8_t)-dir);
+            gen_cycle_wave(dir);
             gen_apply();
             return 2;
         }
@@ -10041,7 +10069,7 @@ static uint8_t gen_adjust_current_value(int8_t dir, uint8_t repeat) {
         }
     }
     if (ui.gen_param == GEN_PARAM_WAVE) {
-        gen_cycle_wave((int8_t)-dir);
+        gen_cycle_wave(dir);
         gen_apply();
         return 2;
     }
@@ -10222,7 +10250,11 @@ static void ui_handle_horizontal_key(int8_t dir) {
 
 static void ui_handle_vertical_key(int8_t screen_dir, uint8_t repeat) {
     if (ui.mode == UI_MODE_GEN) {
-        ui_render_gen_adjust_result(gen_adjust_current_value(screen_dir, repeat));
+        /* Value semantics, like every other branch below: UP raises the
+         * number. This branch used to pass the screen direction straight
+         * through, which is why UP lowered the frequency digits, the duty and
+         * the amplitude while the same key raised values everywhere else. */
+        ui_render_gen_adjust_result(gen_adjust_current_value((int8_t)-screen_dir, repeat));
         return;
     }
 
