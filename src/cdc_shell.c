@@ -214,8 +214,8 @@ static void cmd_help(const char *args) {
            "    then stream exactly <size> raw bytes (cdc_flash.py does both)\r\n"
            "  fwapply                      install what fwload just staged\r\n"
            "  fwswap a|b                   install a cached image, no transfer\r\n"
-           "  ch1ref [0-4095|save]         CH1 offset reference (DAC1, PA4)\r\n"
-           "  ch2ref [0-4095|save]         CH2 offset reference (TMR13 PWM, PA6)\r\n"
+           "  ch1ref [0-4095|save [all]]   CH1 offset reference (DAC1, PA4)\r\n"
+           "  ch2ref [0-4095|save [all]]   CH2 offset reference (TMR13 PWM, PA6)\r\n"
            "  trigreg [0-255]              scope-engine reg 0x08 (trigger level?)\r\n"
            "  meterc <hi> <lo>             queue one raw meter command word\r\n"
            "  meterpose <ce> <ab>          frontend to stock mux arms 0-9 (PortC/E, PortA/B)\r\n"
@@ -556,10 +556,28 @@ static void cmd_chref(const char *args, uint8_t ch) {
     const char *rest;
     uint32_t code;
 
-    if (word_matches(p, "save", &rest) && *rest == '\0') {
-        uint8_t range = ch ? ui_save_ch2_ref() : ui_save_ch1_ref();
+    if (word_matches(p, "save", &rest)) {
+        const char *tail = skip_spaces(rest);
+        uint8_t all_ranges = 0;
+        uint8_t range;
+
+        /* `save all` writes the code into every range, which is what the bias
+         * measurement of 2026-09-08 says is correct: the slope is the same on
+         * all nine rows, so one code centres them all. Plain `save` keeps
+         * touching only the current row — a unit that really does want a row
+         * of its own should not lose it to a fat-fingered `all`. */
+        if (word_matches(tail, "all", &tail) && *skip_spaces(tail) == '\0') {
+            all_ranges = 1u;
+        } else if (*tail != '\0') {
+            sh_out("usage: chNref [0-4095|save [all]]\r\n");
+            return;
+        }
+        range = ui_save_ch_ref(ch, all_ranges);
         if (range == 0xFFu) {
             sh_out("nothing valid to save\r\n");
+        } else if (all_ranges) {
+            sh_out(ch ? "saved to scope_bias[ch2][all ranges]\r\n"
+                      : "saved to scope_bias[ch1][all ranges]\r\n");
         } else {
             sh_out(ch ? "saved to scope_bias[ch2][range " : "saved to scope_bias[ch1][range ");
             sh_u32(range);

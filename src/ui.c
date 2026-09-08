@@ -8509,28 +8509,37 @@ static void dmm_apply_selected_mode(void) {
  * on every probe would burn flash for values nobody is keeping. The value comes
  * from the fpga module rather than an argument, so what gets stored is exactly
  * what is driving the timer. Returns the range it wrote, or 0xFF on refusal. */
-uint8_t ui_save_ch2_ref(void) {
-    uint16_t code = fpga53_ch2_ref_get();
-    uint8_t range = scope_channel_range_index(1);
+/* Save the code currently driving a channel's offset reference.
+ *
+ * `all_ranges` writes it into every range instead of only the one the channel
+ * is sitting on, and that is a measurement, not a convenience: on bench unit
+ * #2 (2026-09-08) the bias slope is the same on all nine volts/div rows —
+ * 0.1245 to 0.1290 ADC counts per code, mean 0.1265, against the 0.1270 CH1
+ * measured on 2026-09-06 — so one code centres the channel on every row. A
+ * save that touches one row is how eight of this unit's nine rows came to sit
+ * at ADC 78 while the ninth sat at 129: the 2026-09-06 session calibrated the
+ * row it was on, and nothing carried that to the rest.
+ *
+ * Returns the range the channel is on, or 0xFF when there is nothing valid to
+ * save. ch: 0 = CH1 (DAC1 on PA4), 1 = CH2 (TMR13 PWM on PA6). */
+uint8_t ui_save_ch_ref(uint8_t ch, uint8_t all_ranges) {
+    uint16_t code;
+    uint8_t range;
+
+    ch = ch ? 1u : 0u;
+    code = ch ? fpga53_ch2_ref_get() : fpga53_ch1_ref_get();
+    range = scope_channel_range_index(ch);
 
     if (code > 4095u) {
         return 0xFFu;
     }
-    ui_settings.scope_bias[1][range] = code;
-    settings_note(&ui_settings);
-    settings_flush();
-    return range;
-}
-
-/* CH1's counterpart. Same contract, the other row. */
-uint8_t ui_save_ch1_ref(void) {
-    uint16_t code = fpga53_ch1_ref_get();
-    uint8_t range = scope_channel_range_index(0);
-
-    if (code > 4095u) {
-        return 0xFFu;
+    if (all_ranges) {
+        for (uint8_t r = 0; r < SETTINGS_SCOPE_RANGE_COUNT; ++r) {
+            ui_settings.scope_bias[ch][r] = code;
+        }
+    } else {
+        ui_settings.scope_bias[ch][range] = code;
     }
-    ui_settings.scope_bias[0][range] = code;
     settings_note(&ui_settings);
     settings_flush();
     return range;

@@ -89,20 +89,35 @@ static void settings_scope_cal_defaults(settings_state_t *settings) {
 }
 
 #if HW_TARGET_2C53T
-/* Migration, 2026-09-06. Units that ran an earlier build have CH2 bias records
- * saved holding 1861, the 2C23T DAC default, written before anything on this
- * board drove TMR13 with them. Reading one back would arm the timer with a
- * value nobody measured and put CH2 near the bottom of the window, so the
- * legacy default is treated as "not calibrated for this channel" and replaced
- * by the measured one. The cost is that 1861 can never be a real CH2 code on
- * this board — it is 81 ADC counts away from centre, which no calibration
- * would ever land on. */
-static void settings_scope_cal_migrate_ch2(settings_state_t *settings) {
+/* Codes that mean "this range was never calibrated on this board", replaced on
+ * load by the measured per-channel default.
+ *
+ * 1861 is the 2C23T DAC default (migration of 2026-09-06): units that ran an
+ * earlier build have bias records holding it, written before anything here
+ * drove TMR13 with them, and arming the timer with a value nobody measured
+ * puts CH2 near the bottom of the window. It is 81 ADC counts from centre.
+ *
+ * 2048 is plain mid-scale (added 2026-09-08). Measured on bench unit #2 with
+ * 0 V on the input: 2048 leaves CH1 at ADC 77.8-79.7 on every row, about 49
+ * counts — two divisions — below the 127.5 centre, while the code that does
+ * centre it is 2423-2454. That was the state of eight of this unit's nine
+ * rows, because `ch1ref save` writes only the row the channel is on and the
+ * 2026-09-06 calibration therefore reached exactly one of them.
+ *
+ * Both sentinels cost the same thing: neither value can ever be a real
+ * calibration on this board, since no calibration would land 49 or 81 counts
+ * from centre. A unit that somehow wants one gets the measured default
+ * instead, which is closer to right than the sentinel was. */
+static uint8_t settings_scope_bias_uncalibrated(uint16_t code) {
+    return (uint8_t)(code == SETTINGS_SCOPE_BIAS_DEFAULT || code == 2048u);
+}
+
+static void settings_scope_cal_migrate(settings_state_t *settings) {
     for (uint8_t range = 0; range < SETTINGS_SCOPE_RANGE_COUNT; ++range) {
-        if (settings->scope_bias[0][range] == SETTINGS_SCOPE_BIAS_DEFAULT) {
+        if (settings_scope_bias_uncalibrated(settings->scope_bias[0][range])) {
             settings->scope_bias[0][range] = SETTINGS_SCOPE_BIAS_CH1_2C53T_DEFAULT;
         }
-        if (settings->scope_bias[1][range] == SETTINGS_SCOPE_BIAS_DEFAULT) {
+        if (settings_scope_bias_uncalibrated(settings->scope_bias[1][range])) {
             settings->scope_bias[1][range] = SETTINGS_SCOPE_BIAS_CH2_2C53T_DEFAULT;
         }
     }
@@ -847,7 +862,7 @@ uint8_t settings_load(settings_state_t *settings) {
 
     settings_clamp(&latest);
 #if HW_TARGET_2C53T
-    settings_scope_cal_migrate_ch2(&latest);
+    settings_scope_cal_migrate(&latest);
 #endif
     settings_copy(&settings_cached, &latest);
     settings_copy(&settings_pending, &latest);

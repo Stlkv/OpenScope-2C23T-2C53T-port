@@ -26,8 +26,7 @@ uint8_t ui_debug_mode_byte(void);
 /* Store the CH2 centering code currently driving TMR13 into the bias row for
  * CH2's current range. Returns that range index, or 0xFF if there was nothing
  * valid to store. 2C53T builds only. */
-uint8_t ui_save_ch2_ref(void);
-uint8_t ui_save_ch1_ref(void);
+uint8_t ui_save_ch_ref(uint8_t ch, uint8_t all_ranges);
 /* Bench: switch the UI to mode 0/1/2 (DMM/SCOPE/GEN) as if picked from the
  * mode menu, and for DMM optionally select a meter submode (ui.c
  * dmm_mode_names index; 0xFF = leave the default). Goes through the same
