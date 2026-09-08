@@ -137,15 +137,36 @@ typedef struct {
 #ifndef FPGA53_TAIL_SKIP
 #define FPGA53_TAIL_SKIP 32u
 #endif
+/* Subtracted from every raw sample by the read, the way stock does it. Lives
+ * here rather than in fpga.c because the renderer's zero below is derived from
+ * it and the two must not drift apart. */
+#ifndef FPGA53_ADC_OFFSET
+#define FPGA53_ADC_OFFSET 28
+#endif
+
 /* Where a channel sits with nothing on the probe, in samples as the renderer
- * sees them (the ADC offset is already subtracted by the read). Measured
- * 2026-08-16 across the ladder rows: CH2 held 0x28 on every unclipped row, CH1
- * read a few counts higher on the off-ladder code it used to be pinned to.
- * This is the zero the volts conversion refers to — 128 is what a signed ADC
- * would use and this one is not that. A per-channel calibration belongs here
- * eventually; one constant is what today's numbers support. */
+ * sees them (the ADC offset is already subtracted by the read). This is the
+ * zero the volts conversion refers to, so it decides where the trace sits
+ * against the zero line and what VAVG/VMAX/VMIN read. Vpp is a difference of
+ * two levels and this cancels out of it — which is why a wrong value here
+ * shows up as "everything is displaced but Vpp looks fine".
+ *
+ * It was 40, measured 2026-08-16 across the ladder rows, when the channels sat
+ * wherever their uncalibrated bias left them — ADC 78 raw on most rows. The
+ * offset calibration of 2026-09-08 moved every row to the middle of the ADC's
+ * range so that clipping is symmetric, and that moved this zero with it: a
+ * centred channel reads 127.5 raw, and the read subtracts FPGA53_ADC_OFFSET
+ * before the renderer sees it. So the value is not a measurement any more, it
+ * is arithmetic on where centring puts the channel — which is why it is
+ * written as the expression rather than as the number it evaluates to.
+ *
+ * The tie to the bias calibration is real: this is only correct while the
+ * channel IS centred. That is what settings_scope_cal_migrate now enforces for
+ * a unit whose bias cells were never calibrated, and what `chNref save all`
+ * writes for one that is calibrated by hand. A unit deliberately parked
+ * off-centre wants a per-channel zero here instead of a constant. */
 #ifndef FPGA53_ZERO_COUNT
-#define FPGA53_ZERO_COUNT 40
+#define FPGA53_ZERO_COUNT (128 - FPGA53_ADC_OFFSET)
 #endif
 
 enum {

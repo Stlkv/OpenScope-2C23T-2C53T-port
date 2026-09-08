@@ -42,7 +42,6 @@ enum {
     FPGA53_SPI_STS_TXE = 1u << 1,
     FPGA53_SPI_STS_BSY = 1u << 7,
     FPGA53_XFER_TIMEOUT = 100000u,
-    FPGA53_ADC_OFFSET = 28u, /* subtracted from raw samples, per stock */
     FPGA53_CH_SAMPLES = 1023u,
     FPGA53_FORCED_READ_POLLS = 200u,
 };
