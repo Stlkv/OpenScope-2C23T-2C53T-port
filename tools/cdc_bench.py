@@ -179,6 +179,42 @@ def cmd_trigsweep(args) -> int:
     return 0
 
 
+S_RE = re.compile(r"^S(?P<ch>[12])/\d+ (?P<hex>[0-9A-F]+)", re.M)
+
+
+def cmd_level(args) -> int:
+    """Mean level of the window in ADC counts, for DC calibration.
+
+    The w= min-max in the dump is the wrong instrument for a DC input: one
+    window spans 10-17 counts of noise and the level wanders about 8 counts
+    between reads, so a single reading carries a 20 % error on a 50-count
+    deflection. The dump already carries the window itself as the decimated
+    S1/S2 lines - 64 samples each - so average those over several dumps and
+    the mean tightens as sqrt(n) while the spread still gets reported.
+    """
+    import statistics
+    vals: dict[str, list[int]] = {"1": [], "2": []}
+    with open_port(find_port(args.port)) as port:
+        read_until_quiet(port, quiet=0.2, limit=1.0)
+        for _ in range(args.samples):
+            send_line(port, "dbg")
+            text = read_until_quiet(port, quiet=0.4, limit=3.0)
+            for m in S_RE.finditer(text):
+                h = m.group("hex")
+                vals[m.group("ch")] += [int(h[i:i + 2], 16)
+                                        for i in range(0, len(h) - 1, 2)]
+            time.sleep(args.gap)
+    for ch in ("1", "2"):
+        xs = vals[ch]
+        if not xs:
+            continue
+        mean = statistics.fmean(xs)
+        sd = statistics.pstdev(xs) if len(xs) > 1 else 0.0
+        print(f"CH{ch}  mean {mean:7.2f} counts (0x{round(mean):02X})  "
+              f"sd {sd:5.2f}  min {min(xs)}  max {max(xs)}  n={len(xs)}")
+    return 0
+
+
 def cmd_flash(args) -> int:
     payload = open(args.image, "rb").read()
     if len(payload) % 2:
@@ -249,6 +285,12 @@ def main() -> int:
     p.add_argument("--dwell", type=float, default=1.5, help="s of frames per value")
     p.add_argument("--channel", choices=["1", "2"], default="1")
     p.set_defaults(func=cmd_trigsweep)
+
+    p = sub.add_parser("level",
+                       help="mean window level in ADC counts (DC calibration)")
+    p.add_argument("--samples", type=int, default=8, help="dumps to average")
+    p.add_argument("--gap", type=float, default=0.3, help="s between dumps")
+    p.set_defaults(func=cmd_level)
 
     p = sub.add_parser("flash", help="stream an image into a W25Q cache slot")
     p.add_argument("image")
