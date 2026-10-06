@@ -415,6 +415,8 @@ static void ui_settings_copy(settings_state_t *dst, const settings_state_t *src)
     dst->beep_level = src->beep_level;
     dst->brightness_level = src->brightness_level;
     dst->theme = src->theme;
+    dst->cont_indicate = src->cont_indicate;
+    dst->debug_overlay = src->debug_overlay;
     dst->startup_screen = src->startup_screen;
     dst->last_screen = src->last_screen;
     dst->sleep_enabled = src->sleep_enabled;
@@ -10308,7 +10310,13 @@ static void settings_adjust_current(int8_t dir) {
         changed = 0;
     }
     if (changed) {
+        /* Written now rather than when the menu is left or the unit powers
+         * down: a reset that sees neither -- a firmware swap, a hang -- lost
+         * the change (bench, 2026-10-06: DEBUG reverted after a reflash).
+         * A settings change is a deliberate act, and the page holds several
+         * writes per erase. */
         settings_note(&ui_settings);
+        settings_flush();
     }
 }
 
@@ -11197,6 +11205,7 @@ void ui_handle_keys(uint32_t events) {
          * independently: either, both or neither. */
         ui_settings.cont_indicate ^= (events & KEY_CH1) ? UI_CONT_SOUND_OFF : UI_CONT_LIGHT_ON;
         settings_note(&ui_settings);
+        settings_flush(); /* survive a reset that skips shutdown, as settings do */
         ui_render();
         return;
     }
