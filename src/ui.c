@@ -2018,8 +2018,13 @@ static const char *scope_trigger_source_label(void) {
 static const char *scope_trigger_level_label(void) {
     static char label[11];
     uint8_t idx = scope_trigger_source_index();
+#if HW_TARGET_2C53T
+    /* The same volts as the trace and the level printed on the trigger line. */
+    int32_t mv = scope_raw_delta_mv(idx, ui.scope_trigger_level);
+#else
     int32_t mv = ((int32_t)ui.scope_trigger_level - 128) *
                  (int32_t)scope_vdiv_mv_for_channel(idx) * 8 / 255;
+#endif
 
     scope_format_signed_mv(label, mv);
     return label;
@@ -6271,6 +6276,15 @@ static void draw_scope_trigger_line(uint16_t gx, uint16_t gy, uint16_t gw, uint1
         return;
     }
     center = scope_channel_center(scope_channel_base_center_for(src), src);
+#if HW_TARGET_2C53T
+    /* Placed by the trace's own counts-to-pixels mapping, so the line sits
+     * where a sample at the trigger level is drawn. The old 96-counts scale
+     * is the 2C23T's; at this board's 25 counts per division it put the line
+     * a quarter short of the level it was labelled with. */
+    (void)delta;
+    y = scope_scaled_sample_y(src, ui.scope_trigger_level, center, amp,
+                              (int16_t)(gy + 1u), (int16_t)(gy + gh - 2u));
+#else
     delta = (int16_t)ui.scope_trigger_level - 128;
     y = (int16_t)(center - (delta * amp) / 96);
     if (y < (int16_t)(gy + 1u)) {
@@ -6278,6 +6292,7 @@ static void draw_scope_trigger_line(uint16_t gx, uint16_t gy, uint16_t gw, uint1
     } else if (y > (int16_t)(gy + gh - 2u)) {
         y = (int16_t)(gy + gh - 2u);
     }
+#endif
     for (uint16_t x = (uint16_t)(gx + 1u); x < (uint16_t)(gx + gw - 1u); x = (uint16_t)(x + 8u)) {
         lcd_rect(x, (uint16_t)y, 5, 1, color);
     }
