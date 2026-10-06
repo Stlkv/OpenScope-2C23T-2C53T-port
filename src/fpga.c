@@ -2276,12 +2276,7 @@ static void fpga53_read_channel(uint8_t opcode) {
         if (raw > rmax) {
             rmax = raw;
         }
-        int16_t cal = (int16_t)raw - (int16_t)FPGA53_ADC_OFFSET;
-        if (cal < 0) {
-            cal = 0;
-        }
         sum = sum * 31u + raw;
-        fpga53_ch_buf[i] = (uint8_t)cal;
     }
 
     if (opcode == 0x04u) {
@@ -2329,10 +2324,8 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
             v = fpga53_xfer(0xFFu);
             if (v < mn) mn = v;
             if (v > mx) mx = v;
-            int16_t c = (int16_t)v - (int16_t)FPGA53_ADC_OFFSET;
-            if (c < 0) c = 0;
-            fpga53_frame[(uint16_t)(((i * 2u) % FPGA_SAMPLE_COUNT) * 2u)] = (uint8_t)c;
-            fpga53_frame[(uint16_t)((((i * 2u) + 1u) % FPGA_SAMPLE_COUNT) * 2u)] = (uint8_t)c;
+            fpga53_frame[(uint16_t)(((i * 2u) % FPGA_SAMPLE_COUNT) * 2u)] = v;
+            fpga53_frame[(uint16_t)((((i * 2u) + 1u) % FPGA_SAMPLE_COUNT) * 2u)] = v;
         }
         fpga53_diag.smin = mn;
         fpga53_diag.smax = mx;
@@ -2342,10 +2335,8 @@ uint8_t fpga_capture_read(uint8_t *dst, uint16_t len) {
             v = fpga53_xfer(0xFFu);
             if (v < mn) mn = v;
             if (v > mx) mx = v;
-            int16_t c = (int16_t)v - (int16_t)FPGA53_ADC_OFFSET;
-            if (c < 0) c = 0;
-            fpga53_frame[(uint16_t)((((i * 2u) % FPGA_SAMPLE_COUNT) * 2u) + 1u)] = (uint8_t)c;
-            fpga53_frame[(uint16_t)(((((i * 2u) + 1u) % FPGA_SAMPLE_COUNT) * 2u) + 1u)] = (uint8_t)c;
+            fpga53_frame[(uint16_t)((((i * 2u) % FPGA_SAMPLE_COUNT) * 2u) + 1u)] = v;
+            fpga53_frame[(uint16_t)(((((i * 2u) + 1u) % FPGA_SAMPLE_COUNT) * 2u) + 1u)] = v;
         }
         fpga53_diag.smin2 = mn;
         fpga53_diag.smax2 = mx;
@@ -2568,10 +2559,7 @@ static uint8_t fpga53_read_point_channel(uint8_t opcode) {
     }
     gpio_set(GPIOB_BASE, 1u << 6); // CS deassert
 
-    cal = (int16_t)(sum / take) - (int16_t)FPGA53_ADC_OFFSET;
-    if (cal < 0) {
-        cal = 0;
-    }
+    cal = (int16_t)(sum / take);
     return (uint8_t)cal;
 }
 
@@ -2711,10 +2699,7 @@ static uint8_t fpga53_dma_collect(void) {
     for (uint16_t i = 0; i < take; ++i) {
         sum += fpga53_ch_buf[i];
     }
-    cal = (int16_t)(sum / take) - (int16_t)FPGA53_ADC_OFFSET;
-    if (cal < 0) {
-        cal = 0;
-    }
+    cal = (int16_t)(sum / take);
     return (uint8_t)cal;
 }
 
