@@ -1805,6 +1805,14 @@ static void scope_sanitize_state(void) {
     }
     scope_measure_mask[0] &= scope_measure_valid_mask();
     scope_measure_mask[1] &= scope_measure_valid_mask();
+    /* One reading per channel: a channel either shows the selected
+     * measurement or none. A saved mask from before holding several
+     * collapses to the selected one. */
+    for (uint8_t ch = 0; ch < 2u; ++ch) {
+        if (scope_measure_mask[ch]) {
+            scope_measure_mask[ch] = scope_measure_bit(scope_measure_param);
+        }
+    }
     if (ui.scope_trigger_level < 12u) {
         ui.scope_trigger_level = 12;
     } else if (ui.scope_trigger_level > 243u) {
@@ -9459,15 +9467,23 @@ static void scope_toggle_trigger_edge(void) {
     scope_trace_invalidate();
 }
 
+/* Each channel shows one measurement or none, never a stack of them: VALUE
+ * picks which, and the channels already showing one switch to it. */
 static void scope_step_measure_param(int8_t dir) {
     cycle_u8(&scope_measure_param, SCOPE_MEASURE_COUNT, dir);
+    for (uint8_t ch = 0; ch < 2u; ++ch) {
+        if (scope_measure_mask[ch]) {
+            scope_measure_mask[ch] = scope_measure_bit(scope_measure_param);
+        }
+    }
 }
 
 static void scope_toggle_measure_for_channel(uint8_t idx) {
     if (idx >= 2u) {
         idx = 0;
     }
-    scope_measure_mask[idx] ^= scope_measure_bit(scope_measure_param);
+    scope_measure_mask[idx] = (scope_measure_mask[idx] & scope_measure_bit(scope_measure_param)) ?
+        0u : scope_measure_bit(scope_measure_param);
 }
 
 static void scope_toggle_measure_visible(void) {
