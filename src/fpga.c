@@ -1025,12 +1025,15 @@ void fpga53_set_channel_range(uint8_t ch, uint8_t vdiv_idx) {
     }
 }
 
-uint16_t fpga53_range_uv_per_count(uint8_t vdiv_idx, uint32_t vdiv_mv) {
+uint32_t fpga53_range_uv_per_count(uint8_t vdiv_idx, uint32_t vdiv_mv) {
     (void)vdiv_idx;
     /* One division is 25 counts by construction of the ladder above, so the
      * volts/div setting alone fixes what a count is worth. Microvolts because
-     * the sensitive steps are fractions of a millivolt per count. */
-    return (uint16_t)((vdiv_mv * 1000u) / FPGA53_RELAY_COUNTS_PER_DIV);
+     * the sensitive steps are fractions of a millivolt per count. 32 bits:
+     * 2 V/div is already 80 000 uV per count, and a 16-bit return wrapped
+     * the three coarse steps to 1/5..1/59 of their scale, which flattened
+     * the trace and the readings at exactly the steps that carry volts. */
+    return (vdiv_mv * 1000u) / FPGA53_RELAY_COUNTS_PER_DIV;
 }
 
 /* Input coupling: PD12 (CH1) and PD13 (CH2), HIGH = DC.

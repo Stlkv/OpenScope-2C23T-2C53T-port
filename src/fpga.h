@@ -275,7 +275,7 @@ void fpga53_set_channel_range(uint8_t ch, uint8_t vdiv_idx);
 /* What one sample count is worth at a given volts/div, in microvolts. Falls
  * out of the same ladder: a division is 25 counts, so the setting alone fixes
  * it. Microvolts because the sensitive steps are under a millivolt a count. */
-uint16_t fpga53_range_uv_per_count(uint8_t vdiv_idx, uint32_t vdiv_mv);
+uint32_t fpga53_range_uv_per_count(uint8_t vdiv_idx, uint32_t vdiv_mv);
 
 /* Glitch reach per channel: furthest sample a short gap started at, fresh
  * frames carrying one, fresh frames seen. Same rule the CH1-only seam build
