@@ -5957,7 +5957,40 @@ static void scope_measure_value_for(char out[12], uint8_t idx, uint8_t measure) 
         scope_format_measure_voltage(out, (int32_t)scope_rms_raw_mv(idx, scope_filtered_rms_raw(idx)));
     } else {
         scope_format_frequency_reading(out, scope_filtered_freq_hz(idx));
+        return;
     }
+#if HW_TARGET_2C53T
+    {
+        /* A sample at either end of the ADC means the input went past what
+         * this volts/div can see, and the reading is the limit, not the
+         * signal: mark it, ">" when the top clipped, "<" when the bottom did,
+         * rather than print a confident wrong number. */
+        uint8_t top = scope_max_raw[idx] == 0xFFu;
+        uint8_t bottom = scope_min_raw[idx] == 0u;
+        char mark = 0;
+
+        if (measure == SCOPE_MEASURE_VMIN) {
+            mark = bottom ? '<' : 0;
+        } else if (measure == SCOPE_MEASURE_VMAX) {
+            mark = top ? '>' : 0;
+        } else if (measure == SCOPE_MEASURE_VAVG) {
+            mark = top ? '>' : (bottom ? '<' : 0);
+        } else {
+            mark = (top || bottom) ? '>' : 0; /* Vpp, Vrms: at least this */
+        }
+        if (mark) {
+            uint8_t n = 0;
+            while (out[n] && n < 10u) {
+                ++n;
+            }
+            out[n + 1u] = 0;
+            for (; n > 0u; --n) {
+                out[n] = out[n - 1u];
+            }
+            out[0] = mark;
+        }
+    }
+#endif
 }
 
 static void draw_scope_measure_text(uint16_t left,
