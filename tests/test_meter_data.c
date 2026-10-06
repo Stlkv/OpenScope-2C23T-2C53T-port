@@ -923,10 +923,13 @@ static int test_port_resistance_band_calibration_override(void)
     process_frame(frame, 7);
     ASSERT(expect_normal_reading("0.170", "Ohm", 0.17f, 0.0005f));
 
-    /* 2.2 kOhm, word 0x050B: "2176", no point, f7 0x20 -> 2.176 kOhm. */
+    /* Word 0x050B: "2176", no point, f7 0x20, frame[8] bit 7 -> the 2 kOhm
+     * range, four decimals: 217.6 Ohm. Recorded 2026-09-07 as a "2.2 kOhm"
+     * resistor and pinned at 2.176 kOhm; the part was a 220 Ohm
+     * (red-red-brown, bands checked 2026-10-06). */
     raw_frame(frame, "5AA5A40D8AEA47208000" "0127");
     process_frame(frame, 6);
-    ASSERT(expect_normal_reading("2.176", "kOhm", 2.176f, 0.0005f));
+    ASSERT(expect_normal_reading("217.6", "Ohm", 217.6f, 0.05f));
 
     /* High range: bit 2, 100 Ohm per count. This is the bench failure of
      * 2026-09-06 — a 300 kOhm resistor read 90.62 Ohm because raw 2981 took
@@ -1012,6 +1015,82 @@ static int test_port_capacitance_frames_from_bench_unit2(void)
  * render the ACV mains frame at its dp-2 default ("22.86"); with the frame DP
  * it reads 226.6 V in submode 1 as it does through the stock class path in
  * submode 0. Diode and temperature go the same way. */
+/*
+ * The sign and the 2 kOhm range, against live frames with an independent
+ * reading behind them: @saulvalenzuela23's captures (upstream #37), upstream
+ * EXP-71 (unit #1, a handheld DMM for resistance and a FNIRSI DMC100 for DC
+ * volts) and unit #2 on 2026-10-06. Each row asserts the decoded value
+ * within 2 % of the REFERENCE, not of our own output.
+ *
+ * Before this the port showed -2.003 V as 2.003, 220 Ohm as 2.168 kOhm,
+ * 1 kOhm as 103.0 Ohm, 100.65 Ohm as 0.650 Ohm, and every kOhm reading
+ * whose frame carries a point ("9.924") in ohms.
+ */
+static int test_port_sign_and_2k_range_against_references(void)
+{
+    static const struct {
+        uint8_t sub; const char *hex, *unit; float reference; const char *what;
+    } rows[] = {
+        { 0, "5AA5B6FDEB8B0F000200015D", "V",    -2.003f,  "saul -2.003 V" },
+        { 0, "5AA5FE07CA870F0082000144", "V",    -1.615f,  "EXP-71 AA reversed" },
+        { 0, "5AA5EE078A4F0E008200013F", "V",     1.615f,  "EXP-71 AA" },
+        { 6, "5AA5A40DEAE74F208000013A", "Ohm",   216.8f,  "unit #2 220 Ohm, bands" },
+        { 6, "5AA5A4ADED4B4E208000013C", "Ohm",   218.2f,  "EXP-71 220 Ohm" },
+        { 6, "5AA5EC0BEA8B4F208000011B", "kOhm",  1.005f,  "EXP-71 1 kOhm, leading 1" },
+        { 6, "5AA5C4CF8F8A4A2080000151", "Ohm",   997.7f,  "saul 1 kOhm" },
+        { 6, "5AA5ECEBFBC7072000000152", "Ohm",   100.65f, "saul 100.65 Ohm, leading 1" },
+        { 6, "5AA5C4CF9F8A0A2000000126", "Ohm",   98.9f,   "EXP-71 100 Ohm" },
+        { 6, "5AA5A41D8ACA47200000012A", "kOhm",  2.175f,  "EXP-71 2.2 kOhm" },
+        { 6, "5AA5C4DFAF4D4E200000012F", "kOhm",  9.924f,  "unit #2 10 kOhm" },
+        { 6, "5AA5EC0B1ACA472000000131", "kOhm",  99.7f,   "EXP-71 100 kOhm" },
+        { 6, "5AA5A4CD8FEA0F2480000132", "kOhm",  297.8f,  "unit #2 300 kOhm" },
+        { 6, "5AA5C4CF4F8E0A2480000133", "kOhm",  994.0f,  "EXP-71 1 MOhm" },
+    };
+    uint8_t frame[12];
+
+    meter_data_init();
+    for (unsigned i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        raw_frame(frame, rows[i].hex);
+        process_frame(frame, rows[i].sub);
+        float ref = rows[i].reference;
+        float tol = 0.02f * (ref < 0.0f ? -ref : ref);
+        if (!meter_reading.valid ||
+            meter_reading.result_class != METER_RESULT_NORMAL ||
+            strcmp(meter_reading.unit_suffix, rows[i].unit) != 0 ||
+            !close_to(meter_reading.value, ref, tol) ||
+            meter_reading.negative != (ref < 0.0f) ||
+            (meter_reading.display_str[0] == '-') != (ref < 0.0f)) {
+            printf("    row %u (%s): got %s %s = %g, want %g %s\n", i, rows[i].what,
+                   meter_reading.display_str, meter_reading.unit_suffix,
+                   (double)meter_reading.value, (double)ref, rows[i].unit);
+            return 0;
+        }
+    }
+
+    /* Control: the -2.003 V frame with frame[2] bit 4 cleared is positive —
+     * the sign comes from that bit and nothing else here. */
+    raw_frame(frame, "5AA5B6FDEB8B0F000200015D");
+    frame[2] &= (uint8_t)~0x10u;
+    process_frame(frame, 0);
+    ASSERT(!meter_reading.negative);
+    ASSERT(close_to(meter_reading.value, 2.003f, 0.0005f));
+
+    /* Control: the sign bit is not a decimal point. The "9.924" kOhm frame
+     * with it set keeps its point (two "points" used to drop both). */
+    raw_frame(frame, "5AA5C4DFAF4D4E200000012F");
+    frame[2] |= 0x10u;
+    process_frame(frame, 6);
+    ASSERT(expect_normal_reading("-9.924", "kOhm", -9.924f, 0.0005f));
+
+    /* Control: the 220 Ohm frame with frame[8] bit 7 cleared reads ten times
+     * higher — bit 7 alone decides the decade. */
+    raw_frame(frame, "5AA5A40DEAE74F208000013A");
+    frame[8] &= (uint8_t)~0x80u;
+    process_frame(frame, 6);
+    ASSERT(expect_normal_reading("2.168", "kOhm", 2.168f, 0.0005f));
+    return 1;
+}
+
 static int test_port_frame_decimal_point_drives_non_dcv_modes(void)
 {
     uint8_t frame[12];
@@ -1237,6 +1316,7 @@ int main(void)
     TEST(port_band_latch_reuses_last_band_within_session);
     TEST(port_capacitance_frames_from_bench_unit2);
     TEST(port_frame_decimal_point_drives_non_dcv_modes);
+    TEST(port_sign_and_2k_range_against_references);
     TEST(session_begin_resets_band_latch_on_same_mode_reentry);
 
     printf("\n%d/%d passed, %d skipped (unported upstream features)\n",

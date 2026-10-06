@@ -648,7 +648,16 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
     uint8_t status = frame[7];
     r->is_ac = (status & (1 << 2)) != 0;
     r->is_auto_range = (status & (1 << 3)) != 0;
-    r->negative = (status & (1 << 0)) != 0;
+    /* The sign is frame[2] bit 4 in every function — stock negates on it
+     * (VNEG at 0x08037166). -2.0030 V arrives as frame[2] = 0xB6 with
+     * frame[7] = 0x00 (@saulvalenzuela23, upstream #37), and a reversed AA
+     * cell as 0xFE / 0x00 (upstream EXP-71), so frame[7] bit 0 alone showed
+     * both positive. That bit is kept for DCV and DC current, where unit #2
+     * showed it on a -00.03 mA frame (EXP-205). Same rule as upstream
+     * meter_data.c since 94c1340. */
+    r->negative = ((frame[2] & 0x10u) != 0u) ||
+                  ((submode == 0 || submode == 2 || submode == 3) &&
+                   (status & (1 << 0)) != 0);
 
     /* frame[2].3 = stock's raw +10000 extension flag. Recorded for every
      * frame (including OL/blank/special ones) so the debug line always shows
@@ -959,13 +968,18 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
      * position; anything else says nothing. Checked against every live frame
      * with a known value: 4.994 V (DP on digit 1), 31.5x V (digit 2),
      * 226.6 V mains (digit 3), 9.576 nF / 100.6 nF / 9.666 uF / 90.36 uF,
-     * 1.346 V on a battery in diode mode. Resistance frames carry NO point:
-     * a 2.2 kOhm resistor in 0x050B is the text "2176", f7 = 0x20 — plain
-     * ohms, which is what the raw x factor override below already renders
-     * as 2.176 kOhm. The +10000 DCV extension
-     * (1.4979 V) carries no DP — its point sits before digit 0, which the
-     * four-glyph display cannot light — and stays with the stock class path. */
-    uint8_t dp_bits = (uint8_t)(((nib0 & 0x10u) ? 1u : 0u) | ((nib1 & 0x10u) ? 2u : 0u) |
+     * 1.346 V on a battery in diode mode. Resistance frames carry a point in
+     * some ranges and not in others ("9.924" kOhm has one, "2168" in the
+     * 2 kOhm range has none) — the resistance block below reads both. The
+     * +10000 DCV extension (1.4979 V) carries no DP — its point sits before
+     * digit 0, which the four-glyph display cannot light — and stays with
+     * the stock class path.
+     *
+     * nib0's bit 4 is NOT a point: it is frame[2] bit 4, the minus sign
+     * (a point before the first digit would have nothing to separate).
+     * Counting it made a negative reading with a real point carry two
+     * "points" and lose both. */
+    uint8_t dp_bits = (uint8_t)(((nib1 & 0x10u) ? 2u : 0u) |
                                 ((nib2 & 0x10u) ? 4u : 0u) | ((nib3 & 0x10u) ? 8u : 0u));
     uint8_t frame_dp = (dp_bits == 2u) ? 1u : (dp_bits == 4u) ? 2u : (dp_bits == 8u) ? 3u : 0u;
 
@@ -1083,8 +1097,12 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
      * The two high-range points agree on the multiplier and are both ~0.65%
      * low, which two 5%-tolerance resistors cannot resolve into a gain error.
      *
-     * frame[8].7 was tested as the range marker first and REFUTED: it is set
-     * at 2.2 kΩ and clear at 10 kΩ, both of which decode correctly.
+     * frame[8].7 was tested as the range marker first and "refuted": it is
+     * set at "2.2 kΩ" and clear at 10 kΩ, both of which seemed to decode
+     * correctly. ⚠ CORRECTED 2026-10-06: that "2.2 kΩ" part was a 220 Ω
+     * (red-red-brown, checked by its bands; upstream EXP-71 predicted it), so
+     * the 2167 row above is 216.7 Ω and frame[8].7 IS a range marker — the
+     * 2 kΩ range, see the block below.
      *
      * Bands above this one (MΩ) remain uncharacterised — if a fourth range
      * exists it will show up as a frame[7] pattern that is neither of these.
@@ -1099,17 +1117,37 @@ void meter_session_frame(meter_session_t *s, const volatile uint8_t *frame)
         const char *unit  = NULL;
         uint8_t     range = frame[7] & 0x0Cu;
 
+        /* The SoC's display has five digits: frame[2] bit 3 is a leading
+         * "1" (+10000 raw) in resistance and continuity as in DCV —
+         * "100.65" Ohm (@saulvalenzuela23, upstream #37) and 1 kOhm =
+         * 1 + "0103" (upstream EXP-71). raw_bcd itself keeps the DCV-only
+         * rule above; the five-digit text is built here. */
+        uint32_t text = (uint32_t)r->raw_bcd + (r->raw_bcd_extended ? 10000u : 0u);
+
         if (range == 0x04u) {
             /* High range: no point in the frame, 100 Ohm per count.
              * 300 kOhm -> "2983" -> 298.3 kOhm (2026-09-07, word 0x050B). */
-            v = (float)r->raw_bcd * METER_CAL_HIGH_KOHM_FACTOR; unit = "kOhm";
+            v = (float)text * METER_CAL_HIGH_KOHM_FACTOR; unit = "kOhm";
         } else if (range == 0x00u || range == 0x08u) {
-            /* Ohms as the SoC spells them, with its own point when it lights
-             * one: "2176" -> 2176 Ohm, " 0.17" (short) -> 0.17 Ohm, in both
-             * the resistance word (f7 0x20) and continuity (f7 0x28). */
-            float ohms = (float)r->raw_bcd;
+            /* The text as the SoC formats it, in the resistance word (f7 0x20)
+             * and continuity (f7 0x28) alike — the rules upstream settled on
+             * unit #1 against two reference meters (EXP-71, e10ca88):
+             *   - an explicit point in the digits wins: " 0.17" -> 0.17,
+             *     "9.924" -> 9.924;
+             *   - otherwise frame[8] bit 7 is the 2 kOhm range, four
+             *     decimals: "2168" -> 0.2168 (unit #2's 220 Ohm, 216.8 Ohm);
+             *   - otherwise the digits are integer ohms: "4824" -> 4824 Ohm.
+             * A text with decimals is in kOhm when frame[6]'s upper nibble is
+             * 4 and in ohms otherwise (" 0.17" short: 0x0A; "9.924": 0x4E);
+             * integer text is ohms in either. Shown here in whichever unit
+             * keeps it under 1000. */
+            bool  kohm_regime = (f6 & 0xF0u) == 0x40u;
+            int   decimals = frame_dp ? 4 - (int)frame_dp
+                           : (frame[8] & 0x80u) ? 4 : 0;
+            float ohms = (float)text;
             int   k;
-            for (k = frame_dp ? frame_dp : 4; k < 4; ++k) ohms /= 10.0f;
+            for (k = 0; k < decimals; ++k) ohms /= 10.0f;
+            if (kohm_regime && decimals > 0) ohms *= 1000.0f;
             if (ohms >= 1000.0f) { v = ohms / 1000.0f; unit = "kOhm"; }
             else                 { v = ohms;           unit = "Ohm";  }
         }
