@@ -62,8 +62,12 @@ static uint16_t g_buzzer_tone_div = BUZZER53_TONE_DIV_DEFAULT;
  * (0.77 ms), and the length is linear in it: swept with the software trigger
  * 2026-09-07, hold 140/320/500/700/1000 gave 141/321/504/705/1006 ticks =
  * 109/247/388/543/775 ms. 320 is the default because 140 (~110 ms) was hard
- * to catch by ear while working the probes. `beep hold <n>` retunes it. */
-static uint16_t g_buzzer_min_beep_ms = 320u;
+ * to catch by ear while working the probes. `beep hold <n>` retunes it.
+ *
+ * Default 0 since 2026-10-06, by request: the tone lasts as long as the SoC
+ * keeps the line pulsing and no longer, even if a quick tap then clicks or is
+ * lost. The knob stays for whoever wants the minimum back. */
+static uint16_t g_buzzer_min_beep_ms = 0u;
 static volatile uint32_t g_dmm_beep_rise_count;
 static volatile uint32_t g_dmm_beep_fall_count;
 /* Where a tap turns into a tone, counted so the chain can be read instead of

@@ -69,8 +69,25 @@ static uint8_t power_hold_confirmed(void) {
 }
 #endif
 
+#if HW_TARGET_2C53T
+/* Bench: how the last continuity tone ended, in beep-service ticks (~0.77 ms).
+ * [0] ticks the tone sounded after the last PC3 edge, [1] of those, ticks the
+ * frame source alone held it on, [2] tones ended, [3] the longest gap between
+ * PC3 edges inside the tone -- what the keep-alive hold has to bridge. Read
+ * with `mem`. */
+volatile uint16_t cont_tone_tail[4];
+static uint16_t cont_gap_max;
+static uint16_t cont_tail_run;
+static uint16_t cont_frame_run;
+static uint8_t cont_tone_was_on;
+#endif
+
 static void dmm_beep_service(uint8_t elapsed_ms) {
     uint8_t dmm_beep_seen;
+#if HW_TARGET_2C53T
+    uint8_t cont_edge = 0;
+    uint8_t cont_frame = 0;
+#endif
     uint8_t buzzer_on = 0;
     uint8_t force_full = 0;
     uint8_t fixed_volume = 0;
@@ -120,9 +137,9 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
          * soon as we are in the mode; only the frame source stays behind
          * diode_beep_ready. */
         board_dmm_beep_irq_arm(1);
-        dmm_beep_seen = (uint8_t)(board_dmm_beep_edge_seen() ||
-                                  (diode_beep_ready &&
-                                   dmm_diode_continuity_active()));
+        cont_edge = board_dmm_beep_edge_seen();
+        cont_frame = (uint8_t)(diode_beep_ready && dmm_diode_continuity_active());
+        dmm_beep_seen = (uint8_t)(cont_edge || cont_frame);
 #else
         if (diode_beep_ready) {
             /* PC3 pulses while the SoC wants a tone (measured 2026-09-07:
@@ -159,8 +176,17 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
             if (diode_beep_hold_ms == 0) {
                 diode_beep_hold_ms = hold;
                 board_beep_stat_inc(1);
-            } else if (diode_beep_hold_ms < DIODE_BEEP_HOLD_MS) {
-                diode_beep_hold_ms = DIODE_BEEP_HOLD_MS;
+            } else {
+                /* The latch is a minimum counted from the first pulse, so it
+                 * keeps running down while pulses continue. It used to freeze
+                 * here, which turned it into a 246 ms tail after every long
+                 * contact (measured 2026-10-06: 320 ticks after the last PC3
+                 * edge on 5 of 5 tones). */
+                diode_beep_hold_ms = diode_beep_hold_ms > elapsed_ms ?
+                    (uint16_t)(diode_beep_hold_ms - elapsed_ms) : 0u;
+                if (diode_beep_hold_ms < DIODE_BEEP_HOLD_MS) {
+                    diode_beep_hold_ms = DIODE_BEEP_HOLD_MS;
+                }
             }
         } else if (diode_beep_hold_ms > elapsed_ms) {
             diode_beep_hold_ms = (uint16_t)(diode_beep_hold_ms - elapsed_ms);
@@ -171,6 +197,28 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
         live_beep_phase_ms = 0;
         buzzer_on = diode_beep_hold_ms ? 1u : 0u;
         force_full = 1;
+#if HW_TARGET_2C53T
+        if (buzzer_on) {
+            if (cont_edge && cont_tail_run > cont_gap_max) {
+                cont_gap_max = cont_tail_run;
+            }
+            cont_tail_run = cont_edge ? 0u : (uint16_t)(cont_tail_run + 1u);
+            if (cont_edge) {
+                cont_frame_run = 0;
+            } else if (cont_frame) {
+                cont_frame_run++;
+            }
+        } else if (cont_tone_was_on) {
+            cont_tone_tail[0] = cont_tail_run;
+            cont_tone_tail[1] = cont_frame_run;
+            cont_tone_tail[2]++;
+            cont_tone_tail[3] = cont_gap_max;
+            cont_gap_max = 0;
+            cont_tail_run = 0;
+            cont_frame_run = 0;
+        }
+        cont_tone_was_on = buzzer_on;
+#endif
     } else if (live_mode) {
         board_dmm_beep_irq_force_full(0);
         board_dmm_beep_irq_arm(0);
