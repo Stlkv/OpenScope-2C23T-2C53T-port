@@ -130,6 +130,7 @@ static void settings_defaults(settings_state_t *settings) {
     settings->brightness_level = 4;
     settings->theme = 0;
     settings->cont_indicate = 0;
+    settings->debug_overlay = 0;
     settings->startup_screen = SETTINGS_START_LAST;
     settings->last_screen = 0;
     settings->last_in_menu = 0;
@@ -188,6 +189,7 @@ static void settings_copy(settings_state_t *dst, const settings_state_t *src) {
     dst->brightness_level = src->brightness_level;
     dst->theme = src->theme;
     dst->cont_indicate = src->cont_indicate;
+    dst->debug_overlay = src->debug_overlay;
     dst->startup_screen = src->startup_screen;
     dst->last_screen = src->last_screen;
     dst->last_in_menu = src->last_in_menu;
@@ -249,6 +251,7 @@ static uint8_t settings_equal(const settings_state_t *a, const settings_state_t 
         a->brightness_level != b->brightness_level ||
         a->theme != b->theme ||
         a->cont_indicate != b->cont_indicate ||
+        a->debug_overlay != b->debug_overlay ||
         a->startup_screen != b->startup_screen ||
         a->last_screen != b->last_screen ||
         a->last_in_menu != b->last_in_menu ||
@@ -320,6 +323,9 @@ static void settings_clamp(settings_state_t *settings) {
     }
     if (settings->cont_indicate > 3u) {
         settings->cont_indicate = 0;
+    }
+    if (settings->debug_overlay > 2u) {
+        settings->debug_overlay = 0;
     }
     if (settings->theme > 1u) {
         settings->theme = 0;
@@ -696,6 +702,9 @@ static uint8_t settings_state_record_valid(uint32_t record, settings_state_t *se
          * existed holds 0 there, which is sound only: the behaviour such a
          * unit already had. */
         settings->cont_indicate = (uint8_t)((payload >> 9) & 0x03u);
+        /* Bits 11-12: the on-screen debug text. 0 (an older page) is "all",
+         * which is what the screen always showed before the setting. */
+        settings->debug_overlay = (uint8_t)((payload >> 11) & 0x03u);
     } else {
         return 0;
     }
@@ -827,7 +836,8 @@ static void settings_write_state_records(uint32_t *addr, const settings_state_t 
                          ((settings->last_screen & 0x03u) << 4) |
                          ((settings->last_in_menu & 0x01u) << 6) |
                          ((settings->theme & 0x01u) << 8) |
-                         ((settings->cont_indicate & 0x03u) << 9));
+                         ((settings->cont_indicate & 0x03u) << 9) |
+                         ((settings->debug_overlay & 0x03u) << 11));
     flash_program_word(*addr, settings_state_record(SETTINGS_STATE_STARTUP, payload));
     *addr += 4u;
 }

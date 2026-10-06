@@ -489,10 +489,12 @@ enum {
     DMM_FAST_RENDER_MS = 80,
     DMM_STATS_ZERO_RESET_SAMPLES = 8,
 #if HW_TARGET_2C53T
-    /* Six tiles: BEEP DISPLAY START / SLEEP THEME INFO — two full rows of the
-     * three-column grid. THEME is 2C53T-only, so the 2C23T keeps five. */
+    /* Six tiles: BEEP DISPLAY START / SLEEP THEME DEBUG — two full rows of
+     * the three-column grid, which is all the screen holds. INFO gave up its
+     * tile to DEBUG; the version is printed under the title instead. THEME
+     * and DEBUG are 2C53T-only, so the 2C23T keeps its five. */
     SETTINGS_ROW_COUNT = 6,
-    SETTINGS_SELECTABLE_COUNT = 5,
+    SETTINGS_SELECTABLE_COUNT = 6,
 #else
     SETTINGS_ROW_COUNT = 5,
     SETTINGS_SELECTABLE_COUNT = 4,
@@ -959,8 +961,11 @@ static const char *const gen_param_labels[] = {"WAVE", "FREQ", "DUTY", "AMP"};
 static const char *const menu_labels[] = {"MULTIMETER", "OSCILLOSCOPE", "SIGNAL GENERATOR", "SETTINGS"};
 #if HW_TARGET_2C53T
 static const char *const settings_row_labels[] = {"BEEP", "DISPLAY", "START",
-                                                  "SLEEP", "THEME", "INFO"};
+                                                  "SLEEP", "THEME", "DEBUG"};
 static const char *const theme_labels[] = {"DARK", "LIGHT"};
+/* ui_settings.debug_overlay: what of the on-screen debug text is drawn. */
+enum { UI_DEBUG_ALL = 0, UI_DEBUG_ERRORS = 1, UI_DEBUG_OFF = 2 };
+static const char *const debug_overlay_labels[] = {"ALL", "ERRORS", "OFF"};
 #else
 static const char *const settings_row_labels[] = {"BEEP", "DISPLAY", "START", "SLEEP", "INFO"};
 #endif
@@ -4515,6 +4520,11 @@ static void draw_dmm_immersive_panel(void) {
  * the panel (ends at y=160) and the softkeys (Y_SOFT=201) — partial panel
  * redraws never touch it, and every caller repaints it last so it wins. */
 static void draw_dmm53_debug_overlay(void) {
+    /* Counters, not verdicts: nothing here is an error state, so "errors
+     * only" hides them along with "off". */
+    if (ui_settings.debug_overlay != UI_DEBUG_ALL) {
+        return;
+    }
     for (uint8_t i = 0; i < 4u; ++i) {
         lcd_text(14, (uint16_t)(155u + i * 11u), dmm53_debug_line(i),
                  C_TEXT, C_BG, 1);
@@ -6642,6 +6652,11 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     fpga53_diag_t dg;
     char dbg[56];
     uint8_t p = 0;
+    uint8_t all = ui_settings.debug_overlay == UI_DEBUG_ALL;
+
+    if (ui_settings.debug_overlay == UI_DEBUG_OFF) {
+        return;
+    }
     fpga53_get_diag(&dg);
 
     /* Window spreads say the capture path carries signal; the roll point span
@@ -6663,7 +6678,9 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
     p = (uint8_t)(p + ui_dbg_str(&dbg[p], " N"));
     p = (uint8_t)(p + ui_dbg_dec(&dbg[p], (uint16_t)dg.slow_points));
     dbg[p] = '\0';
-    lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, C_TEXT, grid_bg, 1);
+    if (all) {
+        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 13u), dbg, C_TEXT, grid_bg, 1);
+    }
 
     if (!dg.v04_id) {
         /* Two ways to get here. dg.warm = the warm-boot token was intact, so
@@ -6672,13 +6689,17 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
          * configure and the port answered zeros — which is what a configured
          * part does (Exp L), i.e. a warm boot we failed to recognise. */
         uint8_t eng_ok = (dg.pc0 || dg.reads > dg.forced || dg.slow_points);
-        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u),
-                 dg.warm ? "V:KEPT (warm boot, port not touched)"
-                         : "V:SILENT (FPGA configured - warm boot)",
-                 C_DBG_DIM, grid_bg, 1);
-        lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u),
-                 eng_ok ? "ENG:RUN" : "ENG:DEAD",
-                 eng_ok ? C_OK : C_BAD, grid_bg, 1);
+        if (all) {
+            lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 3u),
+                     dg.warm ? "V:KEPT (warm boot, port not touched)"
+                             : "V:SILENT (FPGA configured - warm boot)",
+                     C_DBG_DIM, grid_bg, 1);
+        }
+        if (all || !eng_ok) {
+            lcd_text((uint16_t)(gx + 4u), (uint16_t)(gy + 23u),
+                     eng_ok ? "ENG:RUN" : "ENG:DEAD",
+                     eng_ok ? C_OK : C_BAD, grid_bg, 1);
+        }
     }
     if (dg.v04_id) {
         /* The 0x80 first-window marker can land on the top byte of any of the
@@ -6730,8 +6751,14 @@ static void draw_fpga53_debug_line(uint16_t gx, uint16_t gy, uint16_t grid_bg) {
             col[3] = q_ok ? ok_c : bad_c;
             tok[4] = eng_ok ? "ENG:RUN" : "ENG:DEAD";
             col[4] = eng_ok ? ok_c : bad_c;
+            /* "Errors only" keeps just the verdicts that are not OK. Q:BAD is
+             * left out of that: it is the known-normal state (see below). */
+            uint8_t bad[5] = {(uint8_t)!id_ok, (uint8_t)!cold, (uint8_t)!cfg_ok, 0u, (uint8_t)!eng_ok};
             uint16_t vx = (uint16_t)(gx + 4u);
             for (uint8_t i = 0; i < 5u; ++i) {
+                if (!all && !bad[i]) {
+                    continue;
+                }
                 lcd_text(vx, (uint16_t)(gy + 3u), tok[i], col[i], grid_bg, 1);
                 vx = (uint16_t)(vx + lcd_text_width(tok[i], 1) + 6u);
             }
@@ -7781,6 +7808,9 @@ static const char *settings_value_text(uint8_t row, char out[12]) {
     if (row == 4u) {
         return theme_labels[ui_settings.theme & 1u];
     }
+    if (row == 5u) {
+        return debug_overlay_labels[ui_settings.debug_overlay < 3u ? ui_settings.debug_overlay : 0u];
+    }
 #endif
     return FIRMWARE_VERSION_TEXT;
 }
@@ -7812,6 +7842,9 @@ static void draw_settings_menu(void) {
     draw_battery_status_overlay(C_BG);
 
     lcd_text(14, 18, "SETTINGS", C_TEXT, C_BG, 3);
+#if HW_TARGET_2C53T
+    lcd_text(14, 50, "FW " FIRMWARE_VERSION_TEXT, C_MUTED, C_BG, 1);
+#endif
     for (uint8_t row = 0; row < SETTINGS_ROW_COUNT; ++row) {
         uint8_t col = (uint8_t)(row % SETTINGS_GRID_COLUMNS);
         uint8_t line = (uint8_t)(row / SETTINGS_GRID_COLUMNS);
@@ -10203,6 +10236,8 @@ static void settings_adjust_current(int8_t dir) {
         ui_set_theme(ui_settings.theme);
         /* settings_note below covers the write; the flush happens when the
          * menu is left, same as every other row here. */
+    } else if (ui.settings_row == 5u) {
+        cycle_u8(&ui_settings.debug_overlay, 3u, dir);
 #endif
     } else {
         (void)dir;

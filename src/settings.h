@@ -56,6 +56,7 @@ typedef struct {
     uint8_t brightness_level;
     uint8_t theme;         /* 0 dark, 1 light — 2C53T only, see ui.c palette */
     uint8_t cont_indicate; /* continuity: bit0 sound off, bit1 light on — 2C53T */
+    uint8_t debug_overlay; /* on-screen debug text: 0 all, 1 errors only, 2 off — 2C53T */
     uint8_t startup_screen;
     uint8_t last_screen;   /* 0 DMM, 1 SCOPE, 2 GEN — the mode last shown */
     uint8_t last_in_menu;  /* the mode menu was open over it */
