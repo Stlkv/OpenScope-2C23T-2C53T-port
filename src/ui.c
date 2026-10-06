@@ -10273,15 +10273,20 @@ static void ui_handle_vertical_key(int8_t screen_dir, uint8_t repeat) {
     if (ui.mode == UI_MODE_SCOPE && scope_softkey_menu_open()) {
         softkeys_flash();
     }
+    /* Position, volts/div and the measurement list take value semantics
+     * (dir > 0 = up / more) -- scope_adjust_selected_param() already calls
+     * them that way. Handing them the raw screen direction here made UP move
+     * the trace down and step volts/div down. The cursor menu keeps the
+     * screen direction: it converts per cursor type itself. */
     if (ui.mode == UI_MODE_SCOPE && ui.scope_move_mode) {
-        scope_adjust_active_channel_pos(screen_dir);
+        scope_adjust_active_channel_pos((int8_t)-screen_dir);
     } else if (ui.mode == UI_MODE_SCOPE && ui.scope_cursor_menu) {
         scope_adjust_cursor_menu_value(screen_dir, repeat);
     } else if (ui.mode == UI_MODE_SCOPE && ui.scope_measure_menu) {
-        scope_adjust_measure_menu_item(screen_dir);
+        scope_adjust_measure_menu_item((int8_t)-screen_dir);
     } else if (ui.mode == UI_MODE_SCOPE && ui.scope_channel_menu) {
         ui.scope_param = SCOPE_PARAM_GAIN;
-        scope_cycle_active_channel_vdiv(screen_dir);
+        scope_cycle_active_channel_vdiv((int8_t)-screen_dir);
     } else if (ui.mode == UI_MODE_SCOPE &&
                ui.scope_trigger_menu &&
                ui.scope_param == SCOPE_PARAM_TRIG_LEVEL) {
