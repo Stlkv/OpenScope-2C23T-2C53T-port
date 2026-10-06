@@ -11219,6 +11219,136 @@ void ui_settings_set_theme(uint8_t light) {
  * injected key events. Between them the whole colour-scheme verification
  * becomes scriptable from the host -- every screen in both palettes without
  * anyone at the buttons. POWER is refused in the shell, not here. */
+/* Hold-to-power-off: "POWER OFF ->" in the meter's title font, a finish line
+ * on the right, and a fill that sweeps toward it over the hold. Reaching the
+ * line plays the old CRT switch-off -- the picture squeezes to a horizontal
+ * line, then to a dot in the middle, whitening as it goes. Drawn straight
+ * over whatever mode is up; an early release repaints that mode. */
+enum {
+    POWER_LABEL_X = 18,
+    POWER_LABEL_Y = 27,
+    POWER_LINE_X = 296,
+    POWER_LINE_W = 3,
+    POWER_FILL_COLOR = RGB565(220, 40, 40),
+    POWER_WHITE = RGB565(255, 255, 255),
+    POWER_BLACK = 0,
+};
+
+static uint16_t power_hold_drawn_w;
+
+/* The arrow is drawn on the font's own 5x7 pixel grid at the label's scale,
+ * so it reads as type, just stretched: a font glyph is only five columns. */
+static void power_hold_label(void) {
+    enum { SCALE = 3, ARROW_COLS = 11 };
+    uint16_t x = (uint16_t)(POWER_LABEL_X + lcd_text_width("POWER OFF ", SCALE));
+
+    lcd_text_transparent(POWER_LABEL_X, POWER_LABEL_Y, "POWER OFF", POWER_WHITE, SCALE);
+    /* shaft: row 3 across every column */
+    lcd_rect(x, (uint16_t)(POWER_LABEL_Y + 3u * SCALE), ARROW_COLS * SCALE, SCALE, POWER_WHITE);
+    /* head, the full seven rows of a glyph: rows 3 +/- d sit d columns back */
+    for (uint8_t d = 1; d <= 3u; ++d) {
+        uint16_t hx = (uint16_t)(x + (ARROW_COLS - 1u - d) * SCALE);
+        lcd_rect(hx, (uint16_t)(POWER_LABEL_Y + (3u - d) * SCALE), SCALE, SCALE, POWER_WHITE);
+        lcd_rect(hx, (uint16_t)(POWER_LABEL_Y + (3u + d) * SCALE), SCALE, SCALE, POWER_WHITE);
+    }
+}
+
+void ui_power_hold_progress(uint16_t done_ms, uint16_t total_ms) {
+    uint16_t w;
+
+    if (!total_ms) {
+        return;
+    }
+    if (done_ms == 0u) {
+        lcd_fill(POWER_BLACK);
+        lcd_rect(POWER_LINE_X, 0, POWER_LINE_W, LCD_HEIGHT, POWER_WHITE);
+        power_hold_drawn_w = 0;
+        power_hold_label();
+    }
+    if (done_ms > total_ms) {
+        done_ms = total_ms;
+    }
+    w = (uint16_t)((uint32_t)POWER_LINE_X * done_ms / total_ms);
+    if (w > power_hold_drawn_w) {
+        lcd_rect(power_hold_drawn_w, 0, (uint16_t)(w - power_hold_drawn_w), LCD_HEIGHT, POWER_FILL_COLOR);
+        power_hold_drawn_w = w;
+        if (w > POWER_LABEL_X) {
+            power_hold_label();
+        }
+    }
+}
+
+static uint16_t power_mix(uint16_t from, uint16_t to, uint16_t num, uint16_t den) {
+    uint16_t r0 = (uint16_t)(from >> 11), g0 = (uint16_t)((from >> 5) & 0x3Fu), b0 = (uint16_t)(from & 0x1Fu);
+    uint16_t r1 = (uint16_t)(to >> 11), g1 = (uint16_t)((to >> 5) & 0x3Fu), b1 = (uint16_t)(to & 0x1Fu);
+    uint16_t r = (uint16_t)(r0 + ((int32_t)(r1 - r0) * num) / den);
+    uint16_t g = (uint16_t)(g0 + ((int32_t)(g1 - g0) * num) / den);
+    uint16_t b = (uint16_t)(b0 + ((int32_t)(b1 - b0) * num) / den);
+
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+void ui_power_off_collapse(void) {
+    enum { SQUEEZE_Y = 12, SQUEEZE_X = 10, FRAME_MS = 5, DOT_MS = 27 };
+    const uint16_t cx = LCD_WIDTH / 2u;
+    const uint16_t cy = LCD_HEIGHT / 2u;
+    uint16_t top = 0, bottom = LCD_HEIGHT; /* rows [top, bottom) still lit */
+    uint16_t left = 0, right = POWER_LINE_X;
+
+    /* The fill has touched the line: the lit picture is the swept rectangle. */
+    lcd_rect(POWER_LINE_X, 0, (uint16_t)(LCD_WIDTH - POWER_LINE_X), LCD_HEIGHT, POWER_BLACK);
+    for (uint16_t f = 1; f <= SQUEEZE_Y; ++f) {
+        uint16_t half = (uint16_t)(((uint32_t)cy * (SQUEEZE_Y - f)) / SQUEEZE_Y);
+        uint16_t nt = (uint16_t)(cy - half - 1u);
+        uint16_t nb = (uint16_t)(cy + half + 1u);
+
+        lcd_rect(left, top, (uint16_t)(right - left), (uint16_t)(nt - top), POWER_BLACK);
+        lcd_rect(left, nb, (uint16_t)(right - left), (uint16_t)(bottom - nb), POWER_BLACK);
+        top = nt;
+        bottom = nb;
+        lcd_rect(left, top, (uint16_t)(right - left), (uint16_t)(bottom - top),
+                 power_mix(POWER_FILL_COLOR, POWER_WHITE, (uint16_t)(f * 2u), (uint16_t)(SQUEEZE_Y * 3u)));
+        delay_ms(FRAME_MS);
+    }
+    for (uint16_t f = 1; f <= SQUEEZE_X; ++f) {
+        uint16_t nl = (uint16_t)(left + ((uint32_t)(cx - 1u - left) * f) / SQUEEZE_X);
+        uint16_t nr = (uint16_t)(right - ((uint32_t)(right - cx - 1u) * f) / SQUEEZE_X);
+
+        lcd_rect(left, top, (uint16_t)(nl - left), (uint16_t)(bottom - top), POWER_BLACK);
+        lcd_rect(nr, top, (uint16_t)(right - nr), (uint16_t)(bottom - top), POWER_BLACK);
+        left = nl;
+        right = nr;
+        lcd_rect(left, top, (uint16_t)(right - left), (uint16_t)(bottom - top),
+                 power_mix(POWER_FILL_COLOR, POWER_WHITE,
+                           (uint16_t)(SQUEEZE_Y * 2u + f * SQUEEZE_Y / SQUEEZE_X),
+                           (uint16_t)(SQUEEZE_Y * 3u)));
+        delay_ms(FRAME_MS);
+    }
+    delay_ms(DOT_MS);
+    lcd_rect(left, top, (uint16_t)(right - left), (uint16_t)(bottom - top), POWER_BLACK);
+}
+
+void ui_power_hold_cancel(void) {
+    /* Released early: the fill slides back to the left edge over 150 ms
+     * before the mode comes back, so a short press reads as "undone". */
+    enum { RETREAT_FRAMES = 10, RETREAT_FRAME_MS = 15 };
+    uint16_t from = power_hold_drawn_w;
+
+    for (uint16_t f = 1; f <= RETREAT_FRAMES && power_hold_drawn_w; ++f) {
+        uint16_t w = (uint16_t)(from - ((uint32_t)from * f) / RETREAT_FRAMES);
+
+        lcd_rect(w, 0, (uint16_t)(power_hold_drawn_w - w), LCD_HEIGHT, POWER_BLACK);
+        power_hold_drawn_w = w;
+        power_hold_label();
+        delay_ms(RETREAT_FRAME_MS);
+    }
+    power_hold_drawn_w = 0;
+#if !SCOPE_UI_SAFE_STUB
+    scope_trace_invalidate();
+#endif
+    ui_render();
+}
+
 void ui_capture_screenshot(void) {
     capture_screenshot_now();
 }

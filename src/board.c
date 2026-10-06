@@ -1270,3 +1270,11 @@ uint32_t input_pressed_events(void) {
     last_keys = now;
     return events;
 }
+
+uint8_t input_power_held(void) {
+#if HW_TARGET_2C53T
+    return gpio_read(GPIOC_BASE, 1u << 8) ? 0u : 1u; /* PC8, active low */
+#else
+    return (input_read_keys() & KEY_POWER) ? 1u : 0u;
+#endif
+}

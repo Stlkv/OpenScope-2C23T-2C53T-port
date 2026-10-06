@@ -28,6 +28,7 @@ enum {
     LIVE_BEEP_VOLUME_PERCENT = 70,
     STARTUP_BEEP_MS = 55,
     SHUTDOWN_BEEP_MS = 70,
+    POWER_HOLD_MS = 1000,
     STARTUP_INPUT_SETTLE_MS = 200,
 };
 
@@ -43,6 +44,30 @@ static void shutdown_now(uint8_t beep) {
     settings_flush();
     board_power_off();
 }
+
+#if HW_TARGET_2C53T
+/* POWER switches off only when held for POWER_HOLD_MS; a shorter press does
+ * nothing. The UI is frozen while the key is down, but USB keeps being served
+ * so a host session does not drop. */
+static uint8_t power_hold_confirmed(void) {
+    for (uint16_t ms = 0; ms < POWER_HOLD_MS; ms = (uint16_t)(ms + 10u)) {
+        if (!input_power_held()) {
+            ui_power_hold_cancel();
+            return 0;
+        }
+        ui_power_hold_progress(ms, POWER_HOLD_MS);
+        for (uint8_t i = 0; i < 10u; ++i) {
+            usb_msc_poll();
+            cdc_shell_service();
+            usb_msc_cdc_pump();
+            delay_ms(1);
+        }
+    }
+    ui_power_hold_progress(POWER_HOLD_MS, POWER_HOLD_MS);
+    ui_power_off_collapse();
+    return 1;
+}
+#endif
 
 static void dmm_beep_service(uint8_t elapsed_ms) {
     uint8_t dmm_beep_seen;
@@ -245,9 +270,15 @@ int main(void) {
         }
         uint32_t events = input_pressed_events();
         if (events && !input_settle_ms) {
+#if HW_TARGET_2C53T
+            if ((events & KEY_POWER) && power_hold_confirmed()) {
+                shutdown_now(1);
+            }
+#else
             if (events & KEY_POWER) {
                 shutdown_now(1);
             }
+#endif
             ui_handle_keys(events);
             if (events & KEY_REPEAT) {
                 ui_beep_ms = 0;

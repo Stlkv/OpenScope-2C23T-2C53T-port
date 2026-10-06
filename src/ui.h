@@ -15,6 +15,9 @@ uint8_t ui_diode_beep_enabled(void);
 void ui_set_theme(uint8_t light);  /* 0 = dark (default), 1 = light draft */
 void ui_settings_set_theme(uint8_t light); /* + persist, as the menu tile does */
 void ui_capture_screenshot(void);          /* bench: SAVE without the button */
+void ui_power_hold_progress(uint16_t done_ms, uint16_t total_ms); /* 2C53T */
+void ui_power_hold_cancel(void);          /* released early: repaint the mode */
+void ui_power_off_collapse(void);         /* CRT-style switch-off, then black */
 void ui_shell_inject_keys(uint32_t events);/* bench: drive the UI from the host */
 uint8_t ui_theme(void);
 uint8_t ui_live_beep_enabled(void);

@@ -29,6 +29,7 @@ enum {
 };
 
 void delay_ms(uint32_t ms);
+uint8_t input_power_held(void); /* raw POWER level, no debounce or edge */
 void gpio_config_mask(uint32_t base, uint16_t mask, uint8_t cfg);
 void load_counter_init(void);
 uint32_t load_counter_read(void);
