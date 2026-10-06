@@ -136,7 +136,10 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
          * the line, since a PC3 edge is a physical event. So the line arms as
          * soon as we are in the mode; only the frame source stays behind
          * diode_beep_ready. */
+        /* Light-only continuity keeps the line armed, so edges are still
+         * seen; the mute only stops the interrupt from starting the tone. */
         board_dmm_beep_irq_arm(1);
+        board_dmm_beep_irq_mute(!ui_cont_sound_enabled());
         cont_edge = board_dmm_beep_edge_seen();
         cont_frame = (uint8_t)(diode_beep_ready && dmm_diode_continuity_active());
         dmm_beep_seen = (uint8_t)(cont_edge || cont_frame);
@@ -218,6 +221,10 @@ static void dmm_beep_service(uint8_t elapsed_ms) {
             cont_frame_run = 0;
         }
         cont_tone_was_on = buzzer_on;
+        ui_cont_contact(buzzer_on);
+        if (!ui_cont_sound_enabled()) {
+            buzzer_on = 0;
+        }
 #endif
     } else if (live_mode) {
         board_dmm_beep_irq_force_full(0);

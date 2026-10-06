@@ -690,6 +690,8 @@ static const ui_palette_t ui_pal_light = {
 };
 
 static const ui_palette_t *ui_pal = &ui_pal_dark;
+static uint8_t ui_cont_lit; /* the green continuity ground is up */
+enum { UI_CONT_SOUND_OFF = 1u, UI_CONT_LIGHT_ON = 2u }; /* ui_settings.cont_indicate bits */
 
 #define C_BG            (ui_pal->bg)
 #define C_TOP           (ui_pal->top)
@@ -4296,6 +4298,9 @@ static uint16_t dmm_measure_color(void) {
     return C_TEXT;
 }
 
+#if HW_TARGET_2C53T
+static void draw_cont_indicators(uint16_t title_x, uint16_t title_y, uint16_t chips_y, uint16_t bg);
+#endif
 static const char *dmm_alert_label(void) {
     uint8_t warning = dmm_voltage_warning_level();
     if (dmm_live_wire_detected()) {
@@ -4457,6 +4462,11 @@ static void draw_dmm_panel(void) {
     if (dmm_hold_active || dmm_rel_active) {
         draw_dmm_mode_status(22, 80, 300u, C_PANEL);
     }
+#if HW_TARGET_2C53T
+    else if (ui.dmm_mode == DMM_MODE_CONT) {
+        draw_cont_indicators(22, 58, 84, C_PANEL);
+    }
+#endif
     if (!dmm_hold_active && !dmm_rel_active) {
         draw_dmm_alert_chip(176, 84, 124, dmm_alert_label(), dmm_alert_color());
     }
@@ -4485,6 +4495,11 @@ static void draw_dmm_immersive_panel(void) {
     if (dmm_hold_active || dmm_rel_active) {
         draw_dmm_mode_status(18, 68, 304u, C_BG);
     }
+#if HW_TARGET_2C53T
+    else if (ui.dmm_mode == DMM_MODE_CONT) {
+        draw_cont_indicators(18, 27, 58, C_BG);
+    }
+#endif
     if (!dmm_hold_active && !dmm_rel_active) {
         draw_dmm_alert_chip(176, 55, 128, dmm_alert_label(), dmm_alert_color());
     }
@@ -11093,6 +11108,16 @@ void ui_handle_keys(uint32_t events) {
         ui_handle_vertical_key(1, (events & KEY_REPEAT) ? 1u : 0u);
         return;
     }
+#if HW_TARGET_2C53T
+    if ((events & (KEY_CH1 | KEY_CH2)) && ui.mode == UI_MODE_DMM && ui.dmm_mode == DMM_MODE_CONT) {
+        /* In continuity CH1 switches the sound and CH2 the green screen,
+         * independently: either, both or neither. */
+        ui_settings.cont_indicate ^= (events & KEY_CH1) ? UI_CONT_SOUND_OFF : UI_CONT_LIGHT_ON;
+        settings_note(&ui_settings);
+        ui_render();
+        return;
+    }
+#endif
     if (events & KEY_CH1) {
         if (ui.mode == UI_MODE_SCOPE) {
             scope_channel_key(1);
@@ -11200,8 +11225,170 @@ void ui_set_theme(uint8_t light) {
      * the background -- only their immersive variants do -- so stale pixels
      * survive any number of ordinary renders. */
     ui_pal = light ? &ui_pal_light : &ui_pal_dark;
+    ui_cont_lit = 0;
     ui_theme_repaint = 1;
     ui_render();
+}
+
+/* Continuity can be heard, shown, both or neither: ui_settings.cont_indicate
+ * bit 0 silences it (CH1), bit 1 lights it (CH2). "Light" turns the screen's ground
+ * green for as long as the SoC reports contact. It is a palette swap -- the
+ * active table copied with a green ground -- so every text and chip keeps its
+ * own colour and the full repaint the theme path already does covers it. */
+static ui_palette_t ui_pal_cont;
+static volatile uint8_t ui_cont_contact_req;
+
+static void ui_cont_light_apply(uint8_t on) {
+    const ui_palette_t *base = ui_settings.theme ? &ui_pal_light : &ui_pal_dark;
+
+    if (on) {
+        /* Field by field through a volatile pointer: a struct assignment this
+         * size lowers to __aeabi_memcpy, which this image does not link. */
+        const uint16_t *src = (const uint16_t *)base;
+        volatile uint16_t *dst = (volatile uint16_t *)&ui_pal_cont;
+        for (uint16_t i = 0; i < sizeof(ui_palette_t) / sizeof(uint16_t); ++i) {
+            dst[i] = src[i];
+        }
+        ui_pal_cont.bg = ui_settings.theme ? RGB565(150, 225, 165) : RGB565(0, 125, 55);
+        ui_pal_cont.panel = ui_pal_cont.bg;
+        ui_pal_cont.dmm = ui_settings.theme ? RGB565(18, 24, 30) : RGB565(255, 255, 255);
+        /* An off chip is drawn in C_MUTED, which vanished into the green
+         * (bench, 2026-10-06): on the green ground it is white, and so is
+         * the text of the unselected softkey chips, whose ground is a step
+         * lighter than the green rather than the old dark slate. */
+        ui_pal_cont.muted = RGB565(255, 255, 255);
+        ui_pal_cont.panel_2 = ui_settings.theme ? RGB565(175, 238, 188) : RGB565(25, 150, 75);
+        ui_pal = &ui_pal_cont;
+    } else {
+        ui_pal = base;
+    }
+    ui_cont_lit = on;
+    ui_theme_repaint = 1;
+    ui_render();
+}
+
+/* Contact also shows as a glowing green dot after the mode title, drawn and
+ * erased in place rather than by a repaint. */
+static uint8_t ui_cont_dot_shown;
+static uint16_t ui_cont_dot_x, ui_cont_dot_y, ui_cont_dot_bg;
+static uint8_t ui_cont_dot_placed;
+
+/* The dot is a pixel sprite on the font's own grid (3 px cells, as the title
+ * at scale 3): glow rim, mid ring, green core, a highlight up and left. */
+enum { CONT_DOT_CELL = 3, CONT_DOT_CELLS = 9, CONT_DOT_SIZE = CONT_DOT_CELL * CONT_DOT_CELLS };
+
+static const uint8_t cont_dot_sprite[CONT_DOT_CELLS][CONT_DOT_CELLS] = {
+    {0, 0, 1, 1, 1, 1, 1, 0, 0},
+    {0, 1, 2, 2, 2, 2, 2, 1, 0},
+    {1, 2, 3, 3, 3, 3, 3, 2, 1},
+    {1, 2, 3, 4, 4, 3, 3, 2, 1},
+    {1, 2, 3, 4, 3, 3, 3, 2, 1},
+    {1, 2, 3, 3, 3, 3, 3, 2, 1},
+    {1, 2, 3, 3, 3, 3, 3, 2, 1},
+    {0, 1, 2, 2, 2, 2, 2, 1, 0},
+    {0, 0, 1, 1, 1, 1, 1, 0, 0},
+};
+
+static uint16_t cont_mix(uint16_t from, uint16_t to, uint16_t num, uint16_t den) {
+    int32_t r0 = from >> 11, g0 = (from >> 5) & 0x3F, b0 = from & 0x1F;
+    int32_t r1 = to >> 11, g1 = (to >> 5) & 0x3F, b1 = to & 0x1F;
+    return (uint16_t)(((r0 + (r1 - r0) * num / den) << 11) |
+                      ((g0 + (g1 - g0) * num / den) << 5) |
+                      (b0 + (b1 - b0) * num / den));
+}
+
+static void draw_cont_dot(uint8_t lit) {
+    const uint16_t green = RGB565(40, 230, 90);
+    uint16_t x0 = (uint16_t)(ui_cont_dot_x - CONT_DOT_SIZE / 2u);
+    uint16_t y0 = (uint16_t)(ui_cont_dot_y - CONT_DOT_SIZE / 2u);
+    uint16_t shade[5];
+
+    if (!ui_cont_dot_placed) {
+        return;
+    }
+    if (!lit) {
+        lcd_rect(x0, y0, CONT_DOT_SIZE, CONT_DOT_SIZE, ui_cont_dot_bg);
+        return;
+    }
+    shade[0] = ui_cont_dot_bg;
+    shade[1] = cont_mix(ui_cont_dot_bg, green, 1, 4);
+    shade[2] = cont_mix(ui_cont_dot_bg, green, 2, 4);
+    shade[3] = green;
+    shade[4] = RGB565(210, 255, 220);
+    for (uint8_t r = 0; r < CONT_DOT_CELLS; ++r) {
+        for (uint8_t c = 0; c < CONT_DOT_CELLS; ++c) {
+            lcd_rect((uint16_t)(x0 + c * CONT_DOT_CELL), (uint16_t)(y0 + r * CONT_DOT_CELL),
+                     CONT_DOT_CELL, CONT_DOT_CELL, shade[cont_dot_sprite[r][c]]);
+        }
+    }
+}
+
+static void draw_cont_chip(uint16_t x, uint16_t y, const char *label, uint8_t on, uint16_t bg) {
+    enum { PAD_X = 4, PAD_Y = 3 };
+    uint16_t w = (uint16_t)(lcd_text_width(label, 1) - 1u + 2u * PAD_X);
+    uint16_t h = (uint16_t)(7u + 2u * PAD_Y);
+
+    if (on) {
+        lcd_rect(x, y, w, h, C_DMM);
+        lcd_text(x + PAD_X, y + PAD_Y, label, C_ON_ACCENT, C_DMM, 1);
+    } else {
+        lcd_rect(x, y, w, h, bg);
+        lcd_frame(x, y, w, h, C_MUTED);
+        lcd_text(x + PAD_X, y + PAD_Y, label, C_MUTED, bg, 1);
+    }
+}
+
+/* SOUND and LIGHT chips under the title (CH1 / CH2 switch them), and the
+ * spot for the contact dot after the title. */
+static void draw_cont_indicators(uint16_t title_x, uint16_t title_y, uint16_t chips_y, uint16_t bg) {
+    uint8_t sound = !(ui_settings.cont_indicate & UI_CONT_SOUND_OFF);
+    uint8_t light = (ui_settings.cont_indicate & UI_CONT_LIGHT_ON) ? 1u : 0u;
+    uint16_t sound_w = (uint16_t)(lcd_text_width("SOUND", 1) - 1u + 8u);
+
+    draw_cont_chip(title_x, chips_y, "SOUND", sound, bg);
+    draw_cont_chip((uint16_t)(title_x + sound_w + 6u), chips_y, "LIGHT", light, bg);
+
+    /* Two sprite cells clear of the title's last glyph. */
+    ui_cont_dot_x = (uint16_t)(title_x + lcd_text_width(dmm_mode_names[DMM_MODE_CONT], 3) +
+                               CONT_DOT_SIZE / 2u + 2u + 2u * CONT_DOT_CELL);
+    ui_cont_dot_y = (uint16_t)(title_y + 10u); /* middle of a 7-row glyph at scale 3 */
+    ui_cont_dot_bg = bg;
+    ui_cont_dot_placed = 1;
+    if (ui_cont_dot_shown) {
+        draw_cont_dot(1);
+    }
+}
+
+static void ui_cont_light_service(void) {
+    uint8_t in_cont = (uint8_t)(ui.mode == UI_MODE_DMM &&
+                                ui.overlay == UI_OVERLAY_NONE &&
+                                ui.dmm_mode == DMM_MODE_CONT);
+    uint8_t want_light = (uint8_t)(in_cont && ui_cont_contact_req &&
+                                   (ui_settings.cont_indicate & UI_CONT_LIGHT_ON));
+    /* The dot shows contact whenever the screen does not turn green; with
+     * the light on it would only repeat what the whole screen says. */
+    uint8_t want_dot = (uint8_t)(in_cont && ui_cont_contact_req &&
+                                 !(ui_settings.cont_indicate & UI_CONT_LIGHT_ON));
+
+    if (!in_cont) {
+        ui_cont_dot_placed = 0;
+    }
+    if (want_light != ui_cont_lit) {
+        ui_cont_light_apply(want_light);
+    }
+    if (want_dot != ui_cont_dot_shown) {
+        ui_cont_dot_shown = want_dot;
+        draw_cont_dot(want_dot);
+    }
+}
+
+void ui_cont_contact(uint8_t on) {
+    ui_cont_contact_req = on;
+}
+
+uint8_t ui_cont_sound_enabled(void) {
+    return (uint8_t)!(ui.dmm_mode == DMM_MODE_CONT &&
+                      (ui_settings.cont_indicate & UI_CONT_SOUND_OFF));
 }
 
 /* The settings-level entry point: the tile in the settings menu and the bench
@@ -11427,6 +11614,7 @@ void ui_tick(uint32_t elapsed_ms) {
     uint32_t sleep_timeout_ms = settings_sleep_timeout_ms();
 
 #if HW_TARGET_2C53T
+    ui_cont_light_service();
     /* Meter debug overlay heartbeat: counters must advance on screen even
      * when no frames arrive (silent SoC), so no reading-render fires. */
     {

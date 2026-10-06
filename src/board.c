@@ -714,6 +714,16 @@ void board_dmm_beep_irq_arm(uint8_t enabled) {
     }
 }
 
+/* Light-only continuity: the line stays armed so its edges keep being seen,
+ * and only the interrupt's own tone start is held back. Disarming instead
+ * would also clear edge_seen on every service pass, and contact would never
+ * register at all. */
+static volatile uint8_t g_dmm_beep_irq_muted;
+
+void board_dmm_beep_irq_mute(uint8_t muted) {
+    g_dmm_beep_irq_muted = muted ? 1u : 0u;
+}
+
 void board_dmm_beep_irq_force_full(uint8_t enabled) {
     g_dmm_beep_irq_full = enabled ? 1u : 0u;
 }
@@ -729,7 +739,7 @@ void board_dmm_beep_irq_handler(void) {
     if (gpio_read(GPIOC_BASE, 1u << 3)) {
         g_dmm_beep_rise_count++;
         g_dmm_beep_edge_seen = 1;
-        if (g_dmm_beep_irq_armed) {
+        if (g_dmm_beep_irq_armed && !g_dmm_beep_irq_muted) {
             board_buzzer_start_from_irq();
         } else {
             g_beep_noarm_count++;

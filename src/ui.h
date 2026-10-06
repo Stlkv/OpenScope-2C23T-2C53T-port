@@ -18,6 +18,8 @@ void ui_capture_screenshot(void);          /* bench: SAVE without the button */
 void ui_power_hold_progress(uint16_t done_ms, uint16_t total_ms); /* 2C53T */
 void ui_power_hold_cancel(void);          /* released early: repaint the mode */
 void ui_power_off_collapse(void);         /* CRT-style switch-off, then black */
+void ui_cont_contact(uint8_t on);         /* 2C53T: SoC reports contact now */
+uint8_t ui_cont_sound_enabled(void);      /* 2C53T: 0 = continuity is light-only */
 void ui_shell_inject_keys(uint32_t events);/* bench: drive the UI from the host */
 uint8_t ui_theme(void);
 uint8_t ui_live_beep_enabled(void);

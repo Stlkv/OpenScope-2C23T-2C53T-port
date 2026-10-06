@@ -52,6 +52,7 @@ uint8_t board_dmm_beep_active(void);
 uint8_t board_dmm_beep_edge_seen(void);
 void board_dmm_beep_irq_arm(uint8_t enabled);
 void board_dmm_beep_irq_force_full(uint8_t enabled);
+void board_dmm_beep_irq_mute(uint8_t muted); /* armed, edges seen, no tone */
 /* 2C53T only: the piezo is PB9/TMR11_CH1 and the SoC's beep request is PC3. */
 void board_buzzer_set_tone_div(uint16_t div);
 uint16_t board_buzzer_tone_div(void);
