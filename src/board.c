@@ -229,6 +229,27 @@ uint8_t board_power_off_requested(void) {
 void board_power_off(void) {
 #if HW_TARGET_2C53T
     gpio_clear(GPIOC_BASE, 1u << 9);
+    /* On battery the rail is gone within milliseconds of releasing the hold.
+     * Still running half a second later means USB is powering the board, and
+     * the old bare spin here froze the unit until the cable came out: the
+     * screen stayed lit and the power key, polled by the main loop, was dead.
+     * Instead go dark and wait for the key -- let go of the press that got us
+     * here, then a fresh press restarts the firmware. Pulling the cable still
+     * powers the unit off, since the hold stays released. */
+    delay_ms(500);
+    board_backlight_set(0);
+    while (!gpio_read(GPIOC_BASE, 1u << 8)) {
+    }
+    delay_ms(50);
+    for (;;) {
+        if (!gpio_read(GPIOC_BASE, 1u << 8)) {
+            delay_ms(30);
+            if (!gpio_read(GPIOC_BASE, 1u << 8)) {
+                break;
+            }
+        }
+    }
+    REG32(0xE000ED0Cu) = 0x05FA0004u; /* AIRCR SYSRESETREQ */
 #else
     gpio_clear(GPIOB_BASE, 1u << 2);
 #endif
