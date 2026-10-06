@@ -587,6 +587,24 @@ uint16_t dbgdump_render(char *dst, uint16_t cap) {
      * work, not before. */
 #endif
 
+    if (fault_rec.magic == 0x464C5431u) {
+        p = put_str(dst, cap, p, "FLT n=");
+        p = put_dec(dst, cap, p, fault_rec.count);
+        p = put_str(dst, cap, p, " exc=");
+        p = put_dec(dst, cap, p, fault_rec.ipsr & 0x1FFu);
+        p = put_str(dst, cap, p, " pc=");
+        p = put_hex(dst, cap, p, fault_rec.pc, 8);
+        p = put_str(dst, cap, p, " lr=");
+        p = put_hex(dst, cap, p, fault_rec.lr, 8);
+        p = put_str(dst, cap, p, " cfsr=");
+        p = put_hex(dst, cap, p, fault_rec.cfsr, 8);
+        p = put_str(dst, cap, p, " hfsr=");
+        p = put_hex(dst, cap, p, fault_rec.hfsr, 8);
+        p = put_str(dst, cap, p, " bfar=");
+        p = put_hex(dst, cap, p, fault_rec.bfar, 8);
+        p = put_str(dst, cap, p, "\n");
+    }
+
     p = put_str(dst, cap, p, "SPI3 CTRL1=");
     p = put_hex(dst, cap, p, SPI_CTRL1(SPI3_BASE) & 0xFFFFu, 4);
     p = put_str(dst, cap, p, " MODE=");

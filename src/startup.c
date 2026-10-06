@@ -1,6 +1,7 @@
 #include <stdint.h>
 
 #include "app_config.h"
+#include "dbgdump.h"
 
 extern uint32_t __data_load;
 extern uint32_t __data_start;
@@ -142,9 +143,45 @@ void Reset_Handler_C(void) {
     }
 }
 
-void Default_Handler(void) {
+/* Every fault and every unexpected interrupt lands here. It used to spin,
+ * which froze the unit with nothing to show for it -- the power key is polled
+ * by the main loop, so not even that worked. Now it records where the core
+ * was and resets; the next boot's dump prints the record (FLT line). */
+#define FAULT_REC_MAGIC 0x464C5431u /* "FLT1" */
+#define SCB_CFSR  0xE000ED28u
+#define SCB_HFSR  0xE000ED2Cu
+#define SCB_BFAR  0xE000ED38u
+#define SCB_AIRCR 0xE000ED0Cu
+
+__attribute__((section(".fault_rec"), used))
+volatile fault_rec_t fault_rec;
+
+__attribute__((used))
+void fault_record_and_reset(const uint32_t *frame, uint32_t ipsr) {
+    fault_rec.count = fault_rec.magic == FAULT_REC_MAGIC ? fault_rec.count + 1u : 1u;
+    fault_rec.magic = FAULT_REC_MAGIC;
+    fault_rec.ipsr = ipsr;
+    fault_rec.pc = frame[6];
+    fault_rec.lr = frame[5];
+    fault_rec.cfsr = REG32(SCB_CFSR);
+    fault_rec.hfsr = REG32(SCB_HFSR);
+    fault_rec.bfar = REG32(SCB_BFAR);
+    __asm__ volatile("dsb");
+    REG32(SCB_AIRCR) = 0x05FA0004u; /* SYSRESETREQ */
     while (1) {
     }
+}
+
+__attribute__((naked))
+void Default_Handler(void) {
+    __asm__ volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "mrs r1, ipsr\n"
+        "b fault_record_and_reset\n"
+    );
 }
 
 void EXTI3_IRQHandler(void) {

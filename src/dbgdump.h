@@ -12,4 +12,19 @@ uint16_t dbgdump_render(char *dst, uint16_t cap);
  * path (fw_update.c) so both sides can never disagree on the algorithm. */
 uint32_t dbgdump_crc32(const uint8_t *p, uint32_t len);
 
+/* Written by Default_Handler (startup.c) just before it resets the core, in
+ * a NOLOAD section that survives the reset; rendered as the FLT line. */
+typedef struct {
+    uint32_t magic;
+    uint32_t count;
+    uint32_t ipsr;
+    uint32_t pc;
+    uint32_t lr;
+    uint32_t cfsr;
+    uint32_t hfsr;
+    uint32_t bfar;
+} fault_rec_t;
+
+extern volatile fault_rec_t fault_rec;
+
 #endif

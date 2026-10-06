@@ -36,6 +36,16 @@ SECTIONS
     . = ALIGN(8);
   } > RAM
 
+  /* The last fault, for the next boot to report (startup.c, Default_Handler).
+   * Same rules as the token: NOLOAD, so neither a reset nor the startup code
+   * clears it; only a power loss does. Placed after the token so the token's
+   * address does not move. */
+  .fault_rec (NOLOAD) :
+  {
+    KEEP(*(.fault_rec))
+    . = ALIGN(8);
+  } > RAM
+
   .data :
   {
     __data_load = LOADADDR(.data);
