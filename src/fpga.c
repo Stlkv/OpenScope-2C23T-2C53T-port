@@ -249,7 +249,7 @@ static void fpga53_dma_cancel(void);
 static void fpga53_dma_arm(uint16_t count);
 static uint8_t fpga53_dma_complete(void);
 static void fpga53_dma_stop(void);
-static fpga53_diag_t fpga53_diag = { .fe_idx = 0xFFu, .fe_idx_b = 0xFFu };
+static fpga53_diag_t fpga53_diag;
 
 void fpga53_note_configure(void) {
     ++fpga53_diag.cfg_calls;
@@ -257,84 +257,6 @@ void fpga53_note_configure(void) {
 
 void fpga53_note_poll(void) {
     ++fpga53_diag.poll_calls;
-}
-
-/* Analog-frontend experiment: PRM (F4) in scope mode cycles 16 patterns of
- * {PC12, PE4, PE5, PE6} — input-routing and attenuation controls per the
- * OpenScope-2C53T pinout. After the warm-handoff MCU reset these pins float
- * (stock drove them); CH1 happens to conduct in the floating state, CH2 is
- * open. Pattern bits: idx3=PC12, idx2=PE4, idx1=PE5, idx0=PE6. */
-void fpga53_fe_cycle(void) {
-    uint8_t idx = fpga53_diag.fe_idx;
-    idx = (uint8_t)((idx == 0xFFu) ? 0u : ((idx + 1u) & 0x0Fu));
-    fpga53_diag.fe_idx = idx;
-
-    if (idx & 0x08u) {
-        gpio_set(GPIOC_BASE, 1u << 12);
-    } else {
-        gpio_clear(GPIOC_BASE, 1u << 12);
-    }
-    if (idx & 0x04u) {
-        gpio_set(GPIOE_BASE, 1u << 4);
-    } else {
-        gpio_clear(GPIOE_BASE, 1u << 4);
-    }
-    if (idx & 0x02u) {
-        gpio_set(GPIOE_BASE, 1u << 5);
-    } else {
-        gpio_clear(GPIOE_BASE, 1u << 5);
-    }
-    if (idx & 0x01u) {
-        gpio_set(GPIOE_BASE, 1u << 6);
-    } else {
-        gpio_clear(GPIOE_BASE, 1u << 6);
-    }
-    gpio_config_mask(GPIOC_BASE, 1u << 12, 0x1u);
-    gpio_config_mask(GPIOE_BASE, (1u << 4) | (1u << 5) | (1u << 6), 0x1u);
-}
-
-/* Bank B: gain-select / undocumented frontend pins.
- * Bits: idx3=PA15, idx2=PA10, idx1=PB9, idx0=PA6. */
-void fpga53_fe_cycle_b(void) {
-    uint8_t idx = fpga53_diag.fe_idx_b;
-    idx = (uint8_t)((idx == 0xFFu) ? 0u : ((idx + 1u) & 0x0Fu));
-    fpga53_diag.fe_idx_b = idx;
-
-    if (idx & 0x08u) {
-        gpio_set(GPIOA_BASE, 1u << 15);
-    } else {
-        gpio_clear(GPIOA_BASE, 1u << 15);
-    }
-    if (idx & 0x04u) {
-        gpio_set(GPIOA_BASE, 1u << 10);
-    } else {
-        gpio_clear(GPIOA_BASE, 1u << 10);
-    }
-    if (idx & 0x02u) {
-        gpio_set(GPIOB_BASE, 1u << 9);
-    } else {
-        gpio_clear(GPIOB_BASE, 1u << 9);
-    }
-    if (idx & 0x01u) {
-#if FPGA53_FE_SCOPE_POSE
-        gpio_set(GPIOB_BASE, 1u << 10);   /* PA6 = TMR13 PWM now; sweep PB10 */
-#else
-        gpio_set(GPIOA_BASE, 1u << 6);
-#endif
-    } else {
-#if FPGA53_FE_SCOPE_POSE
-        gpio_clear(GPIOB_BASE, 1u << 10);
-#else
-        gpio_clear(GPIOA_BASE, 1u << 6);
-#endif
-    }
-#if FPGA53_FE_SCOPE_POSE
-    gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10), 0x1u);
-    gpio_config_mask(GPIOB_BASE, (1u << 9) | (1u << 10), 0x1u);
-#else
-    gpio_config_mask(GPIOA_BASE, (1u << 15) | (1u << 10) | (1u << 6), 0x1u);
-    gpio_config_mask(GPIOB_BASE, 1u << 9, 0x1u);
-#endif
 }
 
 void fpga53_get_diag(fpga53_diag_t *d) {
@@ -361,8 +283,6 @@ void fpga53_get_diag(fpga53_diag_t *d) {
     d->smin2 = fpga53_diag.smin2;
     d->smax2 = fpga53_diag.smax2;
     d->dup = fpga53_diag.dup;
-    d->fe_idx = fpga53_diag.fe_idx;
-    d->fe_idx_b = fpga53_diag.fe_idx_b;
     d->sweep_val = fpga53_diag.sweep_val;
     d->sweep_hit = fpga53_diag.sweep_hit;
     d->v04_id = fpga53_diag.v04_id;

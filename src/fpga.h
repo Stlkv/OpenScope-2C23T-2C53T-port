@@ -32,8 +32,6 @@ typedef struct {
     uint8_t cst[5];       /* SPI3 status-read 0x03 reply (stock: 00 01 42 2E 2E) */
     uint8_t smin2, smax2; /* raw CH2-window sample range, last read */
     uint8_t dup;          /* 1 = CH2 window byte-identical to CH1 window */
-    uint8_t fe_idx;       /* frontend experiment pattern A (PC12/PE4/PE5/PE6), 0xFF = untouched */
-    uint8_t fe_idx_b;     /* frontend experiment pattern B (PA15/PA10/PB9/PA6), 0xFF = untouched */
     uint32_t v04_id;      /* V0.4 config attempt: IDCODE readback */
     uint32_t v04_stb;     /* status before upload */
     uint32_t v04_sta;     /* status after upload */
@@ -363,8 +361,6 @@ const fpga53_tsweep_row_t *fpga53_tsweep_baseline(void);
 void fpga53_get_diag(fpga53_diag_t *d);
 void fpga53_note_configure(void);
 void fpga53_note_poll(void);
-void fpga53_fe_cycle(void);
-void fpga53_fe_cycle_b(void);
 /* Re-apply the scope analog posture (relays, gain keys, PC1/PC2/PC11 selector)
  * and the TMR13 CH2 trigger reference. Call on scope-mode entry: the meter
  * leaves its own posture behind and takes PA6 back as a GPIO. */

@@ -10840,22 +10840,6 @@ uint8_t ui_debug_mode_byte(void) {
 }
 
 void ui_handle_keys(uint32_t events) {
-#if HW_TARGET_2C53T
-    if (ui.mode == UI_MODE_SCOPE && (events & KEY_F4)) {
-        fpga53_fe_cycle();
-        events &= ~(uint32_t)KEY_F4;
-        if (!events) {
-            return;
-        }
-    }
-    if (ui.mode == UI_MODE_SCOPE && (events & KEY_F3)) {
-        fpga53_fe_cycle_b();
-        events &= ~(uint32_t)KEY_F3;
-        if (!events) {
-            return;
-        }
-    }
-#endif
     ui.idle_ms = 0;
     ui.sleep_ms = 0;
     ui.sleep_due = 0;
